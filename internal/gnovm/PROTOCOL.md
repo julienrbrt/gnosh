@@ -69,9 +69,14 @@ Requests the client may send:
 | `drop` | `{project, name, action}` | empty |
 | `kept` | `{project, name, req, frames?}` | a bool, or `{kept, frames}` when `frames` is set (mem) |
 | `repair` | `{project, name}` | `{kept, cut}` |
-| `mem` | `{project, session, args, titles}` | `{text, erased}` |
+| `mem` | `{project, session, args, titles, command?}` | `{text, erased, refused?}` |
 | `goal` | `{op, project, session, …}` | `{binding, turn, text, closed}` |
 | `cancel` | none | an `ack` |
+
+If `mem.command` is set, the call is a shell read (`gnosh mem`): it only
+shows, finds or logs, names itself as `command` in the answer, and
+`refused` says whether mem refused it. A missing `command` is `/mem` in
+a session, as before.
 
 The worker may also send `result` (the reply to a request), `ack` (a
 cancel was received), and `heartbeat`. Unknown request types fail.

@@ -193,6 +193,30 @@ func TestInProcessClient(t *testing.T) {
 	require.Empty(t, ephemeral, "the last Release deletes memory-only VMs")
 }
 
+func TestClientMemRead(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Acquire(ClientOptions{Options: Options{Dir: dir}, InProcess: true})
+	require.NoError(t, err)
+	defer c.Release()
+	ctx := context.Background()
+	_, err = c.Run(ctx, RunRequest{Project: "/p", Session: "s1", Name: MemVM, Code: `mem.Todo("ship the release")`})
+	require.NoError(t, err)
+
+	text, refused, err := c.MemRead(ctx, "/p", "gnosh mem", "", nil)
+	require.NoError(t, err)
+	require.False(t, refused)
+	require.Contains(t, text, "ship-release")
+
+	text, refused, err = c.MemRead(ctx, "/p", "gnosh mem", "show nope", nil)
+	require.NoError(t, err)
+	require.True(t, refused)
+	require.Contains(t, text, "no item")
+
+	_, refused, err = c.MemRead(ctx, "/p", "gnosh mem", "forget ship-release", nil)
+	require.NoError(t, err)
+	require.True(t, refused, "a shell read refuses a write")
+}
+
 // The client kills a worker that is running a request and silent, or
 // overdue; an idle worker is left alone.
 func TestWorkerKillVerdict(t *testing.T) {

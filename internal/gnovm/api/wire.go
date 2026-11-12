@@ -164,10 +164,15 @@ type (
 		Session string            `json:"session"`
 		Args    string            `json:"args"`
 		Titles  map[string]string `json:"titles,omitempty"`
+		// Command, when set, is a shell read (gnosh mem): it is the name
+		// used in the answer, only show, find and log are accepted, and
+		// Refused on the response is whether mem refused the read.
+		Command string `json:"command,omitempty"`
 	}
 	MemResp struct {
-		Text   string      `json:"text"`
-		Erased *MemErasure `json:"erased,omitempty"`
+		Text    string      `json:"text"`
+		Erased  *MemErasure `json:"erased,omitempty"`
+		Refused bool        `json:"refused,omitempty"`
 	}
 	// GoalReq is one of the goal calls: Op is "bind", "turn", "reopen",
 	// "closed" or "clear".

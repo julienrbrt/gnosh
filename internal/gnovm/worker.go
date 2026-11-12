@@ -271,6 +271,14 @@ func handle(ctx context.Context, host *Host, f *frame) *frame {
 		if err := json.Unmarshal(f.Body, &req); err != nil {
 			return fail(err)
 		}
+		if req.Command != "" {
+			out, refused, err := host.MemRead(ctx, req.Project, req.Command, req.Args, req.Titles)
+			if err != nil {
+				return fail(err)
+			}
+			reply.Body = mustJSON(memResp{Text: out, Refused: refused})
+			break
+		}
 		out, erased, err := host.memCommand(ctx, req.Project, req.Session, req.Args, req.Titles)
 		if err != nil {
 			return fail(err)
