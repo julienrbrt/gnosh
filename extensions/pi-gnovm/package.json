@@ -1,0 +1,26 @@
+{
+  "name": "pi-gnovm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A pi extension that runs Gno VMs and mem through gnosh's GnoVM worker, and cuts popped frames from the model's context.",
+  "type": "module",
+  "license": "SEE LICENSE IN ../../LICENSE.md",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.5.2",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.0.0",
+    "typescript": "^7.0.0"
+  }
+}
