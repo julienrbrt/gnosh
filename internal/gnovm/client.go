@@ -340,6 +340,33 @@ func (c *Client) MemCommand(ctx context.Context, project, session, args string, 
 	return resp.Text, resp.Erased, err
 }
 
+// MemRead answers one of /mem's reads (show, find, log) typed at a shell
+// as command, gnosh mem; see Host.MemRead. It does not treat the call as a
+// change to mem (no vector fill).
+func (c *Client) MemRead(ctx context.Context, project, command, args string, titles map[string]string) (text string, refused bool, err error) {
+	if h, err := c.inProcess(); h != nil || err != nil {
+		if err != nil {
+			return "", false, err
+		}
+		text, refused, err = h.MemRead(ctx, project, command, args, titles)
+		for callAgain(ctx, err) {
+			text, refused, err = h.MemRead(ctx, project, command, args, titles)
+		}
+		return text, refused, err
+	}
+	req := memReq{Project: project, Args: args, Titles: titles, Command: command}
+	body, err := c.call(ctx, msgMem, req)
+	for callAgain(ctx, err) {
+		body, err = c.call(ctx, msgMem, req)
+	}
+	if err != nil {
+		return "", false, err
+	}
+	var resp memResp
+	err = json.Unmarshal(body, &resp)
+	return resp.Text, resp.Refused, err
+}
+
 // inProcess returns the client's own host when it runs VMs in-process, made
 // on first use, or nil when it uses a worker.
 func (c *Client) inProcess() (*Host, error) {

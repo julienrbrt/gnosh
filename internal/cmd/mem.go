@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"testing"
 
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/gnovm"
@@ -49,7 +50,15 @@ func runMem(cmd *cobra.Command, args []string) error {
 	defer done()
 
 	out := cmd.OutOrStdout()
-	opts := gnovm.Options{Dir: app.GnoVMDir(), Client: gnovm.NewClientID(), Embeddings: svc.cfg.Config().Options.MemEmbeddingsURL}
+	opts := gnovm.ClientOptions{
+		Options: gnovm.Options{
+			Dir:        app.GnoVMDir(),
+			Embeddings: svc.cfg.Config().Options.MemEmbeddingsURL,
+		},
+		// go test must not spawn a worker (the test binary would re-exec).
+		// Windows already runs in-process: Acquire forces it there.
+		InProcess: testing.Testing(),
+	}
 	project := svc.cfg.WorkingDir()
 	if _, err := os.Stat(filepath.Dir(gnovm.MemStatusPath(opts.Dir, project))); os.IsNotExist(err) {
 		fmt.Fprintln(out, "no mem here yet: a session makes one when it first keeps something")
@@ -61,14 +70,12 @@ func runMem(cmd *cobra.Command, args []string) error {
 			titles[s.ID] = s.Title
 		}
 	}
-	// One read needs no worker: the host runs here, and takes mem's lock
-	// as a worker does, beside any gnosh with the project open.
-	host, err := gnovm.NewHost(opts)
+	client, err := gnovm.Acquire(opts)
 	if err != nil {
 		return err
 	}
-	defer host.Close()
-	text, refused, err := host.MemRead(ctx, project, version.Command+" mem", strings.Join(args, " "), titles)
+	defer client.Release()
+	text, refused, err := client.MemRead(ctx, project, version.Command+" mem", strings.Join(args, " "), titles)
 	switch {
 	case err != nil:
 		return err

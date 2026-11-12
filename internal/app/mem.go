@@ -23,7 +23,7 @@ func GnoVMDir() string {
 
 // MemCommand runs /mem, the user's command for the project's mem, typed in
 // the session sessionID ("" for none), and returns what to show them. The
-// work is mem's (gnovm.Host.MemCommand); sessions are named by their
+// work is mem's (the GnoVM client's MemCommand); sessions are named by their
 // titles. args never go into a log: /mem redact carries a secret.
 func (a *App) MemCommand(ctx context.Context, sessionID, args string) (string, error) {
 	if a.gnovms == nil {
