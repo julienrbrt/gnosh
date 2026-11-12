@@ -65,7 +65,10 @@ type Hello struct {
 	Magic    string `json:"magic"`
 	Protocol int    `json:"protocol"`
 	Build    string `json:"build"`
-	Gno      string `json:"gno"`
+	// Pinned is set when Build was fixed at build time (-ldflags) rather
+	// than derived from the binary's modification time; see BuildsAgree.
+	Pinned bool   `json:"pinned,omitempty"`
+	Gno    string `json:"gno"`
 	// Set by the client only.
 	Dir             string  `json:"dir,omitempty"`
 	Client          string  `json:"client,omitempty"`
@@ -74,6 +77,18 @@ type Hello struct {
 	DefaultGas      int64   `json:"default_gas,omitempty"`
 	NsPerGas        float64 `json:"ns_per_gas,omitempty"`
 	Embeddings      string  `json:"embeddings,omitempty"`
+}
+
+// BuildsAgree reports whether a client and a worker whose hellos are a and
+// b are builds that may talk, the protocol and gno versions aside. The
+// same build always may. Builds whose ids were pinned at build time must
+// have the same id. Two development builds may not share one, since each
+// id is derived from its own binary's modification time, so a worker
+// built as a program of its own (gnosh-gnovm-worker) is let through when
+// neither side is pinned: the protocol version is what keeps such a pair
+// honest.
+func BuildsAgree(a, b Hello) bool {
+	return a.Build == b.Build || (!a.Pinned && !b.Pinned)
 }
 
 // WriteFrame writes one length-prefixed JSON frame to w.

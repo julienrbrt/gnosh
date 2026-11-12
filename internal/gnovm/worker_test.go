@@ -17,6 +17,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -137,7 +138,7 @@ func TestWorkerRefusesABadHandshake(t *testing.T) {
 	t.Parallel()
 	send, recv, _, served := pipeWorker(t)
 	other := myHello()
-	other.Build = "another-build"
+	other.Build, other.Pinned = "another-build", true
 	send(&frame{Type: msgHello, Body: mustJSON(other)})
 	f := recv()
 	require.NotNil(t, f.Err)
@@ -147,6 +148,73 @@ func TestWorkerRefusesABadHandshake(t *testing.T) {
 	// No hello at all: the worker gives up after handshakeWait.
 	_, _, _, served = pipeWorker(t)
 	require.ErrorIs(t, <-served, errHandshake)
+}
+
+// A development build of the worker made on its own has an id of its own
+// (its binary's modification time): the worker takes a development
+// client's hello all the same, the protocol being the same.
+func TestWorkerTakesAnotherDevelopmentBuild(t *testing.T) {
+	t.Parallel()
+	send, recv, closeReq, served := pipeWorker(t)
+	f := clientHello(t.TempDir())
+	var h hello
+	require.NoError(t, json.Unmarshal(f.Body, &h))
+	h.Build, h.Pinned = "another-development-build", false
+	f.Body = mustJSON(h)
+	send(f)
+	reply := recv()
+	require.Equal(t, msgHello, reply.Type)
+	require.Nil(t, reply.Err)
+	closeReq()
+	require.NoError(t, <-served)
+}
+
+// The worker's program: one named, else gnosh-gnovm-worker beside gnosh's
+// executable (or beside the file it links to), else gnosh itself, for now.
+func TestPickWorker(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("executable bits")
+	}
+	dir := t.TempDir()
+	self := filepath.Join(dir, "gnosh")
+	require.NoError(t, os.WriteFile(self, []byte("gnosh"), 0o755))
+
+	bin, err := pickWorker("", self, false, "darwin")
+	require.NoError(t, err)
+	require.Equal(t, self, bin, "no worker beside it: gnosh runs itself")
+	bin, err = pickWorker("", self, false, "linux")
+	require.NoError(t, err)
+	require.Equal(t, "/proc/self/exe", bin)
+
+	sibling := filepath.Join(dir, WorkerProgram)
+	require.NoError(t, os.WriteFile(sibling, []byte("worker"), 0o644))
+	bin, err = pickWorker("", self, false, "linux")
+	require.NoError(t, err)
+	require.Equal(t, "/proc/self/exe", bin, "a worker that is not executable is not used")
+	require.NoError(t, os.Chmod(sibling, 0o755))
+	bin, err = pickWorker("", self, false, "linux")
+	require.NoError(t, err)
+	require.Equal(t, sibling, bin)
+
+	named := filepath.Join(t.TempDir(), "other-worker")
+	bin, err = pickWorker(named, self, false, "linux")
+	require.NoError(t, err)
+	require.Equal(t, named, bin, "a named program comes first")
+
+	// gnosh linked from elsewhere finds the worker beside the real file.
+	link := filepath.Join(t.TempDir(), "gnosh")
+	require.NoError(t, os.Symlink(self, link))
+	bin, err = pickWorker("", link, false, "linux")
+	require.NoError(t, err)
+	require.Equal(t, sibling, bin)
+
+	// Under go test nothing changes: a program must be named, and not be
+	// the test binary.
+	_, err = pickWorker("", self, true, "linux")
+	require.ErrorContains(t, err, "in-process")
+	_, err = pickWorker(self, self, true, "linux")
+	require.ErrorContains(t, err, "own binary")
 }
 
 // Tests run VMs in-process: a client under go test never spawns its own

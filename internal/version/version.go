@@ -31,6 +31,15 @@ var (
 	BuildID = ""
 )
 
+// buildIDFromLdflags is BuildID as -ldflags set it, read before init
+// derives one: "" for a development build.
+var buildIDFromLdflags = BuildID
+
+// BuildIDPinned reports whether BuildID was set at build time (-ldflags)
+// rather than derived from the executable's modification time. Two
+// programs built separately share a BuildID only when it is pinned.
+func BuildIDPinned() bool { return buildIDFromLdflags != "" }
+
 // A user may install crush using `go install github.com/charmbracelet/crush@latest`.
 // without -ldflags, in which case the version above is unset. As a workaround
 // we use the embedded build version that *is* set when using `go install` (and
