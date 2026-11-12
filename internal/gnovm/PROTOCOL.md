@@ -34,13 +34,25 @@ The JSON envelope (`api.Frame`) is:
 
 Magic string: `gnosh-gnovm`. Protocol version: `1`.
 
-The client execs the worker (`gnosh gnovm-worker`; on Linux,
-`/proc/self/exe`) and immediately writes a `hello` frame on fd 3. The
-worker exits unless a valid hello arrives within **2 seconds**. It
-refuses a hello whose magic is wrong, or whose protocol, gnosh build id,
-or gno/stdlib version differs from its own (it replies with an error
-naming both sides, then exits). On agreement it answers with its own
-`hello` and builds a `Host` from the client's fields.
+The client execs the worker and immediately writes a `hello` frame on
+fd 3. The worker is the program `ClientOptions.Binary` names, else a
+`gnosh-gnovm-worker` next to gnosh's executable (built from
+`gnovm/cmd/gnosh-gnovm-worker`), else gnosh itself as
+`gnosh gnovm-worker` (on Linux, `/proc/self/exe`). The worker exits
+unless a valid hello arrives within **2 seconds**. It refuses a hello
+whose magic is wrong, or whose protocol or gno/stdlib version differs
+from its own, or whose build does not agree with its own (it replies with
+an error naming both sides, then exits). On agreement it answers with its
+own `hello` and builds a `Host` from the client's fields.
+
+Builds agree (`api.BuildsAgree`) when their `build` ids are equal, or when
+neither is `pinned`. A build id is pinned when it was set at build time
+(`-X github.com/charmbracelet/crush/internal/version.BuildID=...`);
+otherwise it is derived from the binary's modification time, so two
+development binaries built separately, gnosh and gnosh-gnovm-worker, never
+share one. Such a pair is let through on the protocol version alone; the
+worker notes it in `worker.log`. Release builds should pin the same id in
+both programs.
 
 The client's hello also carries:
 
@@ -48,6 +60,8 @@ The client's hello also carries:
 - `client` — id of this gnosh process, for its memory-only VMs
 - `budget_bytes`, `default_memory_mb`, `default_gas`, `ns_per_gas`
 - `embeddings` — optional OpenAI-compatible base URL for mem's vectors
+
+Both sides send `pinned` (omitted when false).
 
 Windows cannot pass the extra fds; the client runs the host in-process
 and never starts a worker.

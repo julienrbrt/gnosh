@@ -50,6 +50,7 @@ Thumbs.db
 
 /crush
 /gnosh
+/gnosh-gnovm-worker
 /gnosh-darwin-arm64
 /crush-darwin-arm64
 /tmp/

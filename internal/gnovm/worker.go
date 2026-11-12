@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/charmbracelet/crush/internal/gnovm/api"
 	"github.com/charmbracelet/crush/internal/version"
 )
 
@@ -37,7 +38,7 @@ var errHandshake = errors.New("gnovm worker: no valid handshake")
 
 // myHello is this build's half of the handshake.
 func myHello() hello {
-	return hello{Magic: protocolMagic, Protocol: protocolVersion, Build: version.BuildID, Gno: stdlibVersion()}
+	return hello{Magic: protocolMagic, Protocol: protocolVersion, Build: version.BuildID, Pinned: version.BuildIDPinned(), Gno: stdlibVersion()}
 }
 
 // serve runs the worker's side of the protocol on in and out until in
@@ -73,12 +74,15 @@ func serve(in io.Reader, out io.Writer, setup func(hello)) error {
 		return errHandshake
 	}
 	mine := myHello()
-	if h.Protocol != mine.Protocol || h.Build != mine.Build || h.Gno != mine.Gno {
+	if h.Protocol != mine.Protocol || !api.BuildsAgree(h, mine) || h.Gno != mine.Gno {
 		_ = w.send(&frame{Type: msgHello, Body: mustJSON(mine), Err: &wireError{
 			Kind: "other",
 			Msg:  fmt.Sprintf("worker is build %s (gno %s), client is %s (gno %s): restart gnosh", mine.Build, mine.Gno, h.Build, h.Gno),
 		}})
 		return errHandshake
+	}
+	if h.Build != mine.Build {
+		log.Printf("client is development build %s, worker is %s: protocol %d agrees", h.Build, mine.Build, h.Protocol)
 	}
 	host, err := NewHost(Options{
 		Dir:             h.Dir,

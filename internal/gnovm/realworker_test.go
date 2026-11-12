@@ -20,15 +20,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestRealWorker runs VMs in a real worker process: a gnosh binary built
-// from this tree, never the test binary. It is skipped unless asked for;
-// run it on the devbox, with both binaries given the same build id so their
-// handshake matches, and a cap on processes:
+// TestRealWorker runs VMs in a real worker process: a gnosh binary or a
+// gnosh-gnovm-worker built from this tree, never the test binary. It is
+// skipped unless asked for; run it on the devbox, with a cap on processes:
 //
-//	ID=-X=github.com/charmbracelet/crush/internal/version.BuildID=gnovm-it
-//	go build -ldflags "$ID" -o /root/scratch/gnosh-worker .
-//	GNOVM_WORKER_BIN=/root/scratch/gnosh-worker systemd-run --scope -p TasksMax=64 -- \
-//	  go test -ldflags "$ID" -run TestRealWorker -v ./internal/gnovm/
+//	go build -o /root/scratch/gnosh-gnovm-worker ./gnovm/cmd/gnosh-gnovm-worker
+//	GNOVM_WORKER_BIN=/root/scratch/gnosh-gnovm-worker systemd-run --scope -p TasksMax=64 -- \
+//	  go test -run TestRealWorker -v ./internal/gnovm/
+//
+// Neither binary pins its build id there, so their handshake agrees on the
+// protocol alone; pin the same id in both (-ldflags
+// -X=github.com/charmbracelet/crush/internal/version.BuildID=gnovm-it) to
+// test the strict check.
 //
 // (Not parallel: the client is process-wide.)
 func TestRealWorker(t *testing.T) {

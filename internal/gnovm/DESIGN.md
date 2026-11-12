@@ -82,8 +82,13 @@ gnosh reads the goals snapshots directly for injection, checking them against th
     at once unless a handshake (magic + versions) arrives on fd 3 within 2 s;
   - App-level tests use `in_process`, and a test asserts that `go test` cannot
     spawn a worker.
-- **Worker hygiene**: exec `/proc/self/exe` on Linux (survives a deploy that
-  replaced the binary); the handshake compares protocol, gnosh, gno and stdlib
+- **Which program**: `ClientOptions.Binary` if set, else a
+  `gnosh-gnovm-worker` (`gnovm/cmd/gnosh-gnovm-worker`) next to gnosh's
+  executable or the file it links to, else, for now, gnosh itself as
+  `gnosh gnovm-worker`. There is no environment variable for it: the
+  project's `.env` is loaded into gnosh's environment and is agent-writable.
+- **Worker hygiene**: exec `/proc/self/exe` on Linux when gnosh is its own
+  worker (survives a deploy that replaced the binary); the handshake compares protocol, gnosh, gno and stdlib
   versions; `Setpgid`, SIGINT/SIGHUP ignored; exits on EOF of fd 3; reaped with
   `cmd.Wait`; `GNOSH_PROFILE` dropped; **`cmd.Dir` is the gnovm data directory**
   (`godotenv/autoload` in `main.go` loads `.env` from the working directory

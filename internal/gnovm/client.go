@@ -579,6 +579,11 @@ func (c *workerConn) reap() {
 	c.logF.Close()
 }
 
+// WorkerProgram is the name of the worker as a program of its own
+// (gnovm/cmd/gnosh-gnovm-worker), which gnosh looks for next to its own
+// executable.
+const WorkerProgram = "gnosh-gnovm-worker"
+
 // workerBinary picks the worker's program. Under go test the client never
 // spawns its own binary, which is the test binary: a test that re-ran
 // itself caused a fork bomb on the AI box in October.
@@ -587,7 +592,18 @@ func workerBinary(named string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if testing.Testing() {
+	return pickWorker(named, self, testing.Testing(), runtime.GOOS)
+}
+
+// pickWorker is workerBinary for a process whose executable is self: the
+// program named, if any; else a gnosh-gnovm-worker next to self; else, for
+// now, self, as `gnosh gnovm-worker`.
+//
+// There is deliberately no environment variable for the worker's program:
+// gnosh loads a .env from its working directory, which the agent may
+// write, and that must not choose what gnosh runs.
+func pickWorker(named, self string, underTest bool, goos string) (string, error) {
+	if underTest {
 		if named == "" {
 			return "", errors.New("gnovm: tests run VMs in-process (ClientOptions.InProcess), or name a worker binary")
 		}
@@ -599,12 +615,46 @@ func workerBinary(named string) (string, error) {
 	if named != "" {
 		return named, nil
 	}
+	if bin := siblingWorker(self, goos); bin != "" {
+		return bin, nil
+	}
+	// Temporary: with no gnosh-gnovm-worker beside it, gnosh runs itself as
+	// the worker, as it always has, so a developer who built only gnosh
+	// keeps working. This goes once the worker is a program of its own
+	// that gnosh no longer contains (DESIGN.md §14).
+	//
 	// On Linux, /proc/self/exe is this program even after a deploy
 	// replaced the file, so the worker matches the client's build.
-	if runtime.GOOS == "linux" {
+	if goos == "linux" {
 		return "/proc/self/exe", nil
 	}
 	return self, nil
+}
+
+// siblingWorker is the gnosh-gnovm-worker in the directory of self, or of
+// the file self links to, or "" when there is none: a regular file, and on
+// Unix an executable one.
+func siblingWorker(self, goos string) string {
+	name := WorkerProgram
+	if goos == "windows" {
+		name += ".exe"
+	}
+	dirs := []string{filepath.Dir(self)}
+	if real, err := filepath.EvalSymlinks(self); err == nil && filepath.Dir(real) != dirs[0] {
+		dirs = append([]string{filepath.Dir(real)}, dirs...)
+	}
+	for _, dir := range dirs {
+		bin := filepath.Join(dir, name)
+		st, err := os.Stat(bin)
+		if err != nil || !st.Mode().IsRegular() {
+			continue
+		}
+		if goos != "windows" && st.Mode().Perm()&0o111 == 0 {
+			continue
+		}
+		return bin
+	}
+	return ""
 }
 
 func sameFile(a, b string) bool {
