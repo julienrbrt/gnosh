@@ -7,6 +7,8 @@
 // published in the canonical copy of internal/gnovm/LICENSE.md; together with
 // the Additional Terms (Strong Attribution) in that file.
 
+//go:build !nognovm || windows
+
 package gnovm
 
 import (
@@ -381,17 +383,6 @@ func (h *Host) GoalTurnEnd(ctx context.Context, project, session string, b GoalB
 	defer h.mu.Unlock()
 	h.ensureBase()
 	return h.mem(project).goalTurnEnd(ctx, session, b, marker)
-}
-
-// GoalCheckpoint is what every tenth continuation of a goal asks instead
-// of going on: whether there is a real reason to stop. There is no cap.
-func GoalCheckpoint(b GoalBinding, continued int, marker string) string {
-	return fmt.Sprintf("You have been sent on toward the goal `%[1]s` %[2]q %[3]d times. Step back: is there a real reason "+
-		"to stop? For example, the goal cannot be reached as set; it is blocked on something only the user can give or "+
-		"decide; or you are repeating the same attempts without progress. If the goal already holds, show it and close it "+
-		"with `mem.Done(%[1]q, \"<command> → <result>\")`. If there is a reason to stop, explain it for the user, then end "+
-		"your reply with this line on its own:\n%[4]s\nOtherwise keep working: many attempts are fine.",
-		b.Name, memLine(b.Title, 80), continued, marker)
 }
 
 // GoalReopen reopens a goal the judge found not met.

@@ -55,6 +55,12 @@ tasks:
     generates:
       - crush{{exeExt}}
 
+  build:worker:
+    desc: Build gnosh-gnovm-worker, the GnoVM worker as a program of its own
+    dir: gnovm
+    cmds:
+      - go build -v -o ../gnosh-gnovm-worker{{exeExt}} ./cmd/gnosh-gnovm-worker
+
   run:
     desc: Run build
     cmds:

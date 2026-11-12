@@ -7,6 +7,8 @@
 // published in the canonical copy of internal/gnovm/LICENSE.md; together with
 // the Additional Terms (Strong Attribution) in that file.
 
+//go:build !nognovm || windows
+
 package gnovm
 
 import (
@@ -77,17 +79,6 @@ type memContext struct {
 	checked     []string
 	closes      *[]MemClose
 	pushedAt    map[string]int
-}
-
-// memOp is one change to a mem, as gnomem's do hands it to gnosh and the
-// journal keeps it (gnomem's Op).
-type memOp struct {
-	Kind  string `json:"kind"`
-	Name  string `json:"name,omitempty"`
-	Field string `json:"field,omitempty"`
-	Old   string `json:"old,omitempty"`
-	New   string `json:"new,omitempty"`
-	By    string `json:"by,omitempty"`
 }
 
 // memNativeGas is what a mem native costs: a little bookkeeping in Go.
@@ -285,27 +276,6 @@ func memCallContext(m *gno.Machine, native string) memContext {
 		panic(native + ": only mem's own Mem, in a mem call, may change mem")
 	}
 	return ctx
-}
-
-// stackAfter is stack, a session's frames bottom to top, after events, a
-// call's pushes and pops in order: a push goes on top, and a pop takes its
-// frame off.
-func stackAfter(stack []string, events []MemFrame) []string {
-	out := append([]string(nil), stack...)
-	for _, e := range events {
-		switch e.Kind {
-		case "push":
-			out = append(out, e.Id)
-		case "pop":
-			for i := len(out) - 1; i >= 0; i-- {
-				if out[i] == e.Id {
-					out = append(out[:i:i], out[i+1:]...)
-					break
-				}
-			}
-		}
-	}
-	return out
 }
 
 // memArg is the native's i'th parameter, a string.

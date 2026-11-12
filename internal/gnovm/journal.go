@@ -92,26 +92,6 @@ func lineHash(line []byte) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// createJournal writes a new VM journal holding only its header, durably.
-func createJournal(path string, now time.Time) (*journal, error) {
-	return writeJournalHeader(path, journalHeader{Generation: newGeneration(), Created: now.UTC()})
-}
-
-// writeJournalHeader writes a new journal holding only hdr, durably, as
-// this build's format and gno version.
-func writeJournalHeader(path string, hdr journalHeader) (*journal, error) {
-	hdr.Version, hdr.Gno = journalVersion, stdlibVersion()
-	line, err := json.Marshal(hdr)
-	if err != nil {
-		return nil, err
-	}
-	line = append(line, '\n')
-	if err := writeFileSync(path, line); err != nil {
-		return nil, err
-	}
-	return &journal{path: path, generation: hdr.Generation, gno: hdr.Gno, instance: hdr.Instance, size: int64(len(line)), lastHash: lineHash(line)}, nil
-}
-
 // errBrokenJournal marks a journal that cannot be read past some line.
 var errBrokenJournal = errors.New("journal is broken")
 

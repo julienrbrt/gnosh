@@ -14,9 +14,6 @@ import (
 	"fmt"
 	"strings"
 	"unicode/utf8"
-
-	gno "github.com/gnolang/gno/gnovm/pkg/gnolang"
-	storetypes "github.com/gnolang/gno/tm2/pkg/store/types"
 )
 
 // refusal is an input the host would not run: nothing ran.
@@ -117,39 +114,6 @@ func classifyTrip(err error) error {
 		return &limitError{kind: "cancelled"}
 	}
 	return err
-}
-
-// panicError turns what a run panicked with into an error. A meter trip
-// wins: the GnoVM sometimes wraps or replaces the panic that carried it.
-func panicError(r any, meter *callMeter) error {
-	if err := meter.tripped(); err != nil {
-		return classifyTrip(err)
-	}
-	switch r := r.(type) {
-	case stopRun:
-		return classifyTrip(r.err)
-	case storetypes.OutOfGasError:
-		return &limitError{kind: "gas"}
-	case gno.UnhandledPanicError:
-		return &panicked{msg: truncate(r.Descriptor, maxValue)}
-	case *gno.PreprocessError:
-		msg := r.Unwrap().Error()
-		if isAllocLimit(msg) {
-			return &limitError{kind: "memory"}
-		}
-		return &compileError{msg: truncate(msg, maxValue)}
-	case string:
-		if isAllocLimit(r) {
-			return &limitError{kind: "memory"}
-		}
-		return errors.New(truncate(r, maxValue))
-	case error:
-		if isAllocLimit(r.Error()) {
-			return &limitError{kind: "memory"}
-		}
-		return fmt.Errorf("%s", truncate(r.Error(), maxValue))
-	}
-	return fmt.Errorf("%s", truncate(fmt.Sprint(r), maxValue))
 }
 
 func isAllocLimit(msg string) bool { return strings.Contains(msg, "allocation limit exceeded") }

@@ -61,7 +61,9 @@ The client's hello also carries:
 - `budget_bytes`, `default_memory_mb`, `default_gas`, `ns_per_gas`
 - `embeddings` — optional OpenAI-compatible base URL for mem's vectors
 
-Both sides send `pinned` (omitted when false).
+Both sides send `pinned` (omitted when false). A gnosh built with
+`-tags nognovm` holds no interpreter and sends an empty `gno`; the worker
+then does not compare it (it is the one that knows the gno version).
 
 Windows cannot pass the extra fds; the client runs the host in-process
 and never starts a worker.

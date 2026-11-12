@@ -13,7 +13,11 @@ machine subsystem, carries its own copy of the same License in
 
 ## Before you open a pull request
 
-- Build and test: `go build ./...` and `go test ./...`.
+- Build and test: `go build ./...` and `go test ./...`. The GnoVM worker is
+  a module of its own: also `cd gnovm && go build ./...`. A gnosh built with
+  `-tags nognovm` leaves the GnoVM out and runs its VMs only in
+  `gnosh-gnovm-worker`, which it looks for next to its executable
+  (`task build:worker`; see `internal/gnovm/DESIGN.md` §14).
 - Format with `gofumpt` (`gofmt` is not enough; the linter checks it).
 - Write a test that fails before your change and passes after it.
 - Keep the commit message about what changes and why, in plain sentences.
