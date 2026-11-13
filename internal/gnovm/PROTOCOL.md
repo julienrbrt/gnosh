@@ -68,6 +68,18 @@ then does not compare it (it is the one that knows the gno version).
 Windows cannot pass the extra fds; the client runs the host in-process
 and never starts a worker.
 
+## Other clients
+
+The protocol is not gnosh's alone: `extensions/pi-gnovm` is a client of
+it in TypeScript, for pi. Such a client sends a `build` of its own,
+unpinned, and an empty `gno`, so a worker built without a pinned build id
+takes it, and a pinned (release) worker refuses it, as it would a gnosh of
+another build. It holds no client lock (`.clients/<client>.lock`, an
+flock Node cannot take), so another gnosh's sweep may delete its
+memory-only VMs while it runs; it deletes them itself when it closes, as
+gnosh's client does. Its persistent VMs and mem are the same files as
+gnosh's.
+
 Tests must not spawn their own test binary as the worker (a re-exec
 caused a fork bomb). They set `ClientOptions.InProcess` or name another
 binary.
