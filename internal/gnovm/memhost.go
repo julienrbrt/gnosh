@@ -7,6 +7,8 @@
 // published in the canonical copy of internal/gnovm/LICENSE.md; together with
 // the Additional Terms (Strong Attribution) in that file.
 
+//go:build !nognovm || windows
+
 package gnovm
 
 import (
@@ -24,7 +26,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/charmbracelet/crush/internal/lock"
 	"golang.org/x/mod/semver"
 )
 
@@ -281,21 +282,6 @@ func (h *memHost) touched(r *memRealm, caller string, ops []memOp, working func(
 	return out.Goals
 }
 
-// memStatus is status.json: mem.JSON() as gnosh computed it for no session
-// after a change, with what it was computed for. Hooks read it, and so does
-// the <mem> block at a session's start, without opening mem.
-type memStatus struct {
-	Generation string `json:"generation"`
-	Seq        int64  `json:"seq"`
-	// Day is the user's local date it was computed on, and At when (Unix
-	// seconds): when mem last changed.
-	Day string          `json:"day"`
-	At  int64           `json:"at"`
-	Mem json.RawMessage `json:"mem"`
-}
-
-const memStatusFile = "status.json"
-
 // writeStatus writes status.json for the store r as it holds j. It is best
 // effort: a reader of an old one sees mem as it was.
 func (h *memHost) writeStatus(r *memRealm, j *journal) {
@@ -429,49 +415,10 @@ func (h *memHost) lock(ctx context.Context) (func(), error) {
 	return lockMemDir(ctx, h.dir)
 }
 
-// lockMemDir takes the lock of mem in dir, waiting while another holds it
-// (a gnosh process's call, or its main process reading the index or
-// writing vectors) until ctx is done. The wait is the kernel's: the lock
-// is granted the moment its holder lets go, with no polling and no limit
-// but ctx; every holder's turn is one call, which mem bounds.
-func lockMemDir(ctx context.Context, dir string) (func(), error) {
-	if err := mkdirSync(dir); err != nil {
-		return nil, err
-	}
-	path := filepath.Join(dir, "lock")
-	if release, err := lock.TryFile(path); err == nil {
-		return release, nil
-	} else if !errors.Is(err, lock.ErrContended) {
-		return nil, err
-	}
-	// A worker's heartbeats say it waits, so the client does not count the
-	// wait against the request's deadline.
-	if w := lockWaiting(ctx); w != nil {
-		w.Store(true)
-		defer w.Store(false)
-	}
-	release, err := lock.File(ctx, path)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, &busyError{msg: "stopped waiting for mem, which another gnosh process was using"}
-		}
-		return nil, err
-	}
-	return release, nil
-}
-
-// lockWaitingKey carries a request's flag for "waiting for mem's lock".
-type lockWaitingKey struct{}
-
 // withLockWaiting is ctx carrying flag, which lockMemDir sets while it
 // waits for mem's lock.
 func withLockWaiting(ctx context.Context, flag *atomic.Bool) context.Context {
 	return context.WithValue(ctx, lockWaitingKey{}, flag)
-}
-
-func lockWaiting(ctx context.Context) *atomic.Bool {
-	flag, _ := ctx.Value(lockWaitingKey{}).(*atomic.Bool)
-	return flag
 }
 
 // newerGno reports whether gno version v, a store's, is newer than this
@@ -770,11 +717,6 @@ func (h *memHost) removeOtherGenerations(gen string) {
 	}
 }
 
-// memIndexLayout is the layout of mem's index: a change to its schema or to
-// how Ops become rows is a new number, and an index of another is rebuilt.
-// 2 keeps an item's status; 3 gives thoughts rows of their own.
-const memIndexLayout = 3
-
 func (h *memHost) indexStamp(j *journal) memStamp {
 	return memStamp{Layout: memIndexLayout, Generation: j.generation, Seq: j.seq, End: j.size, Hash: j.lastHash}
 }
@@ -908,88 +850,6 @@ func (h *Host) mem(project string) *memHost {
 	return m
 }
 
-// memDir is where a project's mem lives under dir, keyed by memRoot.
-func memDir(dir, project string) string {
-	return keyedMemDir(dir, memRoot(dir, project))
-}
-
-// keyedMemDir is where the mem keyed by root lives under dir.
-func keyedMemDir(dir, root string) string {
-	return filepath.Join(dir, projectKey(root), "mem")
-}
-
-// memRoot is what a project's mem under data is keyed by. Outside git, it is
-// the project's directory. In a repository, it is the first to have a mem
-// of: the git common dir, which the repository's worktrees and
-// subdirectories share; the folder the common dir is the .git of. With
-// neither, the common dir. So a folder keeps its mem when it becomes a
-// repository (a scaffold's git init), and a worktree made after shares its
-// main checkout's. Symlinks are resolved first, and nothing is cached, so
-// every process finds the same mem.
-func memRoot(data, project string) string {
-	dir, err := filepath.EvalSymlinks(project)
-	if err != nil {
-		dir = filepath.Clean(project)
-	}
-	for d := dir; ; d = filepath.Dir(d) {
-		git := filepath.Join(d, ".git")
-		if fi, err := os.Stat(git); err == nil {
-			if fi.IsDir() {
-				return keptRoot(data, git)
-			}
-			if common := gitCommonDir(git); common != "" {
-				return keptRoot(data, common)
-			}
-		}
-		if filepath.Dir(d) == d {
-			return dir
-		}
-	}
-}
-
-// keptRoot is memRoot in a repository whose git common dir is common.
-func keptRoot(data, common string) string {
-	roots := []string{common}
-	if filepath.Base(common) == ".git" {
-		roots = append(roots, filepath.Dir(common))
-	}
-	for _, root := range roots {
-		if _, err := os.Stat(keyedMemDir(data, root)); err == nil {
-			return root
-		}
-	}
-	return common
-}
-
-// gitCommonDir reads a worktree's .git file ("gitdir: <path>") and that git
-// dir's commondir file, and returns the common dir they name; "" if they do
-// not.
-func gitCommonDir(gitFile string) string {
-	b, err := os.ReadFile(gitFile)
-	if err != nil {
-		return ""
-	}
-	gitdir, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "gitdir:")
-	if !ok {
-		return ""
-	}
-	gitdir = strings.TrimSpace(gitdir)
-	if !filepath.IsAbs(gitdir) {
-		gitdir = filepath.Join(filepath.Dir(gitFile), gitdir)
-	}
-	common := gitdir
-	if b, err := os.ReadFile(filepath.Join(gitdir, "commondir")); err == nil {
-		common = strings.TrimSpace(string(b))
-		if !filepath.IsAbs(common) {
-			common = filepath.Join(gitdir, common)
-		}
-	}
-	if resolved, err := filepath.EvalSymlinks(common); err == nil {
-		return resolved
-	}
-	return filepath.Clean(common)
-}
-
 // memInfo is mem as gnovm_list shows it; ok is false while the project has
 // no mem yet.
 func (h *Host) memInfo(project string) (VMInfo, bool) {
@@ -1046,4 +906,116 @@ func (h *memHost) repair(ctx context.Context) (int, error) {
 		err = nil
 	}
 	return n, err
+}
+
+// finder answers the find native from the index x of journal j: the rows
+// holding all the words, then those closest in meaning, and, when neither
+// finds any, the rows holding one of the words. how says how it looked
+// (see nearest). An index that cannot answer finds nothing, and the error
+// is logged.
+func (h *memHost) finder(ctx context.Context, x *memIndex, j *journal) func(words string, max int) (names, kinds []string, how string) {
+	return func(words string, max int) (names, kinds []string, how string) {
+		all, any, err := x.find(words, max)
+		if err != nil {
+			slog.Warn("mem's index could not search", "error", err)
+			return nil, nil, ""
+		}
+		seen := map[string]bool{}
+		add := func(r memRow) {
+			if !seen[r.kind+" "+r.name] && len(names) < max {
+				seen[r.kind+" "+r.name] = true
+				names, kinds = append(names, r.name), append(kinds, r.kind)
+			}
+		}
+		for _, r := range all {
+			add(r)
+		}
+		near, how := h.nearest(ctx, x, j, words)
+		for _, r := range near {
+			add(r.memRow)
+		}
+		if len(names) == 0 {
+			for _, r := range any {
+				add(r)
+			}
+		}
+		return names, kinds, how
+	}
+}
+
+// nearest is the rows of x close in meaning to words, closest first. how is
+// "meaning" when it looked by meaning; "words" when the embedding server
+// did not answer the search, so that only the words were matched; and ""
+// when there is no server, no vectors yet, or vectors of another model.
+func (h *memHost) nearest(ctx context.Context, x *memIndex, j *journal, words string) (rows []memScored, how string) {
+	if h.embed == nil {
+		return nil, ""
+	}
+	v, err := openMemVectors(memVectorsPath(h.dir, j.generation))
+	if err != nil {
+		slog.Warn("mem's vectors could not be read", "error", err)
+		return nil, ""
+	}
+	defer v.close()
+	vecs, had, err := v.all()
+	if err != nil || len(vecs) == 0 {
+		return nil, ""
+	}
+	all, err := x.rows()
+	if err != nil {
+		slog.Warn("mem's index could not be read", "error", err)
+		return nil, ""
+	}
+	qs, model, err := h.embed.query(ctx, words)
+	switch {
+	case err != nil:
+		return nil, "words"
+	case model != had:
+		return nil, ""
+	}
+	s := memSnapshot{gen: j.generation, rows: all, vecs: vecs, model: had}
+	return s.nearest(qs, model, memFindScore, "item", "thought", "fact", "rule"), "meaning"
+}
+
+// meaningLine is what /mem says of finding by meaning: which model, and how
+// much of mem it has read; "" with no embedding server, or an empty mem.
+func (h *memHost) meaningLine(ctx context.Context) string {
+	if h.embed == nil {
+		return ""
+	}
+	var all, read int
+	var model string
+	ok, err := atMem(ctx, h.dir, "", func(_ string, x *memIndex, v *memVectors) error {
+		rows, err := x.rows()
+		if err != nil {
+			return err
+		}
+		have, err := v.hashes()
+		if err != nil {
+			return err
+		}
+		all = len(rows)
+		for _, r := range rows {
+			if have[r.hash()] {
+				read++
+			}
+		}
+		model, err = v.model()
+		return err
+	})
+	var line string
+	switch {
+	case err != nil || !ok || all == 0:
+		return ""
+	case read == 0:
+		line = fmt.Sprintf("mem will find by meaning too once the embedding server has read it (0 of %d entries so far)", all)
+	case read < all:
+		line = fmt.Sprintf("mem also finds by meaning, with %s: %d of %d entries read, the rest on their way", model, read, all)
+	default:
+		line = fmt.Sprintf("mem also finds by meaning, with %s (all %d entries read)", model, all)
+	}
+	if late, _ := memLate.Load(h.embed.base); late == true {
+		line += fmt.Sprintf("; but the server did not answer its last search within %s, which matched words only", memEmbedWait)
+	}
+	return line
 }

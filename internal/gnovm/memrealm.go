@@ -7,6 +7,8 @@
 // published in the canonical copy of internal/gnovm/LICENSE.md; together with
 // the Additional Terms (Strong Attribution) in that file.
 
+//go:build !nognovm || windows
+
 package gnovm
 
 import (
@@ -206,23 +208,6 @@ type memCall struct {
 	// batch is what the call wrote, held back from the store until commit;
 	// nil for a read.
 	batch storetypes.Store
-}
-
-// memStamp is what a store holds, kept in it under memStampKey and written
-// in the batch of each change: the layout and the gno version it was built
-// under, and the journal's generation and the entry it holds, with where
-// that entry's line ends and the line's hash.
-type memStamp struct {
-	Layout     int    `json:"layout"`
-	Gno        string `json:"gno"`
-	Generation string `json:"generation"`
-	Seq        int64  `json:"seq"`
-	End        int64  `json:"end"`
-	Hash       string `json:"hash,omitempty"`
-	// Unchecked marks a store being built afresh from the journal, whose
-	// rebuild has not been checked yet (memHost.checkRebuild): one cut
-	// across calls is checked by the call that finishes it.
-	Unchecked bool `json:"unchecked,omitempty"`
 }
 
 // memStampKey keeps the stamp beside gno's own keys.

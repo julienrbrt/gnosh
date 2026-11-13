@@ -55,6 +55,22 @@ type ClientOptions struct {
 	Binary string
 }
 
+// localHost is what a client calls on a host of its own, in-process: a
+// *Host, in a build that contains the GnoVM (client_inprocess.go).
+type localHost interface {
+	Run(ctx context.Context, req RunRequest) (*RunResult, error)
+	New(ctx context.Context, req NewRequest) (VMInfo, bool, error)
+	List(projectPath string) (ListResult, error)
+	Drop(ctx context.Context, projectPath, name, action string) error
+	Kept(projectPath, name, req string) (bool, error)
+	KeptFrames(projectPath, req string) ([]MemFrame, bool, error)
+	Repair(ctx context.Context, projectPath, name string) (kept, cut int, err error)
+	memCommand(ctx context.Context, project, session, args string, titles map[string]string) (string, *MemErasure, error)
+	MemRead(ctx context.Context, project, command, args string, titles map[string]string) (text string, refused bool, err error)
+	goal(ctx context.Context, req goalReq) (goalResp, error)
+	Close() error
+}
+
 // Client is a gnosh process's way to its VMs: a worker it spawns on first
 // use (and again if the worker dies), or a host of its own in-process. It
 // is shared by the process (server mode has one App per workspace) and
@@ -63,7 +79,7 @@ type Client struct {
 	opts    ClientOptions
 	mu      sync.Mutex
 	refs    int
-	host    *Host
+	host    localHost
 	conn    *workerConn
 	release func()
 	// deaths records why workers ended, newest last, for gnovm_list.
@@ -367,24 +383,6 @@ func (c *Client) MemRead(ctx context.Context, project, command, args string, tit
 	return resp.Text, resp.Refused, err
 }
 
-// inProcess returns the client's own host when it runs VMs in-process, made
-// on first use, or nil when it uses a worker.
-func (c *Client) inProcess() (*Host, error) {
-	if !c.opts.InProcess {
-		return nil, nil
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.host == nil {
-		h, err := NewHost(c.opts.Options)
-		if err != nil {
-			return nil, err
-		}
-		c.host = h
-	}
-	return c.host, nil
-}
-
 // workerDied is a request whose worker ended before it replied. For a run,
 // whether the call was kept is not known until the next worker is asked.
 type workerDied struct{ cause string }
@@ -592,17 +590,17 @@ func workerBinary(named string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return pickWorker(named, self, testing.Testing(), runtime.GOOS)
+	return pickWorker(named, self, testing.Testing(), runtime.GOOS, selfIsWorker)
 }
 
 // pickWorker is workerBinary for a process whose executable is self: the
-// program named, if any; else a gnosh-gnovm-worker next to self; else, for
-// now, self, as `gnosh gnovm-worker`.
+// program named, if any; else a gnosh-gnovm-worker next to self; else, in
+// a build that contains the GnoVM (selfOK), self, as `gnosh gnovm-worker`.
 //
 // There is deliberately no environment variable for the worker's program:
 // gnosh loads a .env from its working directory, which the agent may
 // write, and that must not choose what gnosh runs.
-func pickWorker(named, self string, underTest bool, goos string) (string, error) {
+func pickWorker(named, self string, underTest bool, goos string, selfOK bool) (string, error) {
 	if underTest {
 		if named == "" {
 			return "", errors.New("gnovm: tests run VMs in-process (ClientOptions.InProcess), or name a worker binary")
@@ -618,10 +616,13 @@ func pickWorker(named, self string, underTest bool, goos string) (string, error)
 	if bin := siblingWorker(self, goos); bin != "" {
 		return bin, nil
 	}
-	// Temporary: with no gnosh-gnovm-worker beside it, gnosh runs itself as
-	// the worker, as it always has, so a developer who built only gnosh
-	// keeps working. This goes once the worker is a program of its own
-	// that gnosh no longer contains (DESIGN.md §14).
+	if !selfOK {
+		return "", fmt.Errorf("gnovm: %s was not found next to %s; this gnosh is built without the GnoVM (-tags nognovm), so its VMs run only in that program", WorkerProgram, self)
+	}
+	// With no gnosh-gnovm-worker beside it, a gnosh that contains the GnoVM
+	// runs itself as the worker, as it always has, so a developer who built
+	// only gnosh keeps working. A gnosh built with -tags nognovm does not
+	// contain it, and needs the program (DESIGN.md §14).
 	//
 	// On Linux, /proc/self/exe is this program even after a deploy
 	// replaced the file, so the worker matches the client's build.

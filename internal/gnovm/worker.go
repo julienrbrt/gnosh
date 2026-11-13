@@ -7,6 +7,8 @@
 // published in the canonical copy of internal/gnovm/LICENSE.md; together with
 // the Additional Terms (Strong Attribution) in that file.
 
+//go:build !nognovm || windows
+
 package gnovm
 
 import (
@@ -21,7 +23,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/crush/internal/gnovm/api"
-	"github.com/charmbracelet/crush/internal/version"
 )
 
 const (
@@ -35,11 +36,6 @@ const (
 // errHandshake is a worker that was not started by a gnosh client, or by
 // one of another build.
 var errHandshake = errors.New("gnovm worker: no valid handshake")
-
-// myHello is this build's half of the handshake.
-func myHello() hello {
-	return hello{Magic: protocolMagic, Protocol: protocolVersion, Build: version.BuildID, Pinned: version.BuildIDPinned(), Gno: stdlibVersion()}
-}
 
 // serve runs the worker's side of the protocol on in and out until in
 // ends: the handshake, then requests one at a time, with cancels taken at
@@ -74,7 +70,9 @@ func serve(in io.Reader, out io.Writer, setup func(hello)) error {
 		return errHandshake
 	}
 	mine := myHello()
-	if h.Protocol != mine.Protocol || !api.BuildsAgree(h, mine) || h.Gno != mine.Gno {
+	// A client built without the GnoVM sends no gno version: the worker,
+	// which holds the interpreter, is the one that knows it.
+	if h.Protocol != mine.Protocol || !api.BuildsAgree(h, mine) || (h.Gno != "" && h.Gno != mine.Gno) {
 		_ = w.send(&frame{Type: msgHello, Body: mustJSON(mine), Err: &wireError{
 			Kind: "other",
 			Msg:  fmt.Sprintf("worker is build %s (gno %s), client is %s (gno %s): restart gnosh", mine.Build, mine.Gno, h.Build, h.Gno),

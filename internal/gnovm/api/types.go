@@ -163,6 +163,9 @@ type ListResult struct {
 	Used      int64
 	BaseBytes int64
 	VMs       []VMInfo
+	// Importable lists the packages a VM may import, besides fmt; the
+	// worker fills it, since only it holds the standard library.
+	Importable []string `json:",omitempty"`
 }
 
 // HostMemory is what the host gnosh runs on can give it.

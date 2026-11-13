@@ -6,6 +6,8 @@
 // that License, with the Additional Terms (Strong Attribution); see
 // internal/gnovm/LICENSE.md.
 
+//go:build !nognovm || windows
+
 package gnovm
 
 import (

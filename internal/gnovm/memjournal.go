@@ -7,6 +7,8 @@
 // published in the canonical copy of internal/gnovm/LICENSE.md; together with
 // the Additional Terms (Strong Attribution) in that file.
 
+//go:build !nognovm || windows
+
 package gnovm
 
 import (
@@ -104,18 +106,6 @@ func erasureOf(ops []memOp) (er memErasure, ok bool) {
 // forgets reports whether er forgets the item, fact or rule (target) name.
 func (er memErasure) forgets(target, name string) bool {
 	return er.forgotten[target+" "+name]
-}
-
-// opTarget is what an Op names: an "item", "fact" or "rule"; or
-// "statements", for a redact of past inputs' code alone.
-func opTarget(op memOp) string {
-	switch {
-	case op.Kind == "fact" || op.Kind == "rule":
-		return op.Kind
-	case op.Kind == "redact", op.Kind == "forget" && op.Field != "":
-		return op.Field
-	}
-	return "item"
 }
 
 // holds reports whether s holds a secret, as typed or Go-quoted, as it sits

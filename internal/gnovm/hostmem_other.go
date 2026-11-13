@@ -7,7 +7,7 @@
 // published in the canonical copy of internal/gnovm/LICENSE.md; together with
 // the Additional Terms (Strong Attribution) in that file.
 
-//go:build !linux && !darwin
+//go:build !linux && !darwin && (!nognovm || windows)
 
 package gnovm
 

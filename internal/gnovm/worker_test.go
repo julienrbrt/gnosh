@@ -180,40 +180,46 @@ func TestPickWorker(t *testing.T) {
 	self := filepath.Join(dir, "gnosh")
 	require.NoError(t, os.WriteFile(self, []byte("gnosh"), 0o755))
 
-	bin, err := pickWorker("", self, false, "darwin")
+	bin, err := pickWorker("", self, false, "darwin", true)
 	require.NoError(t, err)
 	require.Equal(t, self, bin, "no worker beside it: gnosh runs itself")
-	bin, err = pickWorker("", self, false, "linux")
+	bin, err = pickWorker("", self, false, "linux", true)
 	require.NoError(t, err)
 	require.Equal(t, "/proc/self/exe", bin)
 
 	sibling := filepath.Join(dir, WorkerProgram)
 	require.NoError(t, os.WriteFile(sibling, []byte("worker"), 0o644))
-	bin, err = pickWorker("", self, false, "linux")
+	bin, err = pickWorker("", self, false, "linux", true)
 	require.NoError(t, err)
 	require.Equal(t, "/proc/self/exe", bin, "a worker that is not executable is not used")
 	require.NoError(t, os.Chmod(sibling, 0o755))
-	bin, err = pickWorker("", self, false, "linux")
+	bin, err = pickWorker("", self, false, "linux", true)
 	require.NoError(t, err)
 	require.Equal(t, sibling, bin)
 
 	named := filepath.Join(t.TempDir(), "other-worker")
-	bin, err = pickWorker(named, self, false, "linux")
+	bin, err = pickWorker(named, self, false, "linux", true)
 	require.NoError(t, err)
 	require.Equal(t, named, bin, "a named program comes first")
 
 	// gnosh linked from elsewhere finds the worker beside the real file.
 	link := filepath.Join(t.TempDir(), "gnosh")
 	require.NoError(t, os.Symlink(self, link))
-	bin, err = pickWorker("", link, false, "linux")
+	bin, err = pickWorker("", link, false, "linux", true)
 	require.NoError(t, err)
 	require.Equal(t, sibling, bin)
 
+	// A gnosh built without the GnoVM (-tags nognovm) is never its own
+	// worker: with none beside it, it says so.
+	require.NoError(t, os.Remove(sibling))
+	_, err = pickWorker("", self, false, "linux", false)
+	require.ErrorContains(t, err, WorkerProgram+" was not found")
+
 	// Under go test nothing changes: a program must be named, and not be
 	// the test binary.
-	_, err = pickWorker("", self, true, "linux")
+	_, err = pickWorker("", self, true, "linux", true)
 	require.ErrorContains(t, err, "in-process")
-	_, err = pickWorker(self, self, true, "linux")
+	_, err = pickWorker(self, self, true, "linux", true)
 	require.ErrorContains(t, err, "own binary")
 }
 

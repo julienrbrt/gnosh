@@ -7,19 +7,14 @@
 // published in the canonical copy of internal/gnovm/LICENSE.md; together with
 // the Additional Terms (Strong Attribution) in that file.
 
-// Package gnovm runs named Gno virtual machines for gnosh: each with a
-// memory cap and a gas limit per call, its state kept as a journal of the
-// calls that succeeded, persisted on request, and evicted from memory when
-// the budget needs the room. DESIGN.md has the design and its reviews.
+//go:build !nognovm || windows
+
 package gnovm
 
 import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,7 +32,6 @@ import (
 )
 
 const (
-	scratchPrefix = "scratch-"
 	// maxNamedVMs is how many named VMs a project may have; scratch VMs
 	// do not count.
 	maxNamedVMs = 64
@@ -72,38 +66,6 @@ var (
 	maxEntryWall  = 30 * time.Second
 	maxReplayWall = 120 * time.Second
 )
-
-// Options configures a Host.
-type Options struct {
-	// Dir is the data directory, <XDG data>/gnosh/gnovm.
-	Dir string
-	// Client names the gnosh process the host serves, for its memory-only
-	// VMs, which live until that process exits; NewClientID makes one.
-	Client string
-	// BudgetBytes caps the memory the VMs may use; 0 picks it from the
-	// host's free memory.
-	BudgetBytes int64
-	// Defaults for new VMs; zero values mean the built-in defaults.
-	DefaultMemoryMB int
-	DefaultGas      int64
-	NsPerGas        float64
-	// Probe reads the host's memory; nil means ProbeHostMemory.
-	Probe func() (HostMemory, error)
-	// Now is the clock; nil means time.Now.
-	Now func() time.Time
-	// Embeddings is the embedding server mem finds by meaning with, an
-	// OpenAI-compatible base URL such as http://127.0.0.1:8091/v1. mem's
-	// text, and what the user types, are sent there. "" finds by words
-	// alone, and sends nothing anywhere.
-	Embeddings string
-}
-
-// NewClientID returns a fresh id for a gnosh process.
-func NewClientID() string {
-	var b [4]byte
-	_, _ = rand.Read(b[:])
-	return strconv.Itoa(os.Getpid()) + "-" + hex.EncodeToString(b[:])
-}
 
 type machineFile struct {
 	Name    string    `json:"name"`
@@ -247,41 +209,6 @@ func (h *Host) Close() error {
 		h.release = nil
 	}
 	return nil
-}
-
-// deleteEphemeral deletes a client's memory-only VMs, in every project.
-func deleteEphemeral(dir, client string) {
-	matches, _ := filepath.Glob(filepath.Join(dir, "*", ".ephemeral", client))
-	for _, m := range matches {
-		_ = os.RemoveAll(m)
-	}
-}
-
-// projectKey names a project's directory: its path, made safe, and a hash of
-// it, so two projects never share one.
-func projectKey(project string) string {
-	clean := filepath.Clean(project)
-	sum := sha256.Sum256([]byte(clean))
-	var b strings.Builder
-	for _, r := range strings.Trim(clean, string(filepath.Separator)) {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
-	}
-	s := b.String()
-	if len(s) > 48 {
-		s = s[len(s)-48:]
-	}
-	return s + "-" + hex.EncodeToString(sum[:4])
-}
-
-// ScratchName is the name of a session's scratch VM.
-func ScratchName(session string) string {
-	sum := sha256.Sum256([]byte(session))
-	return scratchPrefix + hex.EncodeToString(sum[:4])
 }
 
 func (h *Host) projectDir(project string) string { return filepath.Join(h.opts.Dir, project) }
@@ -462,16 +389,6 @@ func (h *Host) lockVM(ctx context.Context, s *vmState) (func(), error) {
 		}
 	}
 }
-
-// busyError is a VM that cannot be used right now; trying again later may
-// work. again marks mem's catch-up whose slice is spent: the work goes on
-// with the next call, which the client makes at once, never the model.
-type busyError struct {
-	msg   string
-	again bool
-}
-
-func (e *busyError) Error() string { return e.msg }
 
 // sync brings this host's view of a VM up to date with its files, under the
 // VM's lock: it reads the journal the first time, cuts a torn tail another
@@ -1243,6 +1160,7 @@ func (h *Host) List(projectPath string) (ListResult, error) {
 	if h.base != nil {
 		out.BaseBytes = h.base.heap
 	}
+	out.Importable = ImportablePackages()
 	states, err := h.projectStates(project)
 	if err != nil {
 		return out, err
@@ -1400,4 +1318,24 @@ func (h *Host) Repair(ctx context.Context, projectPath, name string) (kept, cut 
 	}
 	s.j, s.res, s.broken, s.brokenAt, s.brokenGen = nil, nil, nil, 0, ""
 	return len(good), total - len(good), nil
+}
+
+// createJournal writes a new VM journal holding only its header, durably.
+func createJournal(path string, now time.Time) (*journal, error) {
+	return writeJournalHeader(path, journalHeader{Generation: newGeneration(), Created: now.UTC()})
+}
+
+// writeJournalHeader writes a new journal holding only hdr, durably, as
+// this build's format and gno version.
+func writeJournalHeader(path string, hdr journalHeader) (*journal, error) {
+	hdr.Version, hdr.Gno = journalVersion, stdlibVersion()
+	line, err := json.Marshal(hdr)
+	if err != nil {
+		return nil, err
+	}
+	line = append(line, '\n')
+	if err := writeFileSync(path, line); err != nil {
+		return nil, err
+	}
+	return &journal{path: path, generation: hdr.Generation, gno: hdr.Gno, instance: hdr.Instance, size: int64(len(line)), lastHash: lineHash(line)}, nil
 }

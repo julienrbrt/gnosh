@@ -476,6 +476,26 @@ but not raise it, and cannot set `in_process`. Lands with the worker (phase
   Crush version's FSL becomes MIT two years after release); or (b) a separate
   `gnosh-gnovm-worker` program holding everything that links gno, with gnosh's
   own binary free of it. Changing Charm's licence is not the Licensor's to do.
+- **Way (b), as built so far** (pending the Licensor's confirmation that (b)
+  is the way out): the worker is a program of its own,
+  `gnovm/cmd/gnosh-gnovm-worker`, in a Go module of its own
+  (`gnovm/go.mod`, `github.com/charmbracelet/crush/gnovm`), and gnosh built
+  with `-tags nognovm` does not link the GnoVM or embed its standard library.
+  The files of this subsystem that make up the host carry the build
+  constraint `!nognovm || windows`; what is left is the client and what it
+  shares with the host (the wire types, mem's directory layout, its index
+  and vectors, which recall reads in gnosh's own process). Such a gnosh is
+  never its own worker: it needs `gnosh-gnovm-worker` next to its
+  executable. `TestFSLBinaryDoesNotLinkGnoVM` (`nognovm_test.go`) checks
+  `go list -deps` on Linux and macOS: no `github.com/gnolang/gno/gnovm/...`
+  package, and no embedded `stdlibs/` or `klashlibs/`; tm2 and x402 remain.
+  Still open: the default build (`go build .`, and so releases until
+  packaging ships two binaries) still contains the GnoVM; Windows keeps the
+  host in-process until it can hand a worker the protocol's pipes; the
+  client code that stays in the FSL binary is this subsystem's, under this
+  License, so it needs the additional permission §18 asks about; and moving
+  the host's sources themselves into the worker module is a larger change,
+  left until the split is agreed.
   No gnosh binary is released meanwhile (the nightly workflow is gated to
   upstream). CONTRIBUTING.md, the README's Contributing and License sections,
   the CLA bot text and the release archive (`LICENSE-gnovm*.md`) match the
