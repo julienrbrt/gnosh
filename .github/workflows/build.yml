@@ -27,6 +27,14 @@ jobs:
       - run: go mod tidy
       - run: git diff --exit-code
       - run: go build -race ./...
+      # The GnoVM worker is a module of its own (gnovm/go.mod), and gnosh
+      # built with -tags nognovm must build without it; the go list gate
+      # is TestFSLBinaryDoesNotLinkGnoVM, run with the tests below.
+      - run: go mod tidy && git diff --exit-code
+        working-directory: gnovm
+      - run: go build ./...
+        working-directory: gnovm
+      - run: go build -tags nognovm -o /dev/null .
       # Under -race the GnoVM package takes about 20 minutes, past go test's
       # default 10.
       - run: go test -race -failfast -timeout 60m ./...
