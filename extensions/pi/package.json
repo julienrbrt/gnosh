@@ -1,0 +1,27 @@
+{
+  "name": "pi-gnosh",
+  "version": "0.1.0",
+  "description": "gnosh's Gno machines, mem and frames in pi, through `gnosh bridge`.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "gnosh", "gno"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "files": ["src", "README.md", "LICENSE"],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.5.2",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^1.5.2",
+    "@earendil-works/pi-coding-agent": "^1.5.2",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.4.7",
+    "typescript": "^5.9.0"
+  }
+}
