@@ -27,7 +27,7 @@ This extension gives pi exactly that and nothing else of gnosh.
 | `session_before_compact` | cancels pi's summary when slides brought the conversation under pi's point; otherwise lets pi summarize, as a gnosh session does with no frame to cut |
 
 The extension holds none of gnosh's logic. It starts `gnosh bridge` (JSON
-lines over stdio; the protocol is gnosh's `spec/gnosh/bridge.md`) and maps
+lines over stdio; the protocol is [`spec/gnosh/bridge.md`](../../spec/gnosh/bridge.md)) and maps
 pi's messages to gnosh's session entries and back. Frame rules, slide
 planning and the wording to the model stay in gnosh, so they improve there.
 
@@ -44,17 +44,15 @@ from your context when you pop it").
 
 ## Use
 
-Needs a gnosh with `gnosh bridge`, `prompt`, `room` and `step` on `PATH` (or
-`PI_GNOSH_PROGRAM=/path/to/gnosh`). Until upstream has it, build it from the
-`feat/bridge-context` branch of https://github.com/julienrbrt/gnosh:
+Needs a gnosh with `gnosh bridge` (ops `prompt`, `room` and `step`) on `PATH`,
+or `PI_GNOSH_PROGRAM=/path/to/gnosh`. Build it from this repository's root:
 
-    git clone -b feat/bridge-context https://github.com/julienrbrt/gnosh && cd gnosh
     CGO_ENABLED=0 go build -o ~/bin/gnosh .
 
-Then:
+Then, from this directory:
 
-    pi -e ./src/index.ts           # from a checkout
-    pi install npm:pi-gnosh        # once published
+    npm install
+    pi -e ./src/index.ts
 
 `gnovm_drop` deleting a machine is put to the person with pi's confirm
 dialog; without a UI it does not run. pi's own compaction settings
@@ -63,7 +61,7 @@ dialog; without a UI it does not run. pi's own compaction settings
 ## See it work, with no model and no network
 
     npm install
-    GNOSH_BIN=~/bin/gnosh npm run demo
+    GNOSH_BIN=~/bin/gnosh npm run demo   # in extensions/pi
 
 `demo/run.ts` drives pi's own faux provider through the same script twice,
 in a 14K window: two large reads, a push, three large reads in the frame, a
@@ -84,8 +82,9 @@ mapping, and the prefix staying byte-stable across a pop).
 ## Benchmark
 
 See [BENCHMARK.md](BENCHMARK.md): pi with and without this extension on the
-same FrontierHarness tasks, same model, same window, same settings.
+same FrontierHarness tasks, same model, same window, same settings, and how
+to rerun it.
 
 ## License
 
-MIT. gnosh itself is under its own license; this package only runs it.
+As the rest of this repository: [LICENSE.md](../../LICENSE.md).
