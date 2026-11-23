@@ -257,3 +257,59 @@ A failure the model should see is not an error: it is `ok: true` with
 - Not stable: the wording of the tools, the receipts and the notes (it is
   gnosh's to improve), and the shape of a view beyond what `frames.md`
   promises. A host must not parse them.
+
+## 10. What a session tells its model, and the slide
+
+Without these a host has mem's calls and the cut, and its model is told
+nothing of either: it does not push, so nothing is ever popped, and the
+host's own summary still governs length. A host that wants a gnosh
+session's behaviour asks for them as gnosh's session would use them. They
+are listed in `ops`; protocol 1 is unchanged.
+
+### 10.1 `prompt`
+
+    → {"op":"prompt","session":"S","first":true,"entries":[…]}
+    ← {"ok":true,"system":"<memory>…</memory>","parts":["<mem>…</mem>","Use mem and Gno …","<system-reminder>You are in `x` …</system-reminder>"]}
+
+- `system` is the system prompt's part about mem (`prompt.Memory`, the
+  lean text), the same bytes every time: the host puts it after its own
+  system prompt, so the prefix a provider caches stays the same.
+- `parts` go after a prompt a person typed, in order: with `first`, the
+  digest of mem (`<mem>`, when mem holds anything); the mem line; and the
+  frame line while the session stands in a frame (its stack from
+  `entries` when given, else as the bridge keeps it, §6.3).
+
+### 10.2 `room`: the slide, instead of a summary
+
+    → {"op":"room","session":"S","entries":[…],"need":12000,"prompt":"e40","edit_tools":["edit","write"]}
+    ← {"ok":true,"new_slides":[{"type":"frame","op":"slide",…}],"freed":13100,"parts":["<system-reminder>The start of `x` left your context …</system-reminder>"],"notice":"slid `x`: …"}
+
+- The host asks at the point where it would summarize (frames.md §8.2),
+  with `need` = what is over the point plus a tenth of the window, by its
+  own count. The bridge plans the cut with `transcript.Slide`, as a
+  session's `MakeRoom` does.
+- `new_slides` are slide entries with a `uuid` and `sessionId` of their
+  own: the host keeps them with the conversation and sends them, at the
+  end of the entries as they stood, in every later `view`, `room` and
+  `step`. `freed` is about how many tokens left the view.
+- `freed` 0 and no slides means nothing could slide: the session stands in
+  no frame, or too little is left. Then, and only then, the host makes
+  room its own way (a summary); "compaction remains only with no frame to
+  cut".
+- `parts` is the slide's line, for the host to add as a note of its own
+  before the model's next reply (frames.md §8.6). `edit_tools` names the
+  host's file-editing tools, whose `file_path` arguments the line names;
+  they default to gnosh's own.
+
+### 10.3 `step`: between two rounds of a turn
+
+    → {"op":"step","session":"S","entries":[…],"used":61000,"point":98000}
+    ← {"ok":true,"parts":["This todo is large: …"]}
+
+- The host asks after each round's results are in, before the model's
+  next reply. `used` is its token count of the request just answered and
+  `point` the count at which it would summarize.
+- `parts` are notes for the host to add before the next reply, each once
+  as a session gives it: the large-step line (frames.md §8.7), measured
+  from `used` when the top frame was entered, and the mem reminder after
+  ten replies with no call on mem.

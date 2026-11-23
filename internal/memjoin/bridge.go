@@ -9,7 +9,9 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/bridge"
 	"github.com/gnosh-ai/gnosh/internal/buildinfo"
 	"github.com/gnosh-ai/gnosh/internal/core"
+	"github.com/gnosh-ai/gnosh/internal/gnovm"
 	gnovmtools "github.com/gnosh-ai/gnosh/internal/gnovm/tools"
+	"github.com/gnosh-ai/gnosh/internal/prompt"
 )
 
 // This file is `gnosh bridge` (spec/gnosh/bridge.md): the project's
@@ -53,6 +55,9 @@ func (p *process) bridgeCommand(ctx context.Context, c *app.CommandContext) int 
 			}).Tools()
 		},
 		Frames:   bridgeFrames,
+		Texts:    prompt.Builtin(),
+		Digest:   func() string { return gnovm.MemBlock(DataDir(c.Dirs.State), project) },
+		UsesMem:  usesMem,
 		Confirms: map[string]bool{gnovmtools.DropToolName: true},
 		Log:      func(line string) { fmt.Fprintln(c.Stderr, line) },
 	})

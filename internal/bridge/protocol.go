@@ -19,10 +19,15 @@ const (
 	OpTools = "tools"
 	OpCall  = "call"
 	OpView  = "view"
+	// The three below carry what a gnosh session tells its model of mem
+	// and makes room with, beside the frames view (bridge.md §10).
+	OpPrompt = "prompt"
+	OpRoom   = "room"
+	OpStep   = "step"
 )
 
 // ops is what hello says the bridge answers.
-var ops = []string{OpHello, OpTools, OpCall, OpView}
+var ops = []string{OpHello, OpTools, OpCall, OpView, OpPrompt, OpRoom, OpStep}
 
 // The error codes of bridge.md §8.
 const (
@@ -57,6 +62,17 @@ type Request struct {
 	Room       int                `json:"room,omitempty"`
 	KeepRounds int                `json:"keep_rounds,omitempty"`
 	Prompt     string             `json:"prompt,omitempty"`
+
+	// prompt (Session too)
+	First bool `json:"first,omitempty"`
+
+	// room (Session, Entries and Prompt too)
+	Need      int      `json:"need,omitempty"`
+	EditTools []string `json:"edit_tools,omitempty"`
+
+	// step (Session and Entries too)
+	Point int `json:"point,omitempty"`
+	Used  int `json:"used,omitempty"`
 }
 
 // Reply is one line the bridge writes. Which fields are set depends on the
@@ -88,6 +104,12 @@ type Reply struct {
 	Tokens     int                `json:"tokens,omitempty"`
 	OverBudget bool               `json:"over_budget,omitempty"`
 	NewSlides  []transcript.Entry `json:"new_slides,omitempty"`
+
+	// prompt, room and step
+	System string   `json:"system,omitempty"`
+	Parts  []string `json:"parts,omitempty"`
+	Freed  int      `json:"freed,omitempty"`
+	Notice string   `json:"notice,omitempty"`
 }
 
 // Error is what a reply with ok false says went wrong.

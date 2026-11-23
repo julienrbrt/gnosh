@@ -249,3 +249,92 @@ func mustJSON(t *testing.T, v any) string {
 	}
 	return string(raw)
 }
+
+// A host asks for what a session tells its model of mem, makes room with
+// a slide instead of a summary, and is given the lines a session adds
+// between rounds (bridge.md §10).
+func TestBridgePromptRoomStep(t *testing.T) {
+	w := newWorld(t)
+	h := w.bridge()
+	h.ask(map[string]any{"op": "hello", "protocol": 1, "client": "test"})
+
+	p := h.ask(map[string]any{"op": "prompt", "session": "S1", "first": true})
+	if !p.OK || !strings.Contains(p.System, "mem") || len(p.Parts) == 0 || !strings.Contains(strings.Join(p.Parts, "\n"), "Use mem and Gno") {
+		t.Fatalf("prompt: %+v", p)
+	}
+
+	c := &conv{session: "S1"}
+	c.prompt("fix the port")
+	// Exploration before any frame: what slides first.
+	for i := 0; i < 4; i++ {
+		id := "x" + itoa(i)
+		c.call(id, `"`+strings.Repeat("read ", 400)+`"`, "")
+		c.result(id, h.ask(runCall(id, `"`+strings.Repeat("read ", 400)+`"`, "")))
+	}
+	none := h.ask(map[string]any{"op": "room", "session": "S1", "entries": c.entries, "need": 1000})
+	if !none.OK || none.Freed != 0 || len(none.NewSlides) != 0 {
+		t.Fatalf("room with no frame should free nothing: %+v", none)
+	}
+	h.ask(map[string]any{"op": "step", "session": "S1", "entries": c.entries, "used": 5000, "point": 20000})
+	c.call("c1", `mem.Todo("fix the port").Push()`, "mem")
+	push := h.ask(runCall("c1", `mem.Todo("fix the port").Push()`, "mem"))
+	c.result("c1", push)
+	for i := 0; i < 3; i++ {
+		id := "w" + itoa(i)
+		c.call(id, `"`+strings.Repeat("work ", 400)+`"`, "")
+		c.result(id, h.ask(runCall(id, `"`+strings.Repeat("work ", 400)+`"`, "")))
+	}
+
+	p = h.ask(map[string]any{"op": "prompt", "session": "S1", "entries": c.entries})
+	if !strings.Contains(strings.Join(p.Parts, "\n"), "You are in `") {
+		t.Fatalf("no frame line while in a frame: %+v", p.Parts)
+	}
+
+	room := h.ask(map[string]any{"op": "room", "session": "S1", "entries": c.entries, "need": 1000, "prompt": "e000"})
+	if !room.OK || room.Freed <= 0 || len(room.NewSlides) == 0 || len(room.Parts) != 1 || !strings.Contains(room.Parts[0], "left your context to make room") {
+		t.Fatalf("room: %+v", room)
+	}
+	before := h.ask(map[string]any{"op": "view", "session": "S1", "entries": c.entries})
+	c.entries = append(c.entries, room.NewSlides...)
+	after := h.ask(map[string]any{"op": "view", "session": "S1", "entries": c.entries})
+	if after.Tokens >= before.Tokens || len(after.Stack) != 1 {
+		t.Fatalf("the slide took nothing out of the view: %d -> %d tokens, stack %+v; %+v %+v", before.Tokens, after.Tokens, after.Stack, after.Error, room.NewSlides)
+	}
+	// The first round stays as the cut's anchor; the oldest rounds after it go.
+	reads := 0
+	for _, m := range after.Messages {
+		if strings.Contains(textOf(m), "read read") {
+			reads++
+		}
+	}
+	if reads >= 8 {
+		t.Fatalf("the rounds before the frame are still in the view: %d messages", reads)
+	}
+
+	// Much came in since the frame was entered: the large-step line, once.
+	st := h.ask(map[string]any{"op": "step", "session": "S1", "entries": c.entries, "used": 16000, "point": 20000})
+	if !st.OK || len(st.Parts) != 1 || !strings.Contains(st.Parts[0], "This todo is large") {
+		t.Fatalf("step: %+v", st)
+	}
+	st = h.ask(map[string]any{"op": "step", "session": "S1", "entries": c.entries, "used": 17000, "point": 20000})
+	if len(st.Parts) != 0 {
+		t.Fatalf("the large-step line twice: %+v", st.Parts)
+	}
+	// Ten replies with no call on mem: the reminder, once.
+	for i := 0; i < 10; i++ {
+		id := "r" + itoa(i)
+		c.call(id, `"x"`, "")
+		c.result(id, h.ask(runCall(id, `"x"`, "")))
+	}
+	st = h.ask(map[string]any{"op": "step", "session": "S1", "entries": c.entries, "used": 17000, "point": 20000})
+	if len(st.Parts) != 1 || !strings.Contains(st.Parts[0], "You have not used mem") {
+		t.Fatalf("no reminder: %+v", st.Parts)
+	}
+	st = h.ask(map[string]any{"op": "step", "session": "S1", "entries": c.entries, "used": 17000, "point": 20000})
+	if len(st.Parts) != 0 {
+		t.Fatalf("the reminder twice: %+v", st.Parts)
+	}
+	if code := h.close(); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/gnosh-ai/gnosh/internal/core"
+	"github.com/gnosh-ai/gnosh/internal/prompt"
 	"github.com/gnosh-ai/gnosh/internal/transcript"
 )
 
@@ -33,6 +34,15 @@ type Options struct {
 	// approval, for ToolInfo.Confirm. The calls themselves are judged by
 	// core.Describer.
 	Confirms map[string]bool
+	// Texts are gnosh's words to the model that prompt, room and step
+	// hand out. Nil means those three answer with nothing to say.
+	Texts *prompt.Set
+	// Digest is what a new session is told of the project's mem (the
+	// <mem> block), or "" when mem holds nothing to tell.
+	Digest func() string
+	// UsesMem reports whether a reply of the model calls mem, for the mem
+	// reminder's count.
+	UsesMem func(core.Message) bool
 	// Log, when not nil, is told what the bridge has to say for a person:
 	// one line each, for standard error.
 	Log func(line string)
@@ -55,6 +65,17 @@ type Server struct {
 type session struct {
 	stack []string
 	store *sync.Map
+	// used is the host's token count of the session's last request, as
+	// step was told it, and pushedAt what it was when each frame on the
+	// stack was entered, by the call that entered it: the large-step
+	// line's measure (frames.md §8.7).
+	used     int
+	pushedAt map[string]int
+	// large holds the push calls of the frames the large-step line was
+	// said of, and remindedAt the number of entries when the mem reminder
+	// was last given.
+	large      map[string]bool
+	remindedAt int
 }
 
 // New makes a Server.
@@ -153,6 +174,12 @@ func (s *Server) Handle(ctx context.Context, line []byte) (Reply, error) {
 		return s.call(ctx, req), nil
 	case OpView:
 		return s.view(req), nil
+	case OpPrompt:
+		return s.prompt(req), nil
+	case OpRoom:
+		return s.room(req), nil
+	case OpStep:
+		return s.step(req), nil
 	case "":
 		return fail(req.ID, CodeBadRequest, "the request has no op"), nil
 	}
@@ -237,6 +264,10 @@ func (s *Server) apply(ss *session, f Frame) {
 	switch f.Kind {
 	case "push":
 		ss.stack = append(ss.stack, f.ID)
+		if ss.pushedAt == nil {
+			ss.pushedAt = map[string]int{}
+		}
+		ss.pushedAt[f.ID] = ss.used
 	case "pop":
 		for i := len(ss.stack) - 1; i >= 0; i-- {
 			if ss.stack[i] == f.ID {
@@ -270,7 +301,7 @@ func (s *Server) view(req Request) Reply {
 	ss := s.session(req.Session)
 	stack := make([]string, len(info.Stack))
 	rep := Reply{OK: true, ID: req.ID, Messages: msgs, Sources: info.Sources, Tokens: info.Tokens,
-		OverBudget: info.OverBudget, NewSlides: info.NewSlides, Stack: []StackFrame{}}
+		OverBudget: info.OverBudget, NewSlides: named(info.NewSlides, req.Session), Stack: []StackFrame{}}
 	for i, f := range info.Stack {
 		stack[i] = f.ID
 		rep.Stack = append(rep.Stack, StackFrame{ID: f.ID, Label: f.Label, CallID: f.ToolUseID, Slid: f.Slid})

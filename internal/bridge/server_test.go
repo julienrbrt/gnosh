@@ -103,7 +103,7 @@ func TestSpec4Hello(t *testing.T) {
 		t.Fatalf("%v %+v", err, reps)
 	}
 	r := reps[0]
-	if !r.OK || string(r.ID) != `"h"` || r.Protocol != 1 || r.Build != "b1" || r.Version != "gnosh b1" || r.Project != "/p" || strings.Join(r.Ops, ",") != "hello,tools,call,view" {
+	if !r.OK || string(r.ID) != `"h"` || r.Protocol != 1 || r.Build != "b1" || r.Version != "gnosh b1" || r.Project != "/p" || strings.Join(r.Ops, ",") != "hello,tools,call,view,prompt,room,step" {
 		t.Errorf("hello reply %+v", r)
 	}
 }
