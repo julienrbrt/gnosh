@@ -19,6 +19,8 @@ Commands
   session <command>       Look at and manage sessions. (Not built yet.)
   mem [show|find|log]     Read the project's mem, without a model. (Not built
                           yet.)
+  bridge                  Serve the project's machines, mem and frames view to
+                          another harness, without a model. (Not built yet.)
   prompt <command>        Read gnosh's own words to the model, and make any of
                           them yours. (Not built yet.)
   agents                  The sessions that run in the background, and those

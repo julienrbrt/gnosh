@@ -229,3 +229,13 @@ func (s *Set) AgentMemory(dir, scope, index string, cut bool) string {
 	}
 	return s.fill(textAgentMemory, v)
 }
+
+// Memory returns the system prompt's part about mem alone, as System adds
+// it for a session with gnovm_run: for a host that is not gnosh and puts
+// gnosh's machine tools beside its own (spec/gnosh/bridge.md, prompt).
+func (s *Set) Memory(form MemoryForm) string {
+	if form == MemoryFull {
+		return strings.TrimSpace(s.fill(textMemoryFull, nil))
+	}
+	return strings.TrimSpace(s.fill(textMemory, nil))
+}

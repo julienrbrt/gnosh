@@ -46,6 +46,10 @@ const (
 	// CmdMem reads the project's mem; Invocation.Args holds the words after
 	// `mem`, for mem itself to read.
 	CmdMem Command = "mem"
+	// CmdBridge serves the project's machine tools and the frames view to
+	// another harness, as JSON lines on standard input and output
+	// (spec/gnosh/bridge.md).
+	CmdBridge Command = "bridge"
 	// CmdPromptShow and the two after it are `gnosh prompt ...`: gnosh's
 	// texts to the model listed or printed, the folder of the person's own,
 	// and gnosh's written there to edit (Invocation.Force writes over a
