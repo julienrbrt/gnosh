@@ -90,9 +90,10 @@ test("pi sends no popped work after a mem pop", { skip: !program && "GNOSH_BIN i
     for (const s of [sent[4], sent[5]]) {
       assert.ok(!s.some((m) => m.includes("1 + 1") || m.includes("lots of work")), s.join("\n"));
       assert.equal(s[0], "user: fix the port");
-      assert.ok(s[2].startsWith(sent[1][2]));
-      assert.match(s[2].replace(" | ", ""), /removed from your context when you popped it\.\]$/);
-      assert.match(s[3], /^assistant: call mem\.Pop/);
+      assert.match(s[1], /^user: <gnosh>Use mem and Gno/); // the mem line after the prompt
+      assert.ok(s[3].startsWith(sent[1][3]));
+      assert.match(s[3].replace(" | ", ""), /removed from your context when you popped it\.\]$/);
+      assert.match(s[4], /^assistant: call mem\.Pop/);
     }
     assert.deepEqual(sent[5].slice(0, sent[4].length), sent[4]);
   } finally {

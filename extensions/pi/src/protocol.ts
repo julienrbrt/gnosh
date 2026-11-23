@@ -81,4 +81,9 @@ export interface Reply {
   tokens?: number;
   over_budget?: boolean;
   new_slides?: Entry[];
+  // prompt, room and step (bridge.md §10)
+  system?: string;
+  parts?: string[];
+  freed?: number;
+  notice?: string;
 }

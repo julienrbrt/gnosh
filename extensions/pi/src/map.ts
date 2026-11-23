@@ -67,30 +67,55 @@ export interface Mapped {
   byUuid: Map<string, PiMessage[]>;
 }
 
+/** The tools whose `path` argument names a file they write: gnosh's view reads it as `file_path`. */
+const EDIT_TOOLS = new Set(["edit", "write"]);
+
+/**
+ * keyOf is a message's own name, the same in every request of the session
+ * while the message is in it: a slide names entries by uuid and is sent
+ * again in every later view, so a uuid must not move when messages before
+ * it go (a pi summary) or come.
+ */
+function keyOf(m: PiMessage, i: number): string {
+  if (m.role === "toolResult" && m.toolCallId) return `r:${m.toolCallId}`;
+  if (m.role === "assistant" && Array.isArray(m.content)) {
+    const call = m.content.find((c) => c.type === "toolCall" && c.id);
+    if (call) return `a:${call.id}`;
+  }
+  const ts = m.timestamp;
+  return typeof ts === "number" || typeof ts === "string" ? `${m.role[0]}:${ts}` : `i:${i}`;
+}
+
 /** toEntries maps one request's pi messages to gnosh entries for session. */
 export function toEntries(msgs: readonly PiMessage[], session: string): Mapped {
   const entries: Entry[] = [];
   const byUuid = new Map<string, PiMessage[]>();
-  const add = (e: Omit<Entry, "uuid">, from: PiMessage[]) => {
-    const uuid = `m${entries.length}`;
+  const add = (e: Omit<Entry, "uuid">, from: PiMessage[], key: string) => {
+    let uuid = key;
+    for (let n = 2; byUuid.has(uuid); n++) uuid = `${key}#${n}`;
     entries.push({ ...e, uuid } as Entry);
     byUuid.set(uuid, from);
   };
   for (let i = 0; i < msgs.length; i++) {
     const m = msgs[i];
     if (m.role === "user") {
-      add({ type: "user", source: "prompt", message: { role: "user", content: userBlocks(m.content) } }, [m]);
+      add({ type: "user", source: "prompt", message: { role: "user", content: userBlocks(m.content) } }, [m], keyOf(m, i));
     } else if (m.role === "assistant") {
       const content: Block[] = [];
       for (const c of (Array.isArray(m.content) ? m.content : []) as Content[]) {
         if (c.type === "text") content.push({ type: "text", text: c.text ?? "" });
         else if (c.type === "thinking") content.push({ type: "thinking", text: c.thinking ?? "" });
-        else if (c.type === "toolCall") content.push({ type: "tool_use", id: c.id, name: c.name, input: c.arguments ?? {} });
+        else if (c.type === "toolCall") {
+          const args = (c.arguments ?? {}) as Record<string, unknown>;
+          const input = EDIT_TOOLS.has(c.name ?? "") && typeof args.path === "string" ? { ...args, file_path: args.path } : args;
+          content.push({ type: "tool_use", id: c.id, name: c.name, input });
+        }
       }
       const calls = content.some((b) => b.type === "tool_use");
-      add({ type: "assistant", stop: calls ? "tool_use" : "end_turn", message: { role: "assistant", content } }, [m]);
+      add({ type: "assistant", stop: calls ? "tool_use" : "end_turn", message: { role: "assistant", content } }, [m], keyOf(m, i));
     } else if (m.role === "toolResult") {
       const group: PiMessage[] = [];
+      const first = i;
       while (i < msgs.length && msgs[i].role === "toolResult") group.push(msgs[i++]);
       i--;
       add(
@@ -103,16 +128,17 @@ export function toEntries(msgs: readonly PiMessage[], session: string): Mapped {
           },
         },
         group,
+        keyOf(group[0], first),
       );
       for (const r of group) {
-        for (const f of framesOf(r)) {
-          if (f.session !== session) continue;
+        framesOf(r).forEach((f, k) => {
+          if (f.session !== session) return;
           const common = { type: "frame" as const, sessionId: session, frame: f.id, label: f.purpose ?? "", toolUseId: r.toolCallId };
-          add(f.kind === "push" ? { ...common, op: "push" } : { ...common, op: "pop", result: f.result ?? "" }, []);
-        }
+          add(f.kind === "push" ? { ...common, op: "push" } : { ...common, op: "pop", result: f.result ?? "" }, [], `f:${r.toolCallId}:${k}`);
+        });
       }
     } else if ((m as { excludeFromContext?: boolean }).excludeFromContext !== true) {
-      add({ type: "user", source: "notice", message: { role: "user", content: [{ type: "text", text: noticeText(m) }] } }, [m]);
+      add({ type: "user", source: "notice", message: { role: "user", content: [{ type: "text", text: noticeText(m) }] } }, [m], keyOf(m, i));
     }
   }
   return { entries, byUuid };
