@@ -26,6 +26,12 @@
 //     --tools left it out): refused.
 //  2. Deny rules, from every source: refused. A deny from any source beats
 //     an allow from any other, and no allow rule carves a hole in one.
+//     Then the blocks outside the working directories, Claude Code's
+//     blockReadsOutsideWorkingDirectories and
+//     blockWritesOutsideWorkingDirectories (Options.BlockReads and
+//     BlockWrites, block.go): a file tool's read or change outside them
+//     is refused, and a shell command that reads outside them, or whose
+//     files cannot be told, is asked about, in every mode.
 //  3. Ask rules: a person is asked, in every mode (dontAsk refuses).
 //  4. The checks that no allow rule and no hook approval passes: a change
 //     to a protected path, a dangerous removal, a guard that could not be
@@ -55,8 +61,9 @@
 //   - dontAsk: runs what default runs and what allow rules cover, and
 //     refuses everything that would have asked.
 //   - bypassPermissions: runs everything except what a deny rule refuses,
-//     what an ask rule or a hook wants asked, a dangerous removal, and a
-//     command a deny or ask rule could not be checked against.
+//     what an ask rule or a hook wants asked, a dangerous removal, a
+//     command a deny or ask rule could not be checked against, and what
+//     the blocks outside the working directories refuse or ask about.
 //
 // "manual" is another name for default. "auto" is not a gnosh mode and
 // reads as default, with a note in Explain. A project's settings can
@@ -188,8 +195,14 @@
 // program hash -p or BASH_CMDS names (with the words that follow the
 // name where the line uses it: "hash -p /bin/rm ls; ls -rf x" is rm -rf
 // x), a command in a variable that some
-// program runs (PAGER, GIT_EXTERNAL_DIFF), and a $(...) inside quoted
-// text, which the shell may yet evaluate: x='a[$(cmd)]'; echo $((x)),
+// program runs (PAGER, GIT_EXTERNAL_DIFF), set before it or by export or
+// declare, the file BASH_ENV names (as by source), what history -s puts
+// in the shell's history (fc runs it again), the command a git setting
+// given with git -c or written by git config runs (core.pager,
+// core.sshCommand, diff.external and their kin) and a git alias (git -c
+// alias.z='!rm x' z runs rm; git -c alias.p=push p pushes), and a
+// $(...) inside quoted text, which the shell may yet evaluate:
+// x='a[$(cmd)]'; echo $((x)),
 // and the word after >&, which bash expands twice (ls >&'$(cmd)').
 // Each is matched as written, with quotes removed, without its directory
 // (/bin/rm is rm), whatever the case of the program's name (RM is rm,
@@ -279,6 +292,27 @@
 //
 // A word counts as quoted only when every variable and every command
 // substitution in it stands inside the quotes.
+//
+// A program that a flag of its own sends to another folder works there
+// (env -C, sudo -D, tar -C, make -C, go -C, and git's own -C, each of
+// which goes on from the one before): each such folder is one the line
+// may be in, as a cd makes it, so "env -C sub cat ../.env" reads .env. A
+// cd found inside a command (command cd, builtin cd, eval 'cd x') counts
+// where that command stands in the line. A file glued to a short flag is
+// a name too (curl -K.env), and so is the value after the = of a long
+// flag that the table of read-only commands does not know (diff
+// --from-file=.env). A command handed a list of the files it reads (tar
+// -T, rsync --files-from, cpio -o, zip -@, --files0-from) names files
+// nobody sees ahead of time. A folder changed with all that is in it (rm
+// -r, chmod -R, mv, a copy into it with cp -r or rsync -r) changes a file
+// that a rule names inside it, by its path written out, when the file is
+// there (a copy: when it brings a file of that name along); a rule that
+// names files inside it by a pattern makes the command one that cannot be
+// checked. A rule that matches at any depth (a bare name: Edit(.env)) is
+// looked for in such a folder and two folders below it, and no deeper. A
+// program this package knows nothing about
+// writes the file its output flag names (-o, -ofile, --output, -out), tar
+// the archive it makes, zip its archive and sqlite3 its database.
 //
 // What the line gives its variables is followed along the roads a line
 // plainly takes: an assignment, or several (each value counts); an
@@ -396,9 +430,15 @@
 // ".." after a link is taken from where the link leads, so link/../x is
 // judged at both places. A file a test looks at counts as read, and git
 // is never handed an unquoted pattern (a file named like a flag would
-// reach it as one). diff, which reads the files of a directory it is
-// given and follows the links among them, has every entry of that
-// directory checked. A variable, a brace pattern or (with no
+// reach it as one). A repository's own settings can make even git status
+// run a program (core.fsmonitor, a filter, a diff driver), so git after a
+// cd in the line asks, and with Options.RepoOf every git command asks
+// while the shell's folder, moved there by an earlier command, is in a
+// repository that is not a working directory's own, nor a work tree or
+// submodule of one; Options.GitRunsPrograms makes git ask in an untrusted
+// folder whose own settings name such programs. diff, which reads the
+// files of a directory it is given and follows the links among them, has
+// every entry of that directory checked. A variable, a brace pattern or (with no
 // Options.Glob) a file name pattern cannot be checked ahead of time and
 // asks, and so does a file that an earlier cp, mv or ln of the same line
 // puts in place. A pattern that starts with a dot (.*) is taken to match
@@ -465,7 +505,8 @@
 //     program. BASH_ENV, ENV, exported functions, SHELLOPTS, BASHOPTS,
 //     POSIXLY_CORRECT, CDPATH and GLOBIGNORE in the environment of the
 //     person who started gnosh are that person's own doing; the engine
-//     cannot see them. zsh has not been held against this package.
+//     cannot see them. Nor does it read the profile files a login shell
+//     runs (sh -l): like a file sourced, they are programs of their own. zsh has not been held against this package.
 //
 // # Protected paths and dangerous removals
 //

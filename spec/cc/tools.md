@@ -133,6 +133,11 @@ Behaviour:
   and recompressed to fit the model's limits; over 128 MB is refused. (P2)
 - **PDFs**: short ones whole; longer than 10 pages only by `pages`; page
   rendering needs `pdftoppm` (error text `pdftoppm is not installed`). (P2)
+  gnosh gives a PDF's text instead of pictures of its pages, by poppler's
+  `pdfinfo` and `pdftotext`, under the same limits (whole up to 10 pages,
+  at most 20 pages a call), each page headed `[page N]`; pages past what
+  one call shows are named for the next call, a page with no text (a scan)
+  is said to be one, and without poppler Read says to install it.
 - **Notebooks** (`.ipynb`): all cells with outputs; more than 256 KB of cells
   or over the token limit is an error; a file over 100 MB is refused. (P2)
 
@@ -542,6 +547,12 @@ Behaviour:
 - A redirect to a **different host** is not followed: the result names the
   original URL and the target, and the model fetches the target itself.
 - `CLAUDE_CODE_DISABLE_WEB_FETCH=1` removes the tool.
+- Content that is not text (a PDF, a picture) is saved to a local file, and
+  the result says where; one sent as `application/octet-stream` is named by
+  what it is (2.1.329 fixed PDFs and pictures sent that way being saved as
+  `.bin`). gnosh saves it into the session's folder for tool output, which
+  Read may read without a question, reads the type from the first bytes,
+  and does not put the prompt to the small model.
 - Request headers: Claude Code sends a `User-Agent` starting `Claude-User`
   and an `Accept` header preferring Markdown. gnosh sends its own
   `User-Agent` and the same `Accept` preference.
@@ -633,6 +644,10 @@ rather than under `~/.claude/plans/`.
 | `edit_mode` | string | no | `replace` (default), `insert` (after the target; at the start when no `cell_id`), `delete`. |
 
 Covered by `Edit(path)` permission rules. Refuses a file that is not UTF-8.
+
+gnosh: built (DECISIONS 325). Cells are named by their `id`, or `cell-N`
+where a notebook older than nbformat 4.5 has none; Read shows the name of
+each cell.
 
 ## 16. Monitor (P2)
 

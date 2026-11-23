@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -32,6 +34,7 @@ func (t bashTool) Spec() core.ToolSpec { return t.m.bashSpec() }
 // Action's summary, which is what a person is shown.
 func (t bashTool) Describe(call core.ToolCall, env *core.ToolEnv) (core.Action, error) {
 	a, err := t.m.bashArgs(call.Input)
+	t.m.remoteCall(call.ID, a.host != nil)
 	if err == nil {
 		err = t.m.rules(a, env, t.person)
 	}
@@ -53,8 +56,24 @@ func (t bashTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEnv
 	if err != nil {
 		return core.ErrorResult(err.Error()), nil
 	}
+	if t.person && !m.opt.PersonSandboxed {
+		// The person's own command, typed with !, runs as they typed it,
+		// outside the sandbox, as Claude Code runs it.
+		a.sandboxed = false
+	}
+	if !t.person {
+		if why := m.capped(a.command); why != "" {
+			return core.ErrorResult(why), nil
+		}
+	}
 	if env == nil || !filepath.IsAbs(env.Cwd) {
 		return core.ToolResult{}, errors.New("shelltool: the tool was given no working directory to run the command in")
+	}
+	if !a.background && a.host == nil && call.ID != "" {
+		defer m.expect(call.ID)()
+	}
+	if a.host != nil {
+		defer m.remoteCall(call.ID, false)
 	}
 	if ctx.Err() != nil {
 		return core.ErrorResult("The command was not started: the call was cancelled first."), nil
@@ -82,8 +101,11 @@ func (t bashTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEnv
 // start starts a command. A refusal is for the model; any other error is
 // the harness's own.
 func (m *Manager) start(a bashArgs, env *core.ToolEnv, callID string) (*job, error) {
-	if st, err := os.Stat(env.Cwd); err != nil || !st.IsDir() {
-		return nil, refusal(fmt.Sprintf("The command was not run: the working directory %s is not there any more. Nothing can run until it exists again.", env.Cwd))
+	cwd := env.Cwd
+	if st, err := os.Stat(cwd); err != nil || !st.IsDir() {
+		if cwd = nearestStanding(env); cwd == "" {
+			return nil, refusal(fmt.Sprintf("The command was not run: the working directory %s is not there any more, and neither is any folder of the session's.", stampText(env.Cwd)))
+		}
 	}
 	ssh := ""
 	if a.host != nil {
@@ -96,8 +118,16 @@ func (m *Manager) start(a bashArgs, env *core.ToolEnv, callID string) (*job, err
 	if err != nil {
 		return nil, err
 	}
-	j := newJob(m, a, env.Cwd)
+	j := newJob(m, a, cwd)
+	j.roots = env.Roots
+	if cwd != env.Cwd {
+		j.gone = env.Cwd
+	}
 	j.ssh = ssh
+	if env.ParentSessionID != "" {
+		// A sub-agent's: the news of its end is the sub-agent's.
+		j.owner = env.SessionID
+	}
 	name, err := m.admit(j, a.background, callID)
 	if err != nil {
 		return nil, err
@@ -222,6 +252,12 @@ func (m *Manager) finishedResult(j *job, a bashArgs, env *core.ToolEnv, person b
 	}
 	if !person {
 		notes = append(notes, m.hints(a, e, body, own && !far.unsure && e.reaped && e.sig == 0)...)
+		if n := m.sandboxHint(a, e, body); n != "" {
+			notes = append(notes, n)
+		}
+		if e.sandboxNote != "" {
+			notes = append(notes, e.sandboxNote)
+		}
 	}
 	notes = append(notes, far.notes...)
 	if len(e.alive) > 0 {
@@ -237,6 +273,15 @@ func (m *Manager) finishedResult(j *job, a bashArgs, env *core.ToolEnv, person b
 			meta[metaLeftRunning] = pgids
 		}
 	}
+	if groups, pgids := describeGroups(e.detached); groups != "" {
+		targets := make([]string, len(pgids))
+		for i, pgid := range pgids {
+			targets[i] = fmt.Sprintf("-%d", pgid)
+		}
+		notes = append(notes, fmt.Sprintf("the command ended and left a process running that let go of its output: %s. It will be stopped when the session ends; one started with setsid is left running. To stop it now: kill -- %s",
+			groups, strings.Join(targets, " ")))
+		meta[metaLeftRunning] = pgids
+	}
 	if e.unread && !e.held && !e.escaped {
 		notes = append(notes, "the last of the output had not been read when this was written; this machine is very slow just now, or the disk the output file is on has stopped taking it")
 	}
@@ -247,19 +292,38 @@ func (m *Manager) finishedResult(j *job, a bashArgs, env *core.ToolEnv, person b
 	// Where the session is now. A command on another machine never moves
 	// it: a directory there is not a directory here.
 	ownExit := e.reason == endExited && e.reaped && e.sig == 0
+	if j.gone != "" {
+		notes = append(notes, fmt.Sprintf("the working directory %s was not there any more, so the command ran in %s", stampText(j.gone), stampText(j.dir)))
+	}
+	// (Folder names go into the notes as the stamp's do: a name with a
+	// line break in it could otherwise pass for a note of gnosh's.)
 	switch where := place(e.finalDir, env); {
 	case j.host != nil:
+	case ownExit && e.finalDir == "" && !isDir(j.dir):
+		// The command took its own working directory away (a checkout
+		// without the folder, a clean): the session goes to the nearest
+		// folder above it that is there.
+		gone := *env
+		gone.Cwd = j.dir
+		if alt := nearestStanding(&gone); alt != "" {
+			res.Cwd = alt
+			notes = append(notes, fmt.Sprintf("the command took away its working directory %s, so the working directory is now %s", stampText(j.dir), stampText(alt)))
+		} else {
+			notes = append(notes, fmt.Sprintf("the command took away its working directory %s, and no folder of the session's is there", stampText(j.dir)))
+		}
 	case ownExit && e.finalDir == "":
-		notes = append(notes, "the shell did not say where it ended (the command replaced it with exec, or set an EXIT trap of its own), so the working directory is still "+env.Cwd)
+		notes = append(notes, "the shell did not say where it ended (the command replaced it with exec, or set an EXIT trap of its own), so the working directory is still "+stampText(env.Cwd))
+	case ownExit && where.to != "" && m.opt.NoCarryCwd:
+		notes = append(notes, "the working directory stays "+stampText(env.Cwd)+": a change of directory does not carry over to the next command here (CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR)")
 	case ownExit && where.to != "":
 		res.Cwd = where.to
-		notes = append(notes, "working directory is now "+where.to)
+		notes = append(notes, "working directory is now "+stampText(where.to))
 	case ownExit && where.checkout:
-		notes = append(notes, fmt.Sprintf("working directory reset to %s: %s is in the checkout your work tree was made from, so the session does not follow the command there", env.Cwd, where.outside))
+		notes = append(notes, fmt.Sprintf("working directory reset to %s: %s is in the checkout your work tree was made from, so the session does not follow the command there", stampText(env.Cwd), stampText(where.outside)))
 	case ownExit && where.outside != "":
-		notes = append(notes, fmt.Sprintf("working directory reset to %s: %s is outside the project, so the session does not follow the command there", env.Cwd, where.outside))
+		notes = append(notes, fmt.Sprintf("working directory reset to %s: %s is outside the project, so the session does not follow the command there", stampText(env.Cwd), stampText(where.outside)))
 	case !ownExit && (where.to != "" || where.outside != ""):
-		notes = append(notes, "the command did not end by itself, so its change of directory is not kept: the working directory is still "+env.Cwd)
+		notes = append(notes, "the command did not end by itself, so its change of directory is not kept: the working directory is still "+stampText(env.Cwd))
 	}
 
 	// The output file is kept only when it holds something the model was
@@ -427,4 +491,32 @@ func compose(headline, body string, notes []string, ran bool) string {
 		text += "[" + note + "]"
 	}
 	return text
+}
+
+// capped counts the model's command against Options.ScriptCaps, and says
+// why it may not run when a cap it falls under is used up; then nothing
+// is counted.
+func (m *Manager) capped(command string) string {
+	if len(m.opt.ScriptCaps) == 0 {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var under []string
+	for _, text := range slices.Sorted(maps.Keys(m.opt.ScriptCaps)) {
+		if text == "" || !strings.Contains(command, text) {
+			continue
+		}
+		if most := max(m.opt.ScriptCaps[text], 0); m.capRuns[text] >= most {
+			return fmt.Sprintf("The command was not run: a command holding %q may run %d time(s) in this session (CLAUDE_CODE_SCRIPT_CAPS), and that many have run.", text, most)
+		}
+		under = append(under, text)
+	}
+	if len(under) > 0 && m.capRuns == nil {
+		m.capRuns = map[string]int{}
+	}
+	for _, text := range under {
+		m.capRuns[text]++
+	}
+	return ""
 }

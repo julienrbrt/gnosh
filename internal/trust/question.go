@@ -22,6 +22,10 @@ type Holding struct {
 	// none.
 	File string
 	Line int
+	// Own says it is the person's own setting, not the folder's, held
+	// because it would run a program in the folder (a language server, an
+	// MCP server gnosh starts), which reads what the folder holds.
+	Own bool
 }
 
 // Question is the trust question, as its parts. How it is drawn is the
@@ -36,6 +40,10 @@ type Question struct {
 	// Would lists what the folder's settings would do, one line each, safe
 	// to print.
 	Would []string
+	// Yours lists the person's own settings that would run a program in
+	// the folder, and wait for the yes as the folder's do, one line each,
+	// safe to print.
+	Yours []string
 	// Risks says what could go wrong if whoever wrote the settings meant
 	// harm: one plain sentence per kind of harm, and only for the kinds
 	// this folder's settings could do.
@@ -54,6 +62,7 @@ func NewQuestion(f Folder, files []string, held []Holding) Question {
 	for _, file := range files {
 		q.Files = append(q.Files, Escape(file))
 	}
+	var theirs []Holding
 	for _, h := range held {
 		line := Escape(h.Text)
 		if h.File != "" {
@@ -63,11 +72,23 @@ func NewQuestion(f Folder, files []string, held []Holding) Question {
 			}
 			line += ")"
 		}
+		if h.Own {
+			q.Yours = append(q.Yours, line)
+			continue
+		}
 		q.Would = append(q.Would, line)
+		theirs = append(theirs, h)
 	}
-	q.Risks = Risks(held)
+	q.Risks = Risks(theirs)
+	if len(q.Yours) > 0 {
+		q.Risks = append(q.Risks, yoursRisk)
+	}
 	return q
 }
+
+// yoursRisk is the sentence for the person's own programs that would run
+// in the folder.
+const yoursRisk = "Your own programs started here read what the folder holds (an .npmrc for npx, a build script, a relative path): a stranger's files could make them run a stranger's code."
 
 // Risks returns what could go wrong with these settings: one sentence per
 // kind of harm present, in a fixed order.
@@ -97,30 +118,66 @@ func Risks(held []Holding) []string {
 func (q Question) String() string {
 	var b strings.Builder
 	b.WriteString("Do you trust the files in this folder?\n\n  " + q.Folder + "\n\n")
-	b.WriteString("Its own settings are not in force.")
-	if len(q.Files) > 0 {
-		b.WriteString(" If you say yes, these files would be read:\n\n")
-		for _, file := range q.Files {
-			b.WriteString("  - " + file + "\n")
-		}
-		b.WriteString("\nThey would add:\n\n")
-	} else {
-		b.WriteString(" If you say yes, they would add:\n\n")
+	q.write(&b, "\n")
+	no := "No: start with your own settings only; gnosh asks again next time."
+	if len(q.Yours) > 0 {
+		no = "No: start without the folder's settings, and with those of your own that run in it waiting; gnosh asks again next time."
 	}
-	for _, w := range q.Would {
-		b.WriteString("  - " + w + "\n")
-	}
-	if len(q.Risks) > 0 {
-		b.WriteString("\nWhat could go wrong, if whoever wrote them meant harm:\n\n")
-		for _, r := range q.Risks {
-			b.WriteString("  - " + r + "\n")
-		}
-	}
-	b.WriteString("\nNo: start with your own settings only; gnosh asks again next time.\n")
+	b.WriteString("\n" + no + "\n")
 	if q.SessionOnly {
 		b.WriteString("Yes: use these settings for this session. (This folder is never recorded as trusted.)\n")
 	} else {
 		b.WriteString("Yes: use these settings from now on. (gnosh trust --forget undoes it.)\n")
+	}
+	return b.String()
+}
+
+// write puts in what is held and what could go wrong, with gap between
+// the parts (a blank line in String, none in Facts).
+func (q Question) write(b *strings.Builder, gap string) {
+	if len(q.Would) > 0 {
+		b.WriteString("Its own settings are not in force.")
+		if len(q.Files) > 0 {
+			b.WriteString(" If you say yes, these files would be read:\n" + gap)
+			for _, file := range q.Files {
+				b.WriteString("  - " + file + "\n")
+			}
+			b.WriteString(gap + "They would add:\n" + gap)
+		} else {
+			b.WriteString(" If you say yes, they would add:\n" + gap)
+		}
+		for _, w := range q.Would {
+			b.WriteString("  - " + w + "\n")
+		}
+		if len(q.Yours) > 0 {
+			b.WriteString(gap)
+		}
+	}
+	if len(q.Yours) > 0 {
+		b.WriteString("These settings of your own would run programs in this folder, and wait for a yes too:\n" + gap)
+		for _, y := range q.Yours {
+			b.WriteString("  - " + y + "\n")
+		}
+	}
+	if len(q.Risks) > 0 {
+		b.WriteString(gap + "What could go wrong, if whoever wrote them meant harm:\n" + gap)
+		for _, r := range q.Risks {
+			b.WriteString("  - " + r + "\n")
+		}
+	}
+}
+
+// Facts is the question as String says it, but with no blank lines and
+// without the start's choices: for a question put in the middle of a
+// session (/cd), whose choices are its own.
+func (q Question) Facts() string {
+	var b strings.Builder
+	b.WriteString("Do you trust the files in this folder?\n  " + q.Folder + "\n")
+	q.write(&b, "")
+	if q.SessionOnly {
+		b.WriteString("A yes lasts for this session: this folder is never recorded as trusted.")
+	} else {
+		b.WriteString("A yes is recorded, and gnosh trust --forget undoes it.")
 	}
 	return b.String()
 }
@@ -140,6 +197,12 @@ func Report(f Folder, held []Holding) string {
 		b.WriteString("\nIts own settings are now in force. They add:\n\n")
 		for _, w := range q.Would {
 			b.WriteString("  - " + w + "\n")
+		}
+	}
+	if len(q.Yours) > 0 {
+		b.WriteString("\nThese settings of your own now run programs in it:\n\n")
+		for _, y := range q.Yours {
+			b.WriteString("  - " + y + "\n")
 		}
 	}
 	if len(q.Risks) > 0 {
@@ -232,19 +295,22 @@ func Escape(s string) string {
 	return b.String()
 }
 
-// LeadsOut reports whether a path inside a folder really leads out of it,
-// once the links on the way are followed, and where it leads. A project's
-// skills folder that is a link to somewhere else is left out of an
-// untrusted folder for this reason: the agent reads a skill's files
-// without asking. A path that cannot be followed counts as leading out.
-func LeadsOut(root, path string) (target string, out bool) {
-	realRoot, err := filepath.EvalSymlinks(root)
+// LeadsOut reports whether a path really leads out of every one of the
+// folders given, once the links on the way are followed, and where it
+// leads. A project's skill, command or kind of sub-agent whose file is a
+// link out of the project is not read for this reason: what the file
+// holds goes to the model with no question asked (a commands file linked
+// to ~/.npmrc had its first line sent as the command's description). A
+// path that cannot be followed counts as leading out, with no target.
+func LeadsOut(path string, roots ...string) (target string, out bool) {
+	target, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", true
 	}
-	target, err = filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", true
+	for _, root := range roots {
+		if real, err := filepath.EvalSymlinks(root); err == nil && (target == real || holds(real, target)) {
+			return target, false
+		}
 	}
-	return target, target != realRoot && !holds(realRoot, target)
+	return target, true
 }

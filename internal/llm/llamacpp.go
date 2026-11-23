@@ -8,6 +8,7 @@ import (
 	"net/url"
 
 	"github.com/gnosh-ai/gnosh/internal/core"
+	"github.com/gnosh-ai/gnosh/internal/prompt"
 )
 
 // llamaCpp is a chat-completions provider that talks to llama.cpp's own
@@ -46,6 +47,15 @@ func (o *openAI) llamaFields(body obj, req *core.Request) {
 	}
 	if len(kwargs) > 0 {
 		body["chat_template_kwargs"] = kwargs
+	}
+	// A budget for the thinking: the server ends the reasoning there, with
+	// the note, and the model goes on to its answer. (A server too old to
+	// know the fields thinks as long as it likes, as before.)
+	if t := req.Thinking; t.BudgetTokens > 0 && t.Mode != "off" {
+		body["reasoning_budget_tokens"] = t.BudgetTokens
+		if t.BudgetNote != "" {
+			body["reasoning_budget_message"] = t.BudgetNote
+		}
 	}
 
 	// The server allows one tool call per answer unless asked for more.
@@ -167,6 +177,24 @@ func (l *llamaCpp) CountTokens(ctx context.Context, req *core.Request) (int, err
 	if req == nil {
 		return 0, l.fail(core.ErrInvalidRequest, "there is no request to count")
 	}
+	send := l.prepared(req)
+	for {
+		n, err := l.countTokens(ctx, send)
+		if err == nil {
+			return n, nil
+		}
+		// A server that takes no images, or could not read one, has the
+		// request counted, and from now on sent, without them (images.go).
+		next, again := l.afterImageError(req, send, err)
+		if !again {
+			return n, err
+		}
+		send = next
+	}
+}
+
+// countTokens is CountTokens for the request as it is.
+func (l *llamaCpp) countTokens(ctx context.Context, req *core.Request) (int, error) {
 	chat, err := l.chatBody(req, false)
 	if err != nil {
 		return 0, err
@@ -226,4 +254,72 @@ func (l *llamaCpp) CountTokens(ctx context.Context, req *core.Request) (int, err
 		return 0, e
 	}
 	return len(tokens.Tokens), nil
+}
+
+// breakControlIn makes harmless the control text in everything of body
+// that the server puts into the prompt: every message's content, thinking
+// and tool calls' arguments, and the tools' descriptions and parameters,
+// every string of their schemas, keys included (an MCP server writes
+// those). A llama.cpp server reads control text wherever it stands in a
+// prompt, quoted text included: a special token (ChatML's <|im_end|>,
+// Qwen's <|vision_start|>, a template's <tool_call>, <think> or
+// <｜User｜>), and on a server with a projector (--mmproj), the marker it
+// puts where an image goes, <__media with a suffix it makes up as it
+// starts. Quoted in a message (a file a tool read, a page it fetched) the
+// first ends the message or starts another, and the second makes the
+// server refuse the whole request ("number of media markers in text
+// exceeds number of bitmaps"). What makes it harmless is prompt.Defuse,
+// the one the loop puts on what tools return: a zero-width space after the
+// "<", which the server then reads as plain text and a model reads past.
+// Arguments the model writes back with one are cleaned of it before any
+// tool runs. What gnosh puts in the system prompt (the person's
+// instruction files among it) and in tools' specs reaches the server only
+// this way.
+func breakControlIn(body obj) {
+	msgs, _ := body["messages"].([]obj)
+	for _, m := range msgs {
+		for _, k := range []string{"content", "reasoning_content"} {
+			switch c := m[k].(type) {
+			case string:
+				m[k] = prompt.Defuse(c)
+			case []obj:
+				for _, part := range c {
+					if t, ok := part["text"].(string); ok {
+						part["text"] = prompt.Defuse(t)
+					}
+				}
+			}
+		}
+		calls, _ := m["tool_calls"].([]obj)
+		for _, call := range calls {
+			if fn, ok := call["function"].(obj); ok {
+				if a, ok := fn["arguments"].(string); ok {
+					fn["arguments"] = defuseJSONText(a)
+				}
+			}
+		}
+	}
+	tools, _ := body["tools"].([]obj)
+	for _, t := range tools {
+		fn, ok := t["function"].(obj)
+		if !ok {
+			continue
+		}
+		if d, ok := fn["description"].(string); ok {
+			fn["description"] = prompt.Defuse(d)
+		}
+		if s, ok := fn["parameters"].(json.RawMessage); ok {
+			fn["parameters"] = json.RawMessage(defuseJSONText(string(s)))
+		}
+	}
+}
+
+// defuseJSONText is prompt.Defuse for JSON text: every string in it, keys
+// included, read with its escapes, so that a "<" written as \u003c is
+// seen too. Text that is not JSON is defused as it stands.
+func defuseJSONText(s string) string {
+	if out, ok := prompt.RewriteJSONStrings(json.RawMessage(s), prompt.Defuse, prompt.MayHoldControl); ok {
+		return string(out)
+	}
+	return prompt.Defuse(s)
 }

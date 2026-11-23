@@ -42,10 +42,13 @@ func (r *Runner) background(in *Input, info eventInfo, h selected, stdin []byte,
 		limit = timeoutFor(h.Event, h.Timeout)
 	}
 	event := in.Event
+	life := *in
+	id := r.lifeStart(&life)
 	r.bg.Add(1)
 	go func() {
 		defer r.bg.Done()
 		p := r.exec(r.bgCtx, h.Hook, stdin, env, dir, limit)
+		r.lifeEnd(id, &life, p)
 		if p.cancelled || r.onBackground == nil {
 			return
 		}

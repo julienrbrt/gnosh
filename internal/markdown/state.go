@@ -392,3 +392,13 @@ func (st *state) define(label string, ref linkRef) {
 	}
 	st.refs[key] = ref
 }
+
+// quoted reports whether a block quote is open around what comes next.
+func (st *state) quoted() bool {
+	for i := range st.frames {
+		if st.frames[i].kind == fQuote {
+			return true
+		}
+	}
+	return false
+}

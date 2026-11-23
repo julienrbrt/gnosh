@@ -51,7 +51,13 @@ func (l *live) transcriptEntries() []TranscriptEntry {
 	if l.ts == nil {
 		return nil
 	}
-	entries := transcript.Conversation(l.ts.Entries())
+	return transcriptEntriesOf(l.ts.Entries())
+}
+
+// transcriptEntriesOf is the conversation a session file's entries hold,
+// as the transcript view shows it.
+func transcriptEntriesOf(all []transcript.Entry) []TranscriptEntry {
+	entries := transcript.Conversation(all)
 	out := make([]TranscriptEntry, 0, len(entries))
 	for i := range entries {
 		e := &entries[i]

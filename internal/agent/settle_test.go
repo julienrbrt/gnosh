@@ -48,7 +48,7 @@ func TestKilledProcessIsSettledOnOpen(t *testing.T) {
 		t.Errorf("%d prompts came back", n)
 	}
 	n := notices(r.rec, LevelInfo)
-	if len(n) != 1 || !strings.Contains(n[0], "gnosh was stopped before this turn finished") || !strings.Contains(n[0], "Edit, Bash") {
+	if len(n) != 1 || !strings.Contains(n[0], "gnosh was stopped before this turn finished") || !strings.Contains(n[0], "Edit (/a), Bash (go test)") {
 		t.Errorf("the person was told %v", n)
 	}
 
@@ -284,4 +284,42 @@ func TestToolCallIDsAreMadeUnique(t *testing.T) {
 		}
 	}
 	r.checkLog()
+}
+
+// A prompt that waits in line while a turn's end cannot be written is not
+// taken for one a dead gnosh left behind when the next turn settles the
+// log: it was returned to the person ("gnosh was stopped before this
+// prompt was sent") while it went out all the same (the agent loop review
+// of 2026-11-19).
+func TestQueuedPromptStaysAfterAFailedTurnEnd(t *testing.T) {
+	reached, release := make(chan struct{}), make(chan struct{})
+	r := newRig(t, nil)
+	first := say("one")
+	first.at, first.wait = once(reached), release
+	r.model.push(first, say("two"))
+	var failed atomic.Bool
+	r.log.mu.Lock()
+	r.log.failOn = func(e Entry) bool { return e.Kind == EntryTurn && failed.CompareAndSwap(false, true) }
+	r.log.mu.Unlock()
+	done1 := make(chan TurnResult, 1)
+	go func() { done1 <- r.run("first") }()
+	<-reached
+	done2 := make(chan TurnResult, 1)
+	go func() { done2 <- r.run("second") }()
+	waitQueue(t, r, "second")
+	close(release)
+	<-done1
+	if res := <-done2; res.Reason != EndCompleted || res.Text != "two" {
+		t.Fatalf("second = %+v", res)
+	}
+	r.idle()
+	if !failed.Load() {
+		t.Fatal("the turn's end was written: the test did not do what it says")
+	}
+	if ret := eventsOf[*PromptReturnedEvent](r.rec); len(ret) != 0 {
+		t.Errorf("prompts returned: %+v", ret)
+	}
+	if n := r.model.count(); n != 2 {
+		t.Errorf("%d requests", n)
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -25,6 +26,10 @@ type Input struct {
 	// filter (Hook.If). Nil means every filter takes it. It is never sent
 	// to a hook.
 	IfMatch func(rule string) bool
+	// NoAgentHooks says the event is one of an agent hook's own sub-agent:
+	// no agent hook runs on it, so that a hook cannot set itself off. It
+	// is never sent to a hook.
+	NoAgentHooks bool
 
 	// SessionID is the session the user is in ("session_id"). For a
 	// sub-agent's event it is still the user's session; AgentID names the
@@ -89,14 +94,16 @@ type Input struct {
 
 	// Source says, for SessionStart, how the session comes to start:
 	// startup, resume, clear, compact or fork ("source"); SessionStart
-	// matchers are tested against it. For PostModelSwitch it is what
-	// switched the model (command), and for DirectoryAdded what added the
+	// matchers are tested against it. For PreModelSwitch and
+	// PostModelSwitch it is what asked for the switch (command), for
+	// ConfigChange which settings file changed (user_settings,
+	// project_settings, local_settings), and for DirectoryAdded what added the
 	// directory (slash_command), which DirectoryAdded matchers are tested
 	// against.
 	Source string
 	// Model names the model, for SessionStart ("model").
 	Model string
-	// EnvFile is, for SessionStart and CwdChanged, the path of the session's own
+	// EnvFile is, for SessionStart, CwdChanged and FileChanged, the path of the session's own
 	// environment file. Hooks get it as GNOSH_ENV_FILE and
 	// CLAUDE_ENV_FILE and may append export lines to it.
 	EnvFile string
@@ -125,6 +132,12 @@ type Input struct {
 	// CompactSummary is the summary, for PostCompact ("compact_summary").
 	CompactSummary string
 
+	// FilePath is also, for ConfigChange, the settings file that changed,
+	// and for FileChanged the watched file (its name is what the matchers
+	// are tested against); FileEvent is then what happened to it: change,
+	// add or unlink ("event").
+	FileEvent string
+	//
 	// FilePath, MemoryType, LoadReason, TriggerFilePath and
 	// ParentFilePath describe a context file, for InstructionsLoaded
 	// ("file_path", "memory_type", "load_reason", "trigger_file_path",
@@ -139,17 +152,21 @@ type Input struct {
 
 	// Message, Title and NotificationType describe a notification
 	// ("message", "title", "notification_type"). NotificationType is
-	// permission_prompt or idle_prompt, and is what the matchers are
-	// tested against.
+	// permission_prompt, idle_prompt, or push_notification (the model's
+	// own, PushNotification), and is what the matchers are tested against.
 	Message          string
 	Title            string
 	NotificationType string
 
-	// FromModel, ToModel and RequestedModel are, for PostModelSwitch, the
-	// model before, the model after (PostModelSwitch matchers are tested
-	// against it), and the name it was asked for by ("from_model",
-	// "to_model", "requested_model").
+	// FromModel, ToModel and RequestedModel are, for PreModelSwitch and
+	// PostModelSwitch, the model before, the model after (their matchers
+	// are tested against it), and the name it was asked for by
+	// ("from_model", "to_model", "requested_model").
 	FromModel, ToModel, RequestedModel string
+	// ContextTokens is, for PreModelSwitch and PostModelSwitch, how many
+	// tokens the conversation came to at the last count: what the next
+	// request sends the new model ("context_tokens").
+	ContextTokens int
 	// Directory is, for DirectoryAdded, the directory added ("directory").
 	Directory string
 	// OldCwd and NewCwd are, for CwdChanged, the directory the shell was
@@ -162,12 +179,40 @@ type Input struct {
 	// Prompt is then the text it expands into.
 	ExpansionType, CommandName, CommandArgs, CommandSource string
 
+	// ToolCalls are, for PostToolBatch, every tool call of the batch, in
+	// the order the model wrote them ("tool_calls").
+	ToolCalls []BatchCall
+
+	// MCPServerName, Mode, RequestedSchema, Action and Content are, for
+	// Elicitation and ElicitationResult: the MCP server that asks (what
+	// the matchers are tested against, "mcp_server_name"); the kind of
+	// request, "form" ("mode"); the fields it asks for, as the JSON schema
+	// it sent ("requested_schema", Elicitation); and the person's answer,
+	// accept, decline or cancel ("action"), with the values when they
+	// accepted ("content", ElicitationResult). Message is the server's
+	// message (Elicitation).
+	MCPServerName   string
+	Mode            string
+	RequestedSchema json.RawMessage
+	Action          string
+	Content         json.RawMessage
+
 	// Extra holds further fields for stdin, by their JSON names, for
 	// things Claude Code documents that this package has no field for
 	// (such as "background_tasks" on Stop or "mcp_server" on a tool
 	// event). Values must be JSON-encodable. A name this package writes
 	// itself is not replaced.
 	Extra map[string]any
+}
+
+// BatchCall is one tool call of a batch, for PostToolBatch: the call, and
+// what the model reads of its result, as text ("tool_response"; Claude
+// Code's is the tool_result content the model is sent).
+type BatchCall struct {
+	ToolName     string
+	ToolUseID    string
+	ToolInput    json.RawMessage
+	ToolResponse string
 }
 
 // permissionModes are the values permission_mode can have.
@@ -192,14 +237,34 @@ func (in *Input) subject() string {
 		return in.LoadReason
 	case Notification:
 		return in.NotificationType
-	case PostModelSwitch:
+	case PreModelSwitch, PostModelSwitch:
 		return in.ToModel
 	case DirectoryAdded:
 		return in.Source
 	case UserPromptExpansion:
 		return in.CommandName
+	case ConfigChange:
+		return in.Source
+	case FileChanged:
+		return filepath.Base(in.FilePath)
+	case Elicitation, ElicitationResult:
+		return in.MCPServerName
 	}
 	return ""
+}
+
+// subjects returns every name the event's matchers may fit: the subject,
+// and for a model switch also the model's own name without its provider,
+// so that "qwen3.8-27b" fits qwen/qwen3.8-27b, as in Claude Code
+// "claude-opus-5" fits every spelling of that model.
+func (in *Input) subjects() []string {
+	s := in.subject()
+	if in.Event == PreModelSwitch || in.Event == PostModelSwitch {
+		if _, id, ok := strings.Cut(s, "/"); ok && id != "" {
+			return []string{s, id}
+		}
+	}
+	return []string{s}
 }
 
 // check says what is wrong with the Input as the agent loop built it.
@@ -315,23 +380,54 @@ func (in *Input) payload(info eventInfo, cwd string) ([]byte, error) {
 		m["message"] = in.Message
 		set("title", in.Title)
 		m["notification_type"] = in.NotificationType
-	case PostModelSwitch:
+	case PreModelSwitch, PostModelSwitch:
 		m["from_model"] = in.FromModel
 		m["to_model"] = in.ToModel
 		m["requested_model"] = in.RequestedModel
 		m["source"] = in.Source
+		m["context_tokens"] = in.ContextTokens
 	case DirectoryAdded:
 		m["directory"] = in.Directory
 		m["source"] = in.Source
 	case CwdChanged:
 		m["old_cwd"] = in.OldCwd
 		m["new_cwd"] = in.NewCwd
+	case ConfigChange:
+		m["source"] = in.Source
+		set("file_path", in.FilePath)
+	case FileChanged:
+		m["file_path"] = in.FilePath
+		m["event"] = in.FileEvent
+	case PostToolBatch:
+		calls := make([]map[string]any, 0, len(in.ToolCalls))
+		for _, c := range in.ToolCalls {
+			input := json.RawMessage(bytes.TrimSpace(c.ToolInput))
+			if len(input) == 0 || !json.Valid(input) {
+				input = json.RawMessage("{}")
+			}
+			calls = append(calls, map[string]any{"tool_name": c.ToolName, "tool_use_id": c.ToolUseID, "tool_input": input, "tool_response": c.ToolResponse})
+		}
+		m["tool_calls"] = calls
 	case UserPromptExpansion:
 		m["expansion_type"] = in.ExpansionType
 		m["command_name"] = in.CommandName
 		m["command_args"] = in.CommandArgs
 		m["command_source"] = in.CommandSource
 		m["prompt"] = in.Prompt
+	case Elicitation:
+		m["mcp_server_name"] = in.MCPServerName
+		m["message"] = in.Message
+		set("mode", in.Mode)
+		if raw := bytes.TrimSpace(in.RequestedSchema); len(raw) > 0 && json.Valid(raw) {
+			m["requested_schema"] = json.RawMessage(raw)
+		}
+	case ElicitationResult:
+		m["mcp_server_name"] = in.MCPServerName
+		m["action"] = in.Action
+		set("mode", in.Mode)
+		if raw := bytes.TrimSpace(in.Content); len(raw) > 0 && json.Valid(raw) {
+			m["content"] = json.RawMessage(raw)
+		}
 	}
 
 	// Claude Code writes this JSON without escaping <, > and &, and a hook
@@ -443,7 +539,7 @@ func (in *Input) environ(info eventInfo, base []string, dir, projectDir, memStat
 		vars["GNOSH_SESSION_START_SOURCE"] = in.Source
 		set("GNOSH_ENV_FILE", in.EnvFile)
 		set("CLAUDE_ENV_FILE", in.EnvFile)
-	case CwdChanged:
+	case CwdChanged, FileChanged:
 		set("GNOSH_ENV_FILE", in.EnvFile)
 		set("CLAUDE_ENV_FILE", in.EnvFile)
 	case SessionEnd:

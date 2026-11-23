@@ -77,13 +77,20 @@ type hello struct {
 	Embeddings      string  `json:"embeddings,omitempty"`
 }
 
+// frameTooLarge is writeFrame's error for a frame over maxFrame.
+type frameTooLarge struct{ size int }
+
+func (e frameTooLarge) Error() string {
+	return fmt.Sprintf("frame of %d bytes is over the %d limit", e.size, maxFrame)
+}
+
 func writeFrame(w io.Writer, f *frame) error {
 	b, err := json.Marshal(f)
 	if err != nil {
 		return err
 	}
 	if len(b) > maxFrame {
-		return fmt.Errorf("frame of %d bytes is over the %d limit", len(b), maxFrame)
+		return frameTooLarge{size: len(b)}
 	}
 	var n [4]byte
 	binary.BigEndian.PutUint32(n[:], uint32(len(b)))

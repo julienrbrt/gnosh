@@ -515,7 +515,7 @@ func TestCleanResultAndOutgoing(t *testing.T) {
 		o.CleanResult = func(_ core.ToolCall, res core.ToolResult) core.ToolResult {
 			return core.TextResult(strings.ReplaceAll(core.TextOf(res.Content), "<|", "< |"))
 		}
-		o.Outgoing = func(req *core.Request) {
+		o.Outgoing = func(_ string, req *core.Request) {
 			// The request is the loop's own copy: changing it must not
 			// reach the log.
 			req.Messages[0].Blocks[0].Text = "REWRITTEN"
@@ -874,8 +874,29 @@ func TestToolAndHookHalt(t *testing.T) {
 		r := newRig(t, func(o *Options) { o.Tools = []core.Tool{stops, tool("Bash", nil)} })
 		r.model.push(use(tc("a", "Agent", `{}`), tc("b", "Bash", `{}`)))
 		res := r.run("delegate")
-		if res.Reason != EndHalted || res.Detail != "a hook stopped the sub-agent" || res.Driver != "Agent" {
+		if res.Reason != EndHalted || res.Detail != "a hook stopped the sub-agent" || res.Driver != "Agent" || res.Planned {
 			t.Fatalf("result = %+v", res)
+		}
+		r.checkLog()
+	})
+	// A tool that ends the turn as it means to (a /loop's next run
+	// scheduled) says so: the result is planned, its notice information.
+	t.Run("planned", func(t *testing.T) {
+		wakes := tool("ScheduleWakeup", func(context.Context, core.ToolCall, *core.ToolEnv) (core.ToolResult, error) {
+			res := core.TextResult("the next run is at 19:20")
+			res.Meta = map[string]any{MetaHalt: "the loop's next run is at 19:20", MetaPlanned: true}
+			return res, nil
+		})
+		r := newRig(t, func(o *Options) { o.Tools = []core.Tool{wakes} })
+		r.model.push(use(tc("a", "ScheduleWakeup", `{}`)))
+		res := r.run("loop")
+		if res.Reason != EndHalted || !res.Planned || res.Driver != "ScheduleWakeup" {
+			t.Fatalf("result = %+v", res)
+		}
+		for _, n := range eventsOf[*NoticeEvent](r.rec) {
+			if n.TurnEnd && n.Level != LevelInfo {
+				t.Errorf("the planned end's notice is %s: %q", n.Level, n.Text)
+			}
 		}
 		r.checkLog()
 	})
@@ -933,6 +954,93 @@ func TestToolAndHookHalt(t *testing.T) {
 			t.Errorf("the message after the round holds %v, want %v", kinds, want)
 		}
 		r.checkLog()
+	})
+}
+
+// AfterRound is told each round once, after all its calls are stored and
+// before the next request: what it adds follows the round's results, its
+// halt ends the turn there, an error halts too, and a round that ends the
+// turn by itself is not told.
+func TestAfterRound(t *testing.T) {
+	t.Run("context, then a halt", func(t *testing.T) {
+		var rounds []RoundDone
+		r := newRig(t, func(o *Options) {
+			o.Tools = []core.Tool{tool("Bash", nil), tool("Fails", func(context.Context, core.ToolCall, *core.ToolEnv) (core.ToolResult, error) {
+				return core.ErrorResult("exit 1"), nil
+			})}
+			o.Moments.AfterRound = func(_ context.Context, d RoundDone) (ToolVerdict, error) {
+				rounds = append(rounds, d)
+				if len(rounds) == 1 {
+					return ToolVerdict{Context: []Part{{Source: "PostToolBatch", Text: "the suite ran: 2 failures"}}}, nil
+				}
+				return ToolVerdict{Halt: true, Reason: "a batch hook stopped the turn"}, nil
+			}
+		})
+		r.model.push(
+			use(tc("a", "Bash", `{"command":"x"}`), tc("b", "Fails", `{}`)),
+			use(tc("c", "Bash", `{}`)),
+			say("never asked for"),
+		)
+		res := r.run("go")
+		if res.Reason != EndHalted || res.Detail != "a batch hook stopped the turn" || res.Driver != "after-round" {
+			t.Fatalf("result = %+v", res)
+		}
+		if len(rounds) != 2 || len(rounds[0].Calls) != 2 || rounds[0].Calls[0].Call.ID != "a" || string(rounds[0].Calls[0].Call.Input) != `{"command":"x"}` ||
+			!rounds[0].Calls[1].Result.IsError || rounds[0].Session != "session-1" || rounds[0].Turn == "" || len(rounds[1].Calls) != 1 {
+			t.Errorf("AfterRound saw %+v", rounds)
+		}
+		if n := len(r.model.requests()); n != 2 {
+			t.Errorf("%d requests, want 2: the halt comes before the third", n)
+		}
+		second := r.model.requests()[1]
+		last := second.Messages[len(second.Messages)-1]
+		var kinds []string
+		for _, b := range last.Blocks {
+			switch {
+			case b.Type == core.BlockToolResult:
+				kinds = append(kinds, "result")
+			case strings.Contains(b.Text, "2 failures"):
+				kinds = append(kinds, "batch")
+			}
+		}
+		if want := []string{"result", "result", "batch"}; !slices.Equal(kinds, want) {
+			t.Errorf("the message after the round holds %v, want %v", kinds, want)
+		}
+		r.checkLog()
+	})
+	t.Run("an error halts", func(t *testing.T) {
+		r := newRig(t, func(o *Options) {
+			o.Tools = []core.Tool{tool("Bash", nil)}
+			o.Moments.AfterRound = func(context.Context, RoundDone) (ToolVerdict, error) {
+				return ToolVerdict{}, errors.New("hook script missing")
+			}
+		})
+		r.model.push(use(tc("a", "Bash", `{}`)), say("never asked for"))
+		res := r.run("go")
+		if res.Reason != EndHalted || !strings.Contains(res.Detail, "hook script missing") {
+			t.Fatalf("result = %+v", res)
+		}
+		r.checkLog()
+	})
+	t.Run("not after a round that ends the turn", func(t *testing.T) {
+		called := false
+		r := newRig(t, func(o *Options) {
+			o.Tools = []core.Tool{tool("Bash", nil)}
+			o.Moments.AfterTool = func(context.Context, ToolDone) (ToolVerdict, error) {
+				return ToolVerdict{Halt: true, Reason: "a hook ended the turn"}, nil
+			}
+			o.Moments.AfterRound = func(context.Context, RoundDone) (ToolVerdict, error) {
+				called = true
+				return ToolVerdict{}, nil
+			}
+		})
+		r.model.push(use(tc("a", "Bash", `{}`)))
+		if res := r.run("go"); res.Reason != EndHalted {
+			t.Fatalf("result = %+v", res)
+		}
+		if called {
+			t.Error("AfterRound was told of a round that ended the turn")
+		}
 	})
 }
 

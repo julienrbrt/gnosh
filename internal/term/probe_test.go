@@ -233,6 +233,7 @@ func TestSequences(t *testing.T) {
 func TestDesktopNote(t *testing.T) {
 	for _, tc := range []struct{ kind, text, want string }{
 		{"osc9", "gnosh waits\x07\x1b]0;evil", "\x1b]9;gnosh waits]0;evil\x1b\\"},
+		{"osc9", "4;1;50", "\x1b]9;gnosh: 4;1;50\x1b\\"},
 		{"osc99", "done", "\x1b]99;;done\x1b\\"},
 		{"", "done", ""},
 		{"bell", "done", ""},

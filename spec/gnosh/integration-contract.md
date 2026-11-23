@@ -458,7 +458,7 @@ and what to build:
 | Where | What | Detail | P |
 |---|---|---|---|
 | the chat | every mem call as a `gnovm_run` call headed by its Gno code, with mem's receipt and the pop's clauses as the result; popped rows stay visible, not dimmed or folded | §5.4, `frames.md` §12.10 | P0 (plain); P2 (the header) |
-| the task list under the prompt | mem's todos for the last task a call changed; the frame the session is in | §10, §6.7 | P1 |
+| the task list above the prompt | mem's todos for the last task a call changed; the frame the session is in | §10, §6.7 | P1 |
 | the status area | the start notice (what is due, what waits on the user); "Goal met: …"; goal warnings; rule warnings; "popped `x`: about N tokens…"; "slid `x`…"; an unchecked close; where an erased secret is still shown | §4.10, §6.2.8, §9.8, §11 | P1 |
 | `/mem` | text, as `mem.md` §12 | §12 | P1 |
 | stderr of a non-interactive run | the same notices, one line each | | P1 |

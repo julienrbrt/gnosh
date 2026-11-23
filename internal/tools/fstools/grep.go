@@ -56,16 +56,16 @@ func (t *grepTool) Spec() core.ToolSpec {
 	left = append(left, "anything in a .git directory", "anything reached through a symbolic link")
 	desc := fmt.Sprintf(`Searches the contents of files for a regular expression.
 
-The pattern is a Go regular expression (RE2 syntax). It has the usual character classes, groups, alternatives and repetition, but no look-ahead or look-behind and no backreferences. The characters ( ) [ ] { } . * + ? | ^ $ and \ have meanings in a pattern: put a backslash before one to search for the character itself.
+The pattern is a Go regular expression (RE2 syntax). It has the usual character classes, groups, alternatives and repetition, but no look-ahead or look-behind and no backreferences, and \b, \w, \d and \s know ASCII only: for words in other scripts use \p{L} (a letter) and \p{N} (a digit). The characters ( ) [ ] { } . * + ? | ^ $ and \ have meanings in a pattern: put a backslash before one to search for the character itself.
 
-path is a file or a directory; left out, it is the working directory. In a directory, every file below it is searched except: %[1]s. To search one of those, give its path. glob and type narrow the search to some files.
+path is a file or a directory; left out, it is the working directory. In a directory, every file below it is searched except: %[1]s. To search one of those, give its path, or a glob that names it. glob narrows the search to the files it names (on their names, *.go, or on their paths below path when it holds a slash, src/**/*.ts), reaching them even where they are hidden or left out by ignore rules (glob .env*); a glob that starts with ! leaves out the files and the directories it names (!vendor, !*.min.js). type narrows the search to a language's files.
 
 output_mode chooses what comes back:
 - files_with_matches (the default): the paths of the files that have a match.
 - content: the matching lines, under the path of the file they are in, each as its line number, a colon, and the line. -A, -B and -C add lines around each match; those have a dash where matching lines have the colon, and a line of -- stands between stretches that are not next to each other. -o shows only the text that matched.
 - count: for each file, its path, a colon, and how many of its lines match; then the total.
 
-Files come most recently changed first. A match lies within one line unless multiline is true. With multiline the pattern may run over line breaks (write \n for one; . still does not match a line break unless the pattern starts with (?s)), ^ and $ match at the start and end of every line, and count counts matches, not lines.
+Files with a match come most recently changed first; lines and counts come in the order of their files' paths, so that paging with offset is steady. A match lies within one line unless multiline is true. With multiline the pattern may run over line breaks (write \n for one; . still does not match a line break unless the pattern starts with (?s)), ^ and $ match at the start and end of every line, and count counts matches, not lines.
 
 At most %[2]d lines (content) or files (the other modes) are shown unless head_limit says otherwise, and at most %[3]s of text whatever it says. offset skips that many first. When something is left out, a note at the end says so and gives the offset to go on from.
 
@@ -95,6 +95,12 @@ type grepQuery struct {
 	globText string
 	globBase bool
 	globNot  bool
+	// globDirs says a negated glob ended with a slash: it leaves out
+	// directories of that name, and not files.
+	globDirs bool
+	// globNamed are the directory names a glob spells out in full, the
+	// hidden or ignored directories it may take the search into.
+	globNamed map[string]bool
 	// typ, when not nil, is the kind of file to search.
 	typ *fileType
 	// root is the file or directory to search.
@@ -257,6 +263,12 @@ func (t *grepTool) plan(call core.ToolCall, env *core.ToolEnv) (*grepQuery, *fai
 			text = text[1:]
 		}
 		text = strings.TrimPrefix(text, "./")
+		if q.globNot && len(text) > 1 && strings.HasSuffix(text, "/") {
+			// "!vendor/": the directories of that name, as a line of
+			// .gitignore means it.
+			q.globDirs = true
+			text = strings.TrimRight(text, "/")
+		}
 		if strings.Contains(text, "/") {
 			text = strings.TrimLeft(text, "/")
 		} else {
@@ -270,6 +282,7 @@ func (t *grepTool) plan(call core.ToolCall, env *core.ToolEnv) (*grepQuery, *fai
 			return nil, failf("%s: %v.", o.GrepName, strings.Replace(patternProblem(err, q.globText), "the pattern", "the glob", 1))
 		}
 		q.glob = g
+		q.globNamed = namesIn(text).dirs
 	}
 	typeName, _, f := a.text("type")
 	if f != nil {
@@ -306,7 +319,7 @@ func (q *grepQuery) wants(rel string) bool {
 	if q.typ != nil && !q.typ.matches(base) {
 		return false
 	}
-	if q.glob != nil {
+	if q.glob != nil && !q.globDirs {
 		name := rel
 		if q.globBase {
 			name = base
@@ -316,6 +329,42 @@ func (q *grepQuery) wants(rel string) bool {
 		}
 	}
 	return true
+}
+
+// enters reports whether the walk goes into the directory rel: not into
+// one a negated glob names ("!vendor" leaves out every directory named
+// vendor, and all below it, as ripgrep's glob does).
+func (q *grepQuery) enters(rel string) bool {
+	if q.glob == nil || !q.globNot {
+		return true
+	}
+	name := rel
+	if q.globBase {
+		name = rel[strings.LastIndexByte(rel, '/')+1:]
+	}
+	return !q.glob.Match(name)
+}
+
+// overrides reports whether the glob reaches an entry that is hidden or
+// that the ignore rules leave out: ripgrep's glob "always overrides any
+// other ignore logic", so that glob ".env*" finds .env.local, and
+// "*.log" the logs an ignore rule leaves out. A hidden or ignored
+// directory is entered only when the glob spells out its name on the way
+// (build/**, .config/*.txt): **/*.py, which any directory could hold the
+// files of, would otherwise take the search through every .venv and
+// node_modules (the review of the day's code, 2026-11-20).
+func (q *grepQuery) overrides(rel string, isDir bool) bool {
+	if q.glob == nil || q.globNot {
+		return false
+	}
+	name := rel[strings.LastIndexByte(rel, '/')+1:]
+	if isDir {
+		return q.globNamed[name] && (q.globBase || q.glob.MatchPrefix(rel))
+	}
+	if q.globBase {
+		return q.glob.Match(name)
+	}
+	return q.glob.Match(rel)
 }
 
 // filters says which filters the call set, for messages.
@@ -427,13 +476,19 @@ func (t *grepTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEn
 			rules:   o.ignoreRules(o.GrepNoIgnore, q.root.real),
 			workers: o.SearchWorkers,
 			spread:  true,
+			enter:   q.enters,
+			over:    q.overrides,
 			visit: func(f walkedFile) {
 				if f.isLink() {
 					return
 				}
+				shown := filepath.Join(q.root.abs, filepath.FromSlash(f.rel))
+				if o.denied(shown, f.path) {
+					return
+				}
 				tally.seen.Add(1)
 				if q.wants(f.rel) {
-					q.search(sctx, tally, filepath.Join(q.root.abs, filepath.FromSlash(f.rel)), f.path)
+					q.search(sctx, tally, shown, f.path)
 				}
 			},
 		}
@@ -455,9 +510,13 @@ func (t *grepTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEn
 		return refused(failf("%s is %s, which cannot be searched.", q.root.abs, kindOf(mode)))
 	}
 
+	// Files with a match come newest first, the order Claude Code gives;
+	// lines and counts come in the order of their files' paths, which does
+	// not change while they are paged through with offset (a file written
+	// between two pages would move, and lines be shown twice or never).
 	hits := tally.hits
 	sort.Slice(hits, func(i, j int) bool {
-		if !hits[i].modTime.Equal(hits[j].modTime) {
+		if q.mode == modeFiles && !hits[i].modTime.Equal(hits[j].modTime) {
 			return hits[i].modTime.After(hits[j].modTime)
 		}
 		return hits[i].path < hits[j].path

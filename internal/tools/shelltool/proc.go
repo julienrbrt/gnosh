@@ -26,6 +26,10 @@ type procInfo struct {
 // processes of a session. Callers fall back on the process group alone.
 var errNoProcList = errors.New("listing a session's processes is not supported on this system")
 
+// errNoEnviron says that this system does not show one process another's
+// environment.
+var errNoEnviron = errors.New("this system does not show a process's environment to another")
+
 // statLine is what parseStat reads from a Linux /proc/<pid>/stat file.
 type statLine struct {
 	name    string

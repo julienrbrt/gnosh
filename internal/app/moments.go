@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gnosh-ai/gnosh/internal/agent"
+	"github.com/gnosh-ai/gnosh/internal/cli"
 	"github.com/gnosh-ai/gnosh/internal/core"
 	"github.com/gnosh-ai/gnosh/internal/hooks"
 	"github.com/gnosh-ai/gnosh/internal/instructions"
@@ -37,9 +38,14 @@ import (
 //	InstructionsLoaded  when instruction files are loaded
 //	Notification        when the front end says a question or an idle
 //	                    session has waited
+//	PreModelSwitch,     /model, before and after the switch
+//	PostModelSwitch
 //
 //	SubagentStart,      when the Agent tool starts a sub-agent, and when
 //	SubagentStop        the sub-agent is about to finish (subagent.go)
+//	PostToolBatch       the loop's AfterRound moment
+//	ConfigChange        before a request, when a settings file changed
+//	                    (settingswatch.go)
 type hookRunner struct {
 	l *live
 	r *hooks.Runner
@@ -53,6 +59,13 @@ func (h *hookRunner) has(e hooks.Event) bool { return h != nil && h.r != nil && 
 // tells the hooks the same ones.
 func (h *hookRunner) run(ctx context.Context, in hooks.Input) (hooks.Outcome, error) {
 	l := h.l
+	if l.isHookAgent(in.AgentID) {
+		// An agent hook's own sub-agent (agenthook.go).
+		if in.Event == hooks.SubagentStart || in.Event == hooks.SubagentStop {
+			return hooks.Outcome{}, nil
+		}
+		in.NoAgentHooks = true
+	}
 	in.SessionID = l.ts.ID()
 	in.TranscriptPath = l.ts.Path()
 	if in.Cwd == "" {
@@ -82,6 +95,12 @@ func (l *live) showHooks(in hooks.Input, out hooks.Outcome) {
 	}
 	source := "hook:" + string(in.Event)
 	for _, m := range out.SystemMessages {
+		if in.ToolUseID != "" && slices.ContainsFunc(out.Records, func(r hooks.Record) bool { return strings.Contains(r.String(), m) }) {
+			// (Shown whole with the call, in the hook's own line: as a
+			// warning too it stood above the call, twice over. Seen on the
+			// devbox's screen.)
+			continue
+		}
 		l.notice(agent.LevelWarning, source, m)
 	}
 	for _, w := range out.Warnings {
@@ -161,6 +180,7 @@ func (l *live) moments() agent.Moments {
 		SessionStart:  l.sessionStart,
 		PromptSubmit:  l.promptSubmit,
 		AfterTool:     l.afterTool,
+		AfterRound:    l.afterRound,
 		BeforeSummary: l.beforeSummary,
 		AfterSummary:  l.afterSummary,
 		TurnFailed:    l.turnFailed,
@@ -169,8 +189,9 @@ func (l *live) moments() agent.Moments {
 	}
 	// (The paths a prompt mentions come before what the features add, so
 	// that mem's line stays the last a prompt carries.)
-	m.PromptLines = append(m.PromptLines, l.firstPromptLines, l.mentionLines)
+	m.PromptLines = append(m.PromptLines, l.firstPromptLines, l.mentionLines, l.pastedLines)
 	m.BeforeRequest = append(m.BeforeRequest, l.turnCap, l.settingsChanged)
+	m.MoreRounds = l.moreRounds
 	var busy []func(context.Context) func()
 	for _, c := range l.contribs {
 		m.PromptLines = append(m.PromptLines, c.c.PromptLines...)
@@ -243,19 +264,67 @@ func (l *live) turnCap(ctx context.Context, info agent.RequestInfo) ([]agent.Par
 		return nil, nil
 	}
 	l.capMu.Lock()
-	over := l.roundsBefore+info.Round > l.maxTurns
-	first := over && !l.capped
+	before, key := l.roundsBefore, ""
+	if l.inv.InputFormat == cli.FormatStreamJSON {
+		// Each message of a stream starts a turn with a fresh count, as in
+		// Claude Code: after one turn reached the cap, every later message
+		// was stopped before its first request.
+		before, key = 0, info.Turn
+	}
+	over := before+info.Round > l.maxTurns
+	first := over && (!l.capped || l.capKey != key)
 	if over {
-		l.capped = true
+		l.capped, l.capKey = true, key
 	}
 	l.capMu.Unlock()
 	if first {
-		l.deliver(&CapEvent{Turns: l.maxTurns})
+		l.deliver(&CapEvent{Turns: l.maxTurns, Turn: info.Turn})
 	}
 	if over {
 		l.agent.Interrupt()
 	}
 	return nil, nil
+}
+
+// turnsSpent reports whether the run has had the turns of the model that
+// --max-turns gave it, so that a turn started now would be stopped before
+// its first request. With stream-json input each turn has a fresh count,
+// and none is spent ahead of it.
+func (l *live) turnsSpent() bool {
+	if l.maxTurns <= 0 || l.inv.InputFormat == cli.FormatStreamJSON {
+		return false
+	}
+	l.capMu.Lock()
+	defer l.capMu.Unlock()
+	return l.capped || l.roundsBefore >= l.maxTurns
+}
+
+// moreRounds is turnCap asked after a round, before what the person queued
+// meanwhile is handed to the turn: a turn that has had its replies ends
+// there, and the queued words go out as a turn of their own (with stream-
+// json input, with a fresh count) instead of into a turn the cap stops.
+func (l *live) moreRounds(turn string, rounds int) (bool, string) {
+	if l.maxTurns <= 0 {
+		return true, ""
+	}
+	l.capMu.Lock()
+	before, key := l.roundsBefore, ""
+	if l.inv.InputFormat == cli.FormatStreamJSON {
+		before, key = 0, turn
+	}
+	over := before+rounds >= l.maxTurns
+	first := over && (!l.capped || l.capKey != key)
+	if over {
+		l.capped, l.capKey = true, key
+	}
+	l.capMu.Unlock()
+	if first {
+		l.deliver(&CapEvent{Turns: l.maxTurns, Turn: turn})
+	}
+	if over {
+		return false, fmt.Sprintf("the run has had its %d turns of the model (--max-turns)", l.maxTurns)
+	}
+	return true, ""
 }
 
 // sessionStart runs the SessionStart hooks, once, before the first prompt
@@ -269,7 +338,59 @@ func (l *live) sessionStart(ctx context.Context, info agent.StartInfo) ([]agent.
 	if err != nil {
 		return nil, err
 	}
+	l.setWatched(out)
+	if out.EndTurn {
+		// "continue": false: the session takes no prompt (Claude Code:
+		// processing stops). What the hook said is the reason.
+		return hookParts(hooks.SessionStart, out), &agent.StopWork{Reason: hookHalt(hooks.SessionStart, "this session takes no prompt", out.StopReason)}
+	}
 	return hookParts(hooks.SessionStart, out), nil
+}
+
+// hookHalt is what a person and a model are told when a hook's
+// "continue": false stopped something.
+func hookHalt(event hooks.Event, what, said string) string {
+	text := fmt.Sprintf("A %s hook the user set up said to stop, so %s.", event, what)
+	if said = strings.TrimSpace(said); said != "" {
+		text += " It said: " + said
+	}
+	return text
+}
+
+// beforeModelSwitch runs the PreModelSwitch hooks before /model makes a
+// switch. A refusal, or a hook that could not check, keeps the model as it
+// is. "ask" puts the switch to the person, and is a refusal where nobody
+// can answer (a run), as in Claude Code.
+func (l *live) beforeModelSwitch(ctx context.Context, c *SlashContext, from, to, requested string) error {
+	if !l.hooks.has(hooks.PreModelSwitch) {
+		return nil
+	}
+	out, err := l.hooks.run(ctx, hooks.Input{Event: hooks.PreModelSwitch, FromModel: from, ToModel: to, RequestedModel: requested,
+		Source: "command", ContextTokens: c.Agent.Context().Used})
+	switch {
+	case err != nil:
+		return fmt.Errorf("the model was not changed: the PreModelSwitch hooks could not be run (%w)", err)
+	case out.Blocked:
+		return fmt.Errorf("the model was not changed: a PreModelSwitch hook the user set up refused the switch to %s. %s", to, firstOf(out.Reason, "It gave no reason."))
+	case out.PermissionDecision != hooks.Ask:
+		return nil
+	}
+	ans, err := c.Agent.Ask(ctx, agent.Question{
+		Kind:  "model-switch",
+		Title: "Switch the model to " + to + "? A PreModelSwitch hook asks.",
+		Text:  out.Reason,
+		Choices: []agent.Choice{
+			{Key: "yes", Label: "Yes, switch to " + to},
+			{Key: "no", Label: "No, keep " + from},
+		},
+	})
+	switch {
+	case errors.Is(err, agent.ErrNobodyToAsk):
+		return fmt.Errorf("the model was not changed: a PreModelSwitch hook the user set up wants the switch to %s confirmed, and nobody is here to confirm it. %s", to, out.Reason)
+	case err != nil || ans.Choice != "yes":
+		return fmt.Errorf("the model was not changed: it is still %s", from)
+	}
+	return nil
 }
 
 // modelSwitched runs the PostModelSwitch hooks once /model has switched
@@ -278,7 +399,8 @@ func (l *live) modelSwitched(ctx context.Context, from, to, requested string) {
 	if !l.hooks.has(hooks.PostModelSwitch) {
 		return
 	}
-	out, err := l.hooks.run(ctx, hooks.Input{Event: hooks.PostModelSwitch, FromModel: from, ToModel: to, RequestedModel: requested, Source: "command"})
+	out, err := l.hooks.run(ctx, hooks.Input{Event: hooks.PostModelSwitch, FromModel: from, ToModel: to, RequestedModel: requested,
+		Source: "command", ContextTokens: l.agent.Context().Used})
 	if err != nil || strings.TrimSpace(out.AdditionalContext) == "" {
 		return
 	}
@@ -310,6 +432,8 @@ func hookParts(event hooks.Event, out hooks.Outcome) []agent.Part {
 // promptSubmit runs the UserPromptSubmit hooks on a prompt a person sent,
 // once, when it is sent. A block sends the prompt back with the reason.
 func (l *live) promptSubmit(ctx context.Context, p agent.Prompt) (agent.Admission, error) {
+	// (A suggestion still being made would hold this prompt's request up.)
+	l.suggest.stop()
 	if !l.hooks.has(hooks.UserPromptSubmit) {
 		return agent.Admission{}, nil
 	}
@@ -355,6 +479,43 @@ func (l *live) afterTool(ctx context.Context, done agent.ToolDone) (agent.ToolVe
 	return v, err
 }
 
+// afterRound runs the PostToolBatch hooks once every tool call of a reply
+// has finished, before the model is asked again: what they add goes to the
+// model after the results, and a block (or "continue": false) ends the
+// turn there, its reason kept in the conversation for the model.
+func (l *live) afterRound(ctx context.Context, done agent.RoundDone) (agent.ToolVerdict, error) {
+	if !l.hooks.has(hooks.PostToolBatch) {
+		return agent.ToolVerdict{}, nil
+	}
+	in := hooks.Input{Event: hooks.PostToolBatch, Cwd: l.subStart(done.AgentID), AgentID: done.AgentID, AgentType: done.AgentType}
+	for _, c := range done.Calls {
+		in.ToolCalls = append(in.ToolCalls, hooks.BatchCall{ToolName: c.Call.Name, ToolUseID: c.Call.ID, ToolInput: c.Call.Input, ToolResponse: core.TextOf(c.Result.Content)})
+	}
+	out, err := l.hooks.run(ctx, in)
+	if err != nil {
+		if ctx.Err() != nil {
+			return agent.ToolVerdict{}, nil
+		}
+		return agent.ToolVerdict{}, err
+	}
+	var v agent.ToolVerdict
+	if strings.TrimSpace(out.AdditionalContext) != "" {
+		v.Context = append(v.Context, agent.Part{Source: "hook:PostToolBatch", Text: hookWords(hooks.PostToolBatch, "", out.AdditionalContext)})
+	}
+	stop := ""
+	switch {
+	case out.Blocked:
+		stop = firstOf(out.Reason, "It gave no reason.")
+	case out.EndTurn:
+		stop = firstOf(out.StopReason, "It gave no reason.")
+	}
+	if stop != "" {
+		v.Context = append(v.Context, agent.Part{Source: "hook:PostToolBatch", Text: prompt.Wrap("A PostToolBatch hook the user set up stopped the turn after these tool calls, and says this:\n" + strings.TrimSpace(stop))})
+		v.Halt, v.Reason = true, "a PostToolBatch hook stopped the turn: "+oneLine(stop, 300)
+	}
+	return v, nil
+}
+
 // cwdMoved runs the CwdChanged hooks when a call of the session's own has
 // left the shell in another directory than the last one seen. They may
 // write export lines to the session's environment file.
@@ -371,7 +532,9 @@ func (l *live) cwdMoved(ctx context.Context, dir string) {
 	l.lastCwd = dir
 	l.cwdMu.Unlock()
 	if l.hooks.has(hooks.CwdChanged) {
-		_, _ = l.hooks.run(ctx, hooks.Input{Event: hooks.CwdChanged, OldCwd: old, NewCwd: dir, EnvFile: l.envFile()})
+		if out, err := l.hooks.run(ctx, hooks.Input{Event: hooks.CwdChanged, OldCwd: old, NewCwd: dir, EnvFile: l.envFile()}); err == nil {
+			l.setWatched(out)
+		}
 	}
 }
 
@@ -382,7 +545,26 @@ func (l *live) afterToolWith(ctx context.Context, done agent.ToolDone, instr *in
 	var v agent.ToolVerdict
 	var errs []error
 	v.Context = append(v.Context, l.lateInstructionsFor(ctx, instr, done)...)
+	if path := shellRead(done); path != "" && fstools.MarkRead(env(), path) == nil {
+		// A file viewed with cat, head, grep and the like counts as read,
+		// as in Claude Code: it may be edited, and its folder's
+		// instruction files arrive (shellread.go).
+		v.Context = append(v.Context, l.lateInstructionsAt(ctx, instr, path)...)
+	}
 	v.Context = append(v.Context, l.skillsForFile(done)...)
+	if path, change := lspPath(done); path != "" && l.lspSrv != nil {
+		// The file's language server is told of it; a change gives the
+		// model the problems it brought (lsp.go).
+		if change {
+			parts, note := l.lspSrv.changed(ctx, path)
+			v.Context = append(v.Context, parts...)
+			if note != "" {
+				v.Notes = append(v.Notes, note)
+			}
+		} else {
+			l.lspSrv.opened(path)
+		}
+	}
 	for _, c := range contribs {
 		if c.c.AfterTool == nil {
 			continue
@@ -402,10 +584,18 @@ func (l *live) afterToolWith(ctx context.Context, done agent.ToolDone, instr *in
 		errs = append(errs, err)
 	}
 	v.Context = append(v.Context, hv.Context...)
+	v.Replace = hv.Replace
 	if hv.Halt && !v.Halt {
 		v.Halt, v.Reason = true, hv.Reason
 	}
 	return v, errors.Join(errs...)
+}
+
+// withheld is a call's result with its output withheld, for the reason
+// given.
+func withheld(res core.ToolResult, why string) *core.ToolResult {
+	res.Content = []core.Block{core.Text("[The output of this call is withheld: " + why + ".]")}
+	return &res
 }
 
 // postToolHooks runs the PostToolUse hooks on a call that succeeded, or
@@ -420,11 +610,16 @@ func (l *live) postToolHooks(ctx context.Context, done agent.ToolDone, env func(
 	if !l.hooks.has(event) {
 		return agent.ToolVerdict{}, nil
 	}
+	dir := l.cwd()
+	if e := env(); e != nil && e.Cwd != "" {
+		dir = e.Cwd
+	}
 	in := hooks.Input{
 		Event:     event,
+		Cwd:       dir,
 		ToolName:  done.Call.Name,
 		ToolUseID: done.Call.ID,
-		ToolInput: done.Call.Input,
+		ToolInput: hookToolInput(done.Call, dir, l.cfg.Paths.Home),
 		Duration:  done.Duration,
 		AgentID:   done.AgentID,
 		AgentType: done.AgentType,
@@ -463,7 +658,7 @@ func (l *live) postToolHooks(ctx context.Context, done agent.ToolDone, env func(
 	path := ""
 	var before os.FileInfo
 	names := fstools.Defaults()
-	if !done.Result.IsError && (done.Call.Name == names.WriteName || done.Call.Name == names.EditName) {
+	if !done.Result.IsError && (done.Call.Name == names.WriteName || done.Call.Name == names.EditName || done.Call.Name == names.NotebookEditName) {
 		if path = touchedPath(done); path != "" {
 			before, _ = os.Stat(path)
 		}
@@ -471,12 +666,36 @@ func (l *live) postToolHooks(ctx context.Context, done agent.ToolDone, env func(
 
 	out, err := l.hooks.run(ctx, in)
 	if err != nil {
+		// The hooks did not finish: what the call returned is withheld,
+		// since one of them may have been there to hide part of it.
+		v := agent.ToolVerdict{Replace: withheld(done.Result, "the "+string(event)+" hooks the user set up were stopped before they finished, and one of them may have been there to hide part of it")}
 		if ctx.Err() != nil {
-			return agent.ToolVerdict{}, nil
+			return v, nil
 		}
-		return agent.ToolVerdict{}, err
+		return v, err
 	}
 	var v agent.ToolVerdict
+	if out.CutShort && out.UpdatedOutput == nil && !out.OutputClash {
+		// So with a hook that ran out of time or was killed: a slip of
+		// one that hides a key must not show the key.
+		v.Replace = withheld(done.Result, "a "+string(event)+" hook the user set up did not finish, and it may have been there to hide part of it")
+	}
+	if out.UpdatedOutput != nil || out.OutputClash {
+		// What the model reads in place of what the tool returned. One
+		// that cannot be read, or two that differ, withhold the output:
+		// a hook that meant to hide part of it (a key, say) must not
+		// have it shown for a slip. (Claude Code shows the original.)
+		r := done.Result
+		text, ok := outputText(out.UpdatedOutput)
+		switch {
+		case out.OutputClash:
+			text = "[The output of this call is withheld: two PostToolUse hooks the user set up each gave one to show in its place, and they differ.]"
+		case !ok:
+			text = "[The output of this call is withheld: a PostToolUse hook the user set up gave one to show in its place that gnosh could not read as text.]"
+		}
+		r.Content = []core.Block{core.Text(text)}
+		v.Replace = &r
+	}
 	if out.Blocked && strings.TrimSpace(out.Reason) != "" {
 		v.Context = append(v.Context, agent.Part{Source: "hook:" + string(event), Text: hookWords(event, done.Call.Name, out.Reason)})
 	}
@@ -494,6 +713,65 @@ func (l *live) postToolHooks(ctx context.Context, done agent.ToolDone, env func(
 		}
 	}
 	return v, nil
+}
+
+// outputText reads a PostToolUse hook's replacement for a tool's output
+// as the text the model reads: a string; gnosh's own shape, an object
+// with "text"; Bash's in Claude Code, an object with "stdout" and
+// "stderr"; an object with "content" as a string; or MCP's, content
+// blocks (alone, or as an object's "content"), of which the text ones
+// are taken. Anything else cannot be read.
+func outputText(raw json.RawMessage) (string, bool) {
+	if raw == nil {
+		return "", false
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s, true
+	}
+	blocks := func(raw json.RawMessage) (string, bool) {
+		var bs []struct{ Type, Text string }
+		if json.Unmarshal(raw, &bs) != nil {
+			return "", false
+		}
+		var parts []string
+		for _, b := range bs {
+			if b.Type == "text" {
+				parts = append(parts, b.Text)
+			}
+		}
+		return strings.Join(parts, "\n"), len(parts) > 0 || len(bs) == 0
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return blocks(raw)
+	}
+	str := func(key string) (string, bool) {
+		var v string
+		field, ok := obj[key]
+		return v, ok && json.Unmarshal(field, &v) == nil
+	}
+	if t, ok := str("text"); ok {
+		return t, true
+	}
+	stdout, hasOut := str("stdout")
+	stderr, hasErr := str("stderr")
+	if hasOut || hasErr {
+		var parts []string
+		for _, p := range []string{stdout, stderr} {
+			if p = strings.TrimRight(p, "\n"); p != "" {
+				parts = append(parts, p)
+			}
+		}
+		return strings.Join(parts, "\n"), true
+	}
+	if c, ok := str("content"); ok {
+		return c, true
+	}
+	if c, ok := obj["content"]; ok {
+		return blocks(c)
+	}
+	return "", false
 }
 
 // toolResponse is what a PostToolUse hook is told a tool returned: the
@@ -545,13 +823,48 @@ func (l *live) beforeSummary(ctx context.Context, info agent.SummaryInfo) (strin
 // "compact".
 func (l *live) afterSummary(ctx context.Context, info agent.SummaryInfo) ([]agent.Part, error) {
 	var parts []agent.Part
+	// The system prompt is made again, as at the start: what it is made
+	// of (the tools there are now, a project that has come to hold Gno
+	// code) may have changed since, and a summary has spent the cache it
+	// kept warm. Claude Code 2.1.328 does so after an automatic summary
+	// as after /compact.
+	if system, err := l.systemPrompt(); err == nil && !slices.Equal(system, l.systemNow()) {
+		l.putSystem(system)
+	}
+	// The model no longer sees any file it read: Edit and Write refuse to
+	// change one until Read has shown it again, as after a slide, so that
+	// no file is written from a copy the model can no longer see. The ones
+	// it read or changed last are read again and given back below.
+	recent := fstools.Recent(l.env(), backFiles)
+	fstools.ForgetAll(l.env())
 	if l.instr != nil {
 		// The files given along the way are forgotten, so that each is
 		// given again when the model next works where it applies; the
-		// ones in effect from the start are given back now.
-		l.instr.Forget()
+		// ones in effect from the start are given back now, read again
+		// when one has changed since, as Claude Code reads them after a
+		// summary.
+		reread := false
+		if len(l.instr.Changed(ctx)) > 0 {
+			ws, err := l.instr.Reload(ctx)
+			if reread = err == nil; !reread && ctx.Err() == nil {
+				l.notice(agent.LevelWarning, "instructions", "The instruction files changed, and could not be read again after the summary ("+err.Error()+"), so those read before are given back.")
+			}
+			for _, w := range ws {
+				l.notice(agent.LevelWarning, "instructions", w.Text)
+			}
+		}
+		if !reread {
+			l.instr.Forget()
+		}
 		if text := l.startInstructions(); text != "" {
 			parts = append(parts, agent.Part{Source: "instructions", Text: text})
+			var given []instructions.File
+			for _, f := range l.instr.Files() {
+				if !f.Late {
+					given = append(given, f)
+				}
+			}
+			l.instructionsLoaded(given, "", "compact")
 		}
 	}
 	if text := l.startAgentTypes(); text != "" {
@@ -568,6 +881,23 @@ func (l *live) afterSummary(ctx context.Context, info agent.SummaryInfo) ([]agen
 	} else {
 		parts = append(parts, pre...)
 	}
+	// Where the session runs, as it stands now: the date, the folder and
+	// git went with the first prompt, which the summary took the place of,
+	// and the model knew none of them after it. (Claude Code 2.1.328 builds
+	// them again after an automatic summary as after /compact.)
+	env := l.envNow()
+	env.Summary = true
+	parts = append(parts, agent.Part{Source: "environment", Text: l.texts.Environment(env)})
+	back, given := l.filesBack(ctx, recent, info.Window)
+	parts = append(parts, back...)
+	defer func() {
+		if ctx.Err() != nil {
+			// Stopped: what this gives back may not reach the model (a
+			// moment that does not finish in time is gone on without), so
+			// the files it read again do not count as read.
+			fstools.Forget(l.env(), given...)
+		}
+	}()
 	if l.shell != nil {
 		var running []string
 		for _, t := range l.shell.Tasks() {
@@ -593,18 +923,33 @@ func (l *live) afterSummary(ctx context.Context, info agent.SummaryInfo) ([]agen
 		}
 		parts = append(parts, more...)
 	}
+	var halt *agent.StopWork
 	if l.hooks.has(hooks.PostCompact) {
-		if _, err := l.hooks.run(ctx, hooks.Input{Event: hooks.PostCompact, Trigger: info.Trigger, CompactSummary: info.Summary}); err != nil {
+		out, err := l.hooks.run(ctx, hooks.Input{Event: hooks.PostCompact, Trigger: info.Trigger, CompactSummary: info.Summary})
+		switch {
+		case err != nil:
 			errs = append(errs, err)
+		case out.EndTurn:
+			halt = &agent.StopWork{Reason: hookHalt(hooks.PostCompact, "the turn ended after the summary", out.StopReason)}
 		}
 	}
 	if l.hooks.has(hooks.SessionStart) {
 		out, err := l.hooks.run(ctx, hooks.Input{Event: hooks.SessionStart, Source: "compact", Model: l.agent.Model().Info.ID, EnvFile: l.envFile()})
-		if err != nil {
+		switch {
+		case err != nil:
 			errs = append(errs, err)
-		} else {
+		default:
 			parts = append(parts, hookParts(hooks.SessionStart, out)...)
+			if out.EndTurn && halt == nil {
+				halt = &agent.StopWork{Reason: hookHalt(hooks.SessionStart, "the turn ended after the summary", out.StopReason)}
+			}
 		}
+	}
+	if halt != nil {
+		if err := errors.Join(errs...); err != nil {
+			l.notice(agent.LevelWarning, "summary", fmt.Sprintf("What the session is given back after a summary could not all be put together (%v).", err))
+		}
+		return parts, halt
 	}
 	return parts, errors.Join(errs...)
 }
@@ -658,6 +1003,8 @@ func (l *live) turnEnded(ctx context.Context, res agent.TurnResult) {
 		}
 	}
 	l.tellNewBuild()
+	l.loopTurnEnded()
+	l.suggestNext(res)
 }
 
 // sessionEnd is what happens when the session closes, in the order the
@@ -706,6 +1053,7 @@ func (l *live) stopHooks(ctx context.Context, end agent.TurnEnd) (agent.Verdict,
 		Event:                hooks.Stop,
 		StopHookActive:       end.Streak > 0,
 		LastAssistantMessage: end.Text,
+		Extra:                l.stopLists(),
 	})
 	switch {
 	case err != nil:

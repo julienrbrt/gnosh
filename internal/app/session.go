@@ -28,6 +28,7 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/jsonschema"
 	"github.com/gnosh-ai/gnosh/internal/permission"
 	"github.com/gnosh-ai/gnosh/internal/prompt"
+	"github.com/gnosh-ai/gnosh/internal/sandbox"
 	"github.com/gnosh-ai/gnosh/internal/tools/shelltool"
 	"github.com/gnosh-ai/gnosh/internal/transcript"
 	"github.com/gnosh-ai/gnosh/internal/trust"
@@ -43,23 +44,69 @@ type live struct {
 	inv cli.Invocation
 	cfg *config.Config
 
+	// lspSrv are the session's language servers (lsp.go).
+	lspSrv *lspServers
+	// sandboxProxy is the sandbox's way out to the hosts the settings
+	// allow, and sandboxNet what a sandboxed command is told of it
+	// (sandbox.go); nil and empty when there is none.
+	sandboxProxy *sandbox.Proxy
+	sandboxNet   struct{ proxy, relay string }
+
+	// agentsSeen is when the person last looked at the runs in the
+	// background from the session (its start, or the agent view opened
+	// over it), in Unix nanoseconds (agentview.go, agentsWord).
+	agentsSeen atomic.Int64
+
 	// interactive says a person is there to be asked. source is how the
 	// session came to be, in the SessionStart hook's words.
 	interactive bool
 	source      string
+	// modelPicked says the model was picked when the session started,
+	// from a list, as nothing chose one (set before the session runs).
+	modelPicked bool
+	// watch is how the files FileChanged hooks watch stood at the last
+	// look (filewatch.go).
+	watch fileWatch
+	// suggestOn is the promptSuggestionEnabled option as it stands, and
+	// suggest the suggestion being made (suggest.go).
+	suggestOn atomic.Bool
+	suggest   suggester
+	// respondShell is the respondToBashCommands option as it stands: the
+	// model answers a command the person ran behind "!" (shellline.go).
+	respondShell atomic.Bool
+	// askIdle is the askUserQuestionTimeout option as it stands, as a
+	// duration in nanoseconds; zero for none (askuser.go).
+	askIdle atomic.Int64
+	// fewerLast is the list /fewer-permission-prompts last gave, which
+	// its add takes numbers of (fewerprompts.go).
+	fewerMu   sync.Mutex
+	fewerLast []askedRule
+	// reviewCap is the /code-review --max-findings choice made in this
+	// session ("" for default), or nil for none: the state file's holds
+	// then (reviewcmd.go).
+	reviewCap atomic.Pointer[string]
 
-	store     *transcript.Store
-	ts        *transcript.Session
-	log       *sessionLog
-	engine    *permission.Engine
-	hooks     *hookRunner
-	shell     *shelltool.Manager
-	texts     *prompt.Set
-	instr     *instructions.Set
-	tools     []core.Tool
-	own       []core.Tool // gnosh's own tools that are offered, without the Agent tool
-	toolStore *sync.Map
-	roots     []string
+	store  *transcript.Store
+	ts     *transcript.Session
+	log    *sessionLog
+	engine *permission.Engine
+	hooks  *hookRunner
+	// hookAgents are the sub-agents agent hooks run (agenthook.go).
+	hookAgents hookAgents
+	shell      *shelltool.Manager
+	texts      *prompt.Set
+	instr      *instructions.Set
+	tools      []core.Tool
+	own        []core.Tool // gnosh's own tools that are offered, without the Agent tool
+	toolStore  *sync.Map
+	roots      []string
+	// rootTrust says, of each added folder looked at, whether its own
+	// agents, skills and commands are read (defRoots).
+	rootTrustMu sync.Mutex
+	rootTrust   map[string]bool
+	// addedDirs are the folders /add-dir added, which a new start of the
+	// session (/restart, /cd) is given as --add-dir.
+	addedDirs []string
 	agent     *agent.Agent
 	facts     *Session
 	contribs  []joined
@@ -94,11 +141,15 @@ type live struct {
 	// (serverload.go).
 	load   loadWatch
 	typeMu sync.Mutex
-	types  map[string]string // a model's id -> its provider's type
+	types  map[string]string // provider/model id -> the provider's type
 	// modelMu guards large once the session is open, and switchMu makes
 	// /model one switch at a time.
 	modelMu  sync.Mutex
 	switchMu sync.Mutex
+	// offerMu makes taking the list of tools and offering it one step, so
+	// that two servers that connect at once cannot have the older list
+	// offered last, in place of the newer (mcp.go offerMCPTools).
+	offerMu sync.Mutex
 
 	// lastSummary is how the last summary ended.
 	lastSummary atomic.Pointer[agent.SummaryEvent]
@@ -138,6 +189,9 @@ type live struct {
 	capMu        sync.Mutex
 	roundsBefore int
 	capped       bool
+	// capKey is the turn the cap was reached in, with stream-json input,
+	// where each turn has a count of its own.
+	capKey string
 
 	// reopen is the id of the session this one opens again, after a
 	// rewind; rewindTo is the point /rewind asked to go back to, which
@@ -145,8 +199,10 @@ type live struct {
 	reopen   string
 	rewindTo string
 	// rewindAll says /rewind asked for the files to be put back with the
-	// conversation.
-	rewindAll bool
+	// conversation, and rewindKept is the summary of what followed the
+	// prompt that /rewind N summarize asked to keep in its place.
+	rewindAll  bool
+	rewindKept string
 	// checks keeps what the files the model changes held, for a rewind,
 	// and checkWarn says once that one could not be kept.
 	checks    *checkpoints
@@ -156,20 +212,28 @@ type live struct {
 	// statusLine runs the configured status line command, or is nil.
 	statusLine *statusLiner
 	// bgAgents are the sub-agents running in the background, and bgWG
-	// counts their goroutines.
+	// counts their goroutines. bgStops counts the times they were all
+	// stopped, under bgMu (bgStopsNow).
 	bgMu     sync.Mutex
 	bgAgents []*bgAgent
+	bgStops  int64
 	bgWG     sync.WaitGroup
 	// resumeTo is the session /resume asked to open in place of this one.
 	resumeTo string
+	// resumeShown is the list /resume showed last, by id: /resume N opens
+	// the Nth of it, though the folder's sessions have changed order since
+	// (a session beside this one was written to).
+	resumeShown []string
 	// branchTo is set by /branch: the name of the copy it asked for, which
 	// may be empty.
 	branchTo *string
-	// system is what the model is told as its instructions, and named
-	// says the session has a name or was given one after its first
-	// prompt.
-	system []string
-	named  atomic.Bool
+	// system is what the model is told as its instructions (held with
+	// systemMu: a summary makes it again from the loop, /output-style
+	// from a command, and /context reads it), and named says the session
+	// has a name or was given one after its first prompt.
+	systemMu sync.Mutex
+	system   []string
+	named    atomic.Bool
 	// lastCwd is the directory the shell was last seen in, for
 	// CwdChanged; empty means the one the session started in.
 	cwdMu   sync.Mutex
@@ -240,6 +304,25 @@ type live struct {
 	// newBuildSaid says the person was told of a newer gnosh installed
 	// (restart.go).
 	newBuildSaid atomic.Bool
+	// restartWhy, set by a tool that moved the session (EnterWorktree,
+	// ExitWorktree), is what the front end is told when the turn has
+	// ended: the session closes for gnosh to start again (RestartEvent).
+	restartWhy atomic.Pointer[string]
+	// crons is the session's scheduled prompts (crontool.go), and self its
+	// self-paced /loop, under loopMu (cronloop.go).
+	crons  cronBook
+	loopMu sync.Mutex
+	self   *selfLoop
+	// chanRates counts what each channel pushed in the present minute
+	// (channel.go), under chanMu.
+	chanMu    sync.Mutex
+	chanRates map[string]*channelRate
+	// relay is the permission questions put to the channels that relay
+	// them (channelrelay.go).
+	relay relayBook
+	// pushLast is when the last notification PushNotification asked for
+	// was sent (pushtool.go).
+	pushLast atomic.Pointer[time.Time]
 	// notif is the notification channel /config set while the session
 	// runs; "" is the configuration's.
 	notifMu sync.Mutex
@@ -260,6 +343,9 @@ type live struct {
 	// bgUntold that the ends of that work are no longer told to the model
 	// (the run has stopped waiting for it).
 	bgEver, bgUntold atomic.Bool
+	// monitorSent is when each Monitor last passed lines on, by its id
+	// (monitorLines).
+	monitorSent sync.Map
 }
 
 // joined is a feature with what it added to this session.
@@ -398,7 +484,13 @@ func (p *program) openSession(ctx context.Context, st *startup, front Frontend, 
 	hc, _ := hooksConfig(l.cfg)
 	ho := st.hookOptions(l.cfg)
 	ho.Background = l.backgroundHook
+	if l.inv.Command == cli.CmdPrint && l.inv.OutputFormat == cli.FormatStreamJSON {
+		// Each hook's start and end, for stream-json (HookLifeEvent).
+		ho.Lifecycle = func(life hooks.Life) { l.deliver(&HookLifeEvent{Life: life}) }
+	}
 	ho.MCP = l.mcpHookCall
+	ho.Prompt = l.promptHookAsk
+	ho.Agent = l.agentHookRun
 	for _, c := range l.contribs {
 		if c.c.Hooks != nil {
 			fires := ho.Fires
@@ -410,6 +502,13 @@ func (p *program) openSession(ctx context.Context, st *startup, front Frontend, 
 	if err != nil {
 		return l, fmt.Errorf("the hooks cannot be run as they are configured:\n%w", err)
 	}
+	// A sandbox the settings turn on that cannot run here: a notice, or,
+	// with failIfUnavailable, no session.
+	if note, stop := l.sandboxNotice(); stop != nil {
+		return l, stop
+	} else if note != "" {
+		l.notice(agent.LevelWarning, "sandbox", note)
+	}
 	l.hooks = &hookRunner{l: l, r: runner}
 	if l.asAgent != nil {
 		// The hooks of the kind the session runs as hold for all of it.
@@ -420,18 +519,31 @@ func (p *program) openSession(ctx context.Context, st *startup, front Frontend, 
 
 	// The tools, the instruction files and the system prompt. What the
 	// files the tools change held is kept beside the session's file.
-	l.checks = openCheckpoints(filepath.Join(l.st.dirs(l.ts.ID()).Session, "checkpoints"), l.p.now)
+	// (By the session's own file: a session resumed from another folder
+	// keeps its copies where they were made.)
+	l.checks = openCheckpoints(filepath.Join(strings.TrimSuffix(l.ts.Path(), ".jsonl"), "checkpoints"), l.p.now)
+	// (The copies of the session this one was branched from, which the
+	// files followed from there are compared with as each prompt goes out.)
+	l.promptsInOrder()
 	if err := l.buildTools(); err != nil {
 		return l, err
 	}
 	l.allowSpool()
+	l.ownSession()
 	if err := l.loadInstructions(ctx); err != nil {
 		return l, err
 	}
 	l.agentNotices()
+	if target := dataDirLeadsOut(l.cfg); target != "" {
+		l.notice(agent.LevelWarning, "data", fmt.Sprintf(
+			"The project's data folder %s is a link to %s, outside the project: gnosh keeps this project's saved approvals, work trees and delivered files there. If you did not make that link (a repository can carry one), remove it; to keep the data elsewhere on purpose, set projectDataDir to that folder's absolute path.",
+			l.cfg.Paths.DataDir, target))
+	}
 	l.loadStyles()
 	system, err := l.systemPrompt()
+	l.systemMu.Lock()
 	l.system = system
+	l.systemMu.Unlock()
 	if err != nil {
 		return l, err
 	}
@@ -446,7 +558,11 @@ func (p *program) openSession(ctx context.Context, st *startup, front Frontend, 
 				q.Choices = append(q.Choices, agent.Choice{Key: m, Label: m})
 			}
 			ans, err := asker.AskBefore(q)
-			return ans.Choice, err == nil && slices.Contains(models, ans.Choice)
+			ok := err == nil && slices.Contains(models, ans.Choice)
+			// (Kept nowhere: a gnosh that goes on with this session is
+			// told it, relaunchFor.)
+			l.modelPicked = l.modelPicked || ok
+			return ans.Choice, ok
 		}
 	}
 	if err := l.setupModels(ctx, pick); err != nil {
@@ -458,6 +574,7 @@ func (p *program) openSession(ctx context.Context, st *startup, front Frontend, 
 
 	// The log, and the agent.
 	l.log = newSessionLog(l.ts, l.texts)
+	l.log.cwd = l.cwd
 	l.log.startedWith = "gnosh " + p.o.BuildID
 	if name := l.agentName(); name != "" && name != l.storedAgent() {
 		l.log.runAs = name
@@ -473,12 +590,9 @@ func (p *program) openSession(ctx context.Context, st *startup, front Frontend, 
 			l.log.afterStored = append(l.log.afterStored, c.c.AfterStored)
 		}
 	}
-	l.log.onCut = func() {
-		if l.instr != nil {
-			l.instr.Forget()
-		}
-	}
-	texts, err := loopTexts(l.texts, slices.Contains(l.toolNames(), gnoRunTool))
+	l.log.onCut = func() { forgetGone(l.log, l.instr) }
+	l.log.onPrompt = l.promptGoesOut
+	texts, err := loopTexts(l.texts, slices.Contains(l.toolNames(), gnoRunTool), l.ts.Path())
 	if err != nil {
 		return l, err
 	}
@@ -488,8 +602,10 @@ func (p *program) openSession(ctx context.Context, st *startup, front Frontend, 
 		Roots:         l.roots,
 		Tree:          l.st.treeEnv(),
 		Interactive:   l.interactive,
+		Relay:         !l.interactive && l.p.runAsks != "",
 		StartSource:   l.source,
 		Model:         l.large.model,
+		Fallbacks:     l.fallbacks(),
 		System:        system,
 		Tools:         l.tools,
 		Log:           l.log,
@@ -507,6 +623,7 @@ func (p *program) openSession(ctx context.Context, st *startup, front Frontend, 
 		Mark:          prompt.Wrap,
 		CleanInput:    cleanInput,
 		CleanResult:   cleanResult,
+		Reroute:       l.rerouteGno,
 		Outgoing:      l.outgoing,
 		OnPanic:       l.onPanic,
 		Store:         l.toolStore,
@@ -516,6 +633,11 @@ func (p *program) openSession(ctx context.Context, st *startup, front Frontend, 
 		small := l.small.model
 		opts.Small = &small
 	}
+	// (What the session loaded is the settings it has taken in.)
+	l.watchSettings()
+	l.suggestOn.Store(l.cfg.Options.PromptSuggestionEnabled.V)
+	l.respondShell.Store(l.cfg.Options.RespondToBashCommands.V)
+	l.askIdle.Store(int64(askIdleOf(l.cfg.Options.AskUserQuestionTimeout.V)))
 	a, err := agent.New(opts)
 	l.agent = a
 	// Published for the code that runs beside the session's opening (a
@@ -549,9 +671,22 @@ func (p *program) openSession(ctx context.Context, st *startup, front Frontend, 
 	}
 	// The MCP servers: their tools are added as each connects.
 	l.mcp = l.loadMCP()
+	l.channelsNotice()
 	l.startMCP()
 	l.startStatusLine()
+	l.watchAgents()
+	l.watchRuns()
+	l.watchFiles(l.ctx)
+	if l.cronOff() == "" {
+		l.restoreCrons()
+		go l.runCron(l.ctx)
+	}
 	l.startInitialPrompt()
+	// A session /restart opened in a newer build says what changed, and
+	// one /cd moved is told where it is now.
+	l.whatsNew()
+	l.movedHere()
+	l.treeMoved()
 	return l, nil
 }
 
@@ -559,6 +694,10 @@ func (p *program) openSession(ctx context.Context, st *startup, front Frontend, 
 // command line names, or a copy of it.
 func (l *live) openTranscript(ctx context.Context) error {
 	inv, cwd := l.inv, l.cfg.Paths.Cwd
+	if _, err := personsTitle(inv.Name); err != nil {
+		// (Before a session is made, which would be left with no name.)
+		return fmt.Errorf("--name: %w. Nothing was started", err)
+	}
 	if l.reopen != "" {
 		// The session that was just closed, again (a rewind), another
 		// session of the folder (/resume), or the copy /branch made.
@@ -567,6 +706,9 @@ func (l *live) openTranscript(ctx context.Context) error {
 			return fmt.Errorf("the session %s could not be opened again: %w", l.reopen, err)
 		}
 		l.ts = ts
+		l.ownSession()
+		// What is written from here on is written in this folder.
+		l.ts.SetCwd(cwd)
 		// (/resume opens a session whose conversation is not on the
 		// screen; a rewind's and a branch's is.)
 		l.showPast = l.source == "resume"
@@ -597,14 +739,27 @@ func (l *live) openTranscript(ctx context.Context) error {
 	path, id := "", ""
 	switch inv.Conversation {
 	case cli.ConversationContinue:
-		info, ok, err := l.store.Latest(ctx, cwd)
+		list, err := l.store.List(ctx, cwd)
 		if err != nil {
 			return fmt.Errorf("the sessions of this folder could not be listed: %w", err)
 		}
-		if !ok {
+		if len(list) == 0 {
 			return fmt.Errorf("there is no session to continue: none was started in %s (sessions are kept under %s). Start one without -c", cwd, l.store.Dir)
 		}
-		id = info.ID
+		// The newest session that no other gnosh holds open, as Claude
+		// Code's -c passes over a background session that still runs: a
+		// /fork or /background run is newest while it works.
+		id = list[0].ID
+		for i, info := range list {
+			if transcript.InUse(info.Path) {
+				continue
+			}
+			if i > 0 {
+				l.notice(agent.LevelInfo, "session", fmt.Sprintf("The newest session of this folder, %s, is open in another gnosh (a run in the background, perhaps), so -c goes on with %s, the newest one free.", shortID(list[0].ID), shortID(info.ID)))
+			}
+			id = info.ID
+			break
+		}
 	case cli.ConversationResume:
 		switch {
 		case inv.ResumeIsFile:
@@ -633,7 +788,16 @@ func (l *live) openTranscript(ctx context.Context) error {
 		}
 		return l.store.OpenReadOnly(ctx, id)
 	}
-	ts, err := open(!inv.ForkSession)
+	// A file -r named by its path that is not one of gnosh's own is gone
+	// on with as a copy in gnosh's folder (importSession).
+	foreign := path != "" && !l.store.Holds(path)
+	var ts *transcript.Session
+	var err error
+	if foreign {
+		ts, err = l.importSession(ctx, path, cwd)
+	} else {
+		ts, err = open(!inv.ForkSession)
+	}
 	if err != nil {
 		var locked *transcript.LockedError
 		switch {
@@ -641,7 +805,7 @@ func (l *live) openTranscript(ctx context.Context) error {
 			why := fmt.Sprintf("the session %s is open in another gnosh, and one session has one writer. Close that one, or add --fork-session to go on in a copy", locked.ID)
 			if log := strings.TrimSuffix(locked.Path, ".jsonl") + ".background.log"; fileExists(log) {
 				// (A run /background or /fork started, most likely.)
-				why += fmt.Sprintf(". If it is a run in the background, it lets go of the session when it is done; what it prints is in %s", log)
+				why += ". " + heldByRun(locked.ID)
 			}
 			return errors.New(why)
 		case errors.Is(err, transcript.ErrNotFound):
@@ -650,7 +814,7 @@ func (l *live) openTranscript(ctx context.Context) error {
 		return fmt.Errorf("the session could not be opened: %w", err)
 	}
 	l.source = "resume"
-	if inv.ForkSession {
+	if inv.ForkSession && !foreign {
 		copied, err := l.store.Branch(ts, "")
 		ts.Close()
 		if err != nil {
@@ -659,10 +823,73 @@ func (l *live) openTranscript(ctx context.Context) error {
 		ts, l.source = copied, "fork"
 	}
 	l.ts = ts
+	l.ownSession()
+	// What is written from here on is written in this folder, which may
+	// not be the one the session's last entry was (another folder's
+	// session opened by its id, a shell that had moved, or /cd).
+	l.ts.SetCwd(cwd)
 	// (Not for a gnosh /restart started: the session it opens is on the
 	// screen already.)
 	l.showPast = l.source == "resume" && !l.p.restarted
 	return l.nameSession()
+}
+
+// importSession opens a session file from outside gnosh's folder, which
+// -r named by its path (a file someone shared, one a repository holds), as
+// a copy in gnosh's own folder, and goes on in the copy. The file itself
+// is never written, and nothing kept beside it is used: its checkpoints,
+// which /rewind would restore files from, are not gnosh's. What would
+// steer the session is left out of the copy (its scheduled tasks, goal,
+// todos, the kind it runs as), and every word in it but the model's own
+// is read as data, gnosh's own tags in it broken: the file was not
+// written by this gnosh, and its tool results or notes could pass for
+// gnosh's words, or its prompts for the person's standing rules.
+func (l *live) importSession(ctx context.Context, path, cwd string) (*transcript.Session, error) {
+	src, err := l.store.OpenPath(ctx, path, true)
+	if err != nil {
+		return nil, err
+	}
+	defer src.Close()
+	ts, err := l.store.Import(src, cwd, importedEntry)
+	if err != nil {
+		return nil, err
+	}
+	l.notice(agent.LevelInfo, "session", fmt.Sprintf("%s is not one of gnosh's own session files, so it goes on as a copy in gnosh's folder (%s): the file is not written to, what it holds besides the model's replies is read as data, and its scheduled tasks, goal and todos are not brought back.", path, shortID(ts.ID())))
+	return ts, nil
+}
+
+// importedEntry is an entry of a session file from outside gnosh's folder
+// as it is copied in (importSession): a note that steers the session, a
+// branch's pointer or a count is left out, and every word but the model's
+// replies is made data.
+func importedEntry(e transcript.Entry) (transcript.Entry, bool) {
+	switch e.Type {
+	case transcript.TypeMeta, transcript.TypeBranch, transcript.TypeUsage:
+		return e, false
+	case transcript.TypeAssistant:
+		return e, true
+	}
+	m := e.Message
+	m.Blocks = untrustedBlocks(m.Blocks)
+	e.Message = m
+	e.Summary = prompt.Untrusted(e.Summary)
+	e.Label, e.Result, e.Title = prompt.Untrusted(e.Label), prompt.Untrusted(e.Result), prompt.Untrusted(e.Title)
+	return e, true
+}
+
+// untrustedBlocks is a copy of blocks with gnosh's own tags broken in
+// every text, a tool result's too.
+func untrustedBlocks(blocks []core.Block) []core.Block {
+	if blocks == nil {
+		return nil
+	}
+	out := make([]core.Block, len(blocks))
+	for i, b := range blocks {
+		b.Text = prompt.Untrusted(b.Text)
+		b.Content = untrustedBlocks(b.Content)
+		out[i] = b
+	}
+	return out
 }
 
 // nameSession gives the session the name -n asks for. A name the person
@@ -671,7 +898,11 @@ func (l *live) nameSession() error {
 	if l.inv.Name == "" || l.source == "clear" {
 		return nil
 	}
-	if _, err := l.ts.Append(transcript.TitleEntry(l.inv.Name, transcript.SourceUser)); err != nil {
+	name, _ := personsTitle(l.inv.Name) // (refused before: openTranscript)
+	if name == "" {
+		return nil
+	}
+	if _, err := l.ts.Append(transcript.TitleEntry(name, transcript.SourceUser)); err != nil {
 		return fmt.Errorf("the session could not be named: %w", err)
 	}
 	return nil
@@ -700,7 +931,12 @@ func (l *live) findSession(ctx context.Context, word string) (string, error) {
 	}
 	switch len(matches) {
 	case 0:
-		return "", fmt.Errorf("no session has the id or the name %q (sessions are kept under %s), so nothing was started", word, l.store.Dir)
+		if l.ts != nil {
+			// /resume: the open session is not one to open.
+			open := l.ts.ID()
+			list = slices.DeleteFunc(slices.Clone(list), func(info transcript.Info) bool { return info.ID == open })
+		}
+		return searchSessions(list, word, l.store.Dir)
 	case 1:
 		return matches[0].ID, nil
 	}
@@ -709,6 +945,45 @@ func (l *live) findSession(ctx context.Context, word string) (string, error) {
 		lines = append(lines, fmt.Sprintf("  %s  (last written %s)", m.ID, m.Modified.Local().Format("2006-01-02 15:04")))
 	}
 	return "", fmt.Errorf("%d sessions are named %q. Resume one by its id:\n%s", len(matches), word, strings.Join(lines, "\n"))
+}
+
+// searchShown is how many sessions a search that found more than one
+// names.
+const searchShown = 10
+
+// searchSessions finds the session whose name or first prompt holds every
+// one of the words, in any case, among all the folder's sessions (list,
+// the one written to last first), not only the ones a list shows: the id
+// when one does, and otherwise an error that names the ones that do, or
+// says none does. dir is where the sessions are kept.
+func searchSessions(list []transcript.Info, words, dir string) (string, error) {
+	terms := strings.Fields(strings.ToLower(words))
+	var hits []transcript.Info
+	for _, info := range list {
+		text := strings.ToLower(info.Title + "\n" + info.FirstPrompt)
+		all := len(terms) > 0
+		for _, t := range terms {
+			all = all && strings.Contains(text, t)
+		}
+		if all {
+			hits = append(hits, info)
+		}
+	}
+	switch len(hits) {
+	case 0:
+		return "", fmt.Errorf("no session has the id or the name %q, nor those words in its name or first prompt (sessions are kept under %s), so nothing was started", words, dir)
+	case 1:
+		return hits[0].ID, nil
+	}
+	var lines []string
+	for i, h := range hits {
+		if i == searchShown {
+			lines = append(lines, fmt.Sprintf("  and %d more", len(hits)-searchShown))
+			break
+		}
+		lines = append(lines, fmt.Sprintf("  %s  %s  %s", h.ID[:min(8, len(h.ID))], h.Modified.Local().Format("2006-01-02 15:04"), oneLine(firstOf(h.Title, h.FirstPrompt), 80)))
+	}
+	return "", fmt.Errorf("%d sessions have %q in their name or first prompt, the one written to last first. Resume one by its id:\n%s", len(hits), words, strings.Join(lines, "\n"))
 }
 
 // pickSession shows the folder's sessions to pick from, for -r with
@@ -806,15 +1081,24 @@ func (l *live) statusFacts() map[string]string {
 // noteBackground keeps the count of commands that run in the background
 // among the facts for a status line.
 func (l *live) noteBackground() {
-	l.bgEver.Store(true)
 	// The commands and the sub-agents that run in the background.
 	running := len(l.backgroundAgents())
+	tasks := 0
 	if l.shell != nil {
-		for _, t := range l.shell.Tasks() {
+		all := l.shell.Tasks()
+		tasks = len(all)
+		for _, t := range all {
 			if t.Running {
 				running++
 			}
 		}
+	}
+	if running > 0 || tasks > 0 {
+		// Only work that went to the background counts: every Bash call
+		// that ended in the foreground did, and a run then waited as for
+		// background work, its result line written before the structured
+		// output and the end's checks.
+		l.bgEver.Store(true)
 	}
 	value := ""
 	if running > 0 {
@@ -913,6 +1197,7 @@ func (l *live) setMode(m permission.Mode) error {
 	}
 	if now := l.engine.Mode(); now != before {
 		l.flog.logf("permission", "the permission mode is now %s (it was %s)", now, before)
+		l.deliver(&ModeEvent{Mode: string(now)})
 		l.statusLine.poke()
 		told := slices.Clone(l.contribs)
 		l.subMu.Lock()
@@ -930,6 +1215,47 @@ func (l *live) setMode(m permission.Mode) error {
 		}
 	}
 	return nil
+}
+
+// envVar is one of Claude Code's variables, from the env block of the
+// settings files, where Claude Code reads it too, or else from the shell.
+// A variable of notFromProjects is not taken from a project's own file.
+func (l *live) envVar(name string) string {
+	if l.cfg != nil {
+		if e, ok := l.cfg.EnvEntry(name); ok && !(notFromProjects[name] && e.Origin.Layer == config.LayerProject) {
+			return e.Value.Reveal()
+		}
+	}
+	return l.p.env[name]
+}
+
+// notFromProjects are the variables gnosh reads that Claude Code passes
+// over in the env block of a project's own settings files, the project's
+// and the local one (its settings reference, "Variables Claude Code
+// ignores in env"): they are the person's to set.
+var notFromProjects = map[string]bool{
+	"CLAUDE_CODE_DISABLE_FILE_MENTIONS": true,
+}
+
+// envOn reports whether one of Claude Code's on/off variables is on, read
+// as Claude Code reads one: 1, true, yes or on, in any case (the review of
+// 2026-11-20: gnosh took only "1", and only from the shell).
+func (l *live) envOn(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(l.envVar(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// ownSession lets the read block through to the session's own folder,
+// where its commands' saved output, fetched pages and pasted pictures are
+// kept (permission.Engine.AddOwnRead): this session's alone, not every
+// past one of the project.
+func (l *live) ownSession() {
+	if l.engine != nil && l.ts != nil && l.st != nil {
+		l.engine.AddOwnRead(l.st.dirs(l.ts.ID()).Session)
+	}
 }
 
 // cwd is the session's working directory as it stands.
@@ -1058,11 +1384,7 @@ func (l *live) repeatPolicy() agent.RepeatPolicy {
 					return k
 				}
 			}
-			failed := "ok"
-			if res.IsError {
-				failed = "error"
-			}
-			return call.Name + "\x00" + string(call.Input) + "\x00" + failed + "\x00" + core.TextOf(res.Content)
+			return agent.RepeatKey(call, res)
 		}
 	}
 	if len(nudges) > 0 {
@@ -1088,8 +1410,16 @@ func (l *live) deliver(ev any) {
 		l.front.Event(ev)
 	}
 	l.evMu.Unlock()
+	if _, ok := ev.(*agent.TurnEndEvent); ok {
+		// A tool moved the session: with its turn over, the front end
+		// closes it, and the program starts again where it moved.
+		if why := l.restartWhy.Swap(nil); why != nil && l.p.restartArgs() != nil {
+			l.deliver(&RestartEvent{Why: *why})
+		}
+	}
 	l.loadMoment(ev)
 	l.statusPoke(ev)
+	l.relayEvent(ev)
 	// A command may have moved to the background, or one there may have
 	// been stopped.
 	if te, ok := ev.(*agent.ToolEndEvent); ok && (te.Name == shelltool.BashName || te.Name == shelltool.StopName) {
@@ -1145,29 +1475,37 @@ func (l *live) onPanic(what string, v any, stack []byte) {
 func (l *live) info() SessionInfo {
 	m := l.agent.Model()
 	info := SessionInfo{
-		ID:           l.ts.ID(),
-		Path:         l.ts.Path(),
-		Cwd:          l.cfg.Paths.Cwd,
-		Model:        m.Info.ID,
-		Address:      m.Address,
-		Thinking:     m.Level,
-		Tools:        l.toolNames(),
-		MCPServers:   l.mcpStatus(),
-		Mode:         string(l.engine.Mode()),
-		Commands:     l.slash.names(),
-		CommandList:  l.slash.list(),
-		Skills:       append(l.typedSkills(), l.mcpPromptInfos()...),
-		Version:      l.p.o.BuildID,
-		Interactive:  l.interactive,
-		SidePanel:    l.cfg.Options.SidePanel.V,
-		Verbose:      l.cfg.Options.Verbose.V,
-		Vim:          l.cfg.Options.EditorMode.V == "vim",
-		OutputStyle:  l.styleNow(),
-		Color:        l.sessionColor(),
-		Keybindings:  l.keybindingsPath(),
-		ShowPast:     l.showPast,
-		NotifChannel: l.notifChannel(),
-		Resume:       "gnosh -r " + l.ts.ID(),
+		ID:               l.ts.ID(),
+		Path:             l.ts.Path(),
+		Cwd:              l.cfg.Paths.Cwd,
+		Model:            m.Info.ID,
+		Address:          m.Address,
+		Thinking:         m.Level,
+		ThinkingBudget:   m.ThinkingBudget,
+		BudgetNote:       m.BudgetNote,
+		Tools:            l.toolNames(),
+		MCPServers:       l.mcpStatus(),
+		Mode:             string(l.engine.Mode()),
+		Commands:         l.commandNames(),
+		CommandList:      l.commandList(),
+		Skills:           append(l.typedSkills(), l.mcpPromptInfos()...),
+		Version:          l.p.o.BuildID,
+		Interactive:      l.interactive,
+		SidePanel:        l.cfg.Options.SidePanel.V,
+		Verbose:          l.cfg.Options.Verbose.V,
+		ViewMode:         l.viewModeSet(),
+		HideTurnDuration: !l.liveBool("showTurnDuration", l.cfg.Options.ShowTurnDuration.V),
+		ListIgnored:      !l.liveBool("respectGitignore", l.cfg.Options.RespectGitignore.V),
+		FileSuggestion:   l.cfg.FileSuggestion != nil,
+		Vim:              l.cfg.Options.EditorMode.V == "vim",
+		Theme:            l.cfg.Options.Theme.V,
+		OutputStyle:      l.styleNow(),
+		Color:            l.sessionColor(),
+		Keybindings:      l.keybindingsPath(),
+		ShowPast:         l.showPast,
+		NotifChannel:     l.notifChannel(),
+		AskTimeout:       time.Duration(l.askIdle.Load()),
+		Resume:           "gnosh -r " + l.ts.ID(),
 	}
 	for _, it := range l.cfg.Options.VimInsertModeRemaps {
 		info.VimRemaps = append(info.VimRemaps, it.V)
@@ -1197,6 +1535,9 @@ func (l *live) kill() {
 func (l *live) close(reason string) {
 	l.closeOnce.Do(func() {
 		l.closing.Store(true)
+		// No FileChanged hook runs after SessionEnd: the watcher ends
+		// first.
+		l.stopWatching()
 		if l.agent != nil {
 			// End stops the turn and then tells the SessionEnd moment,
 			// which closes the shell and runs the hooks.
@@ -1213,6 +1554,7 @@ func (l *live) close(reason string) {
 		l.cancel()
 		waitGroup(&l.bg, 15*time.Second)
 		l.closeMCP()
+		l.lspSrv.close()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		for _, c := range slices.Backward(l.contribs) {
 			if c.c.Close == nil {
@@ -1343,29 +1685,33 @@ func (c *controls) Command(ctx context.Context, line string) (CommandResult, err
 		}
 	}
 	if point := l.rewindTo; err == nil && res.Handled && res.Name == "rewind" && point != "" {
-		all := l.rewindAll
-		l.rewindTo, l.rewindAll = "", false
-		files := ""
-		if all {
-			// The files first, while the session that changed them is the
-			// one behind the controls.
-			done, failed := l.checks.restore(l.rewindFiles(point))
-			l.flog.logf("turn", "the files were put back as they were before the prompt in entry %s: %d put back, %d not", point, len(done), len(failed))
-			files = restoreSaid(done, failed)
+		all, kept := l.rewindAll, l.rewindKept
+		l.rewindTo, l.rewindAll, l.rewindKept = "", false, ""
+		changed := 0
+		if !all {
+			// (What a conversation-only rewind leaves in the files, said
+			// after it in a word.)
+			if cps, ferr := l.rewindFiles(point); ferr == nil {
+				changed = len(cps)
+			}
 		}
-		text, rerr := c.Rewind(ctx, point)
+		text, files, rerr := c.rewindWith(ctx, point, all, kept)
 		if rerr != nil {
 			if files != "" {
-				return res, fmt.Errorf("%s But the conversation could not be taken back: %w", files, rerr)
+				return res, fmt.Errorf("%s But the session could not be opened again: %w", files, rerr)
 			}
 			return res, rerr
 		}
 		res.Reset, res.Draft = true, text
 		res.Text = "The conversation is back to before this prompt of yours, which you can send again or change:\n" + text
-		if files != "" {
+		if kept != "" {
+			res.Text += "\nWhat followed it is kept as a summary, which the model reads with your next prompt."
+		}
+		switch {
+		case files != "":
 			res.Text += "\n" + files
-		} else {
-			res.Text += "\nThe files stay as they are now. " + rewindNote
+		case changed > 0:
+			res.Text += fmt.Sprintf("\nThe files stay as they are now: %s changed since that prompt.", countWords(changed, "file", "files"))
 		}
 	}
 	if id := l.resumeTo; err == nil && res.Handled && res.Name == "resume" && id != "" {
@@ -1392,6 +1738,15 @@ func (c *controls) Command(ctx context.Context, line string) (CommandResult, err
 // status line command, which is told it as vim.mode and runs again when
 // it changes, as Claude Code's does.
 func (c *controls) SetVimMode(mode string) { c.cur().setVimMode(mode) }
+
+// Resized tells the session the terminal has a new size: the status line
+// command, told it as COLUMNS and LINES, runs again (Claude Code 2.1.326
+// stopped keeping a width that was).
+func (c *controls) Resized() {
+	if l := c.cur(); l != nil {
+		l.statusLine.poke()
+	}
+}
 
 // clear ends the session with the reason "clear" and opens a new one
 // behind the same controls.
@@ -1427,7 +1782,7 @@ func (c *controls) Signals() <-chan os.Signal { return c.p.o.Signals }
 // them.
 func (c *controls) Notify(kind, title, message string) {
 	l := c.cur()
-	if !l.hooks.has(hooks.Notification) || (kind != "permission_prompt" && kind != "idle_prompt") {
+	if !l.hooks.has(hooks.Notification) || (kind != "permission_prompt" && kind != "idle_prompt" && kind != "push_notification") {
 		return
 	}
 	in := hooks.Input{Event: hooks.Notification, NotificationType: kind, Title: title, Message: message}
@@ -1487,18 +1842,56 @@ func (c *controls) BackgroundWork() (running []string, ever bool) {
 // CheckBackground hands the model a checkpoint in a run that has waited
 // long for background work: a note that wakes it, says what still runs
 // and for how long the run has waited, and asks whether to stop that work
-// or to wait on.
-func (c *controls) CheckBackground(waited time.Duration, work []string) {
+// or to wait on. It says why when the model cannot be asked.
+func (c *controls) CheckBackground(waited time.Duration, work []string) error {
 	l := c.cur()
-	if l.agent == nil || l.closing.Load() {
-		return
+	switch {
+	case l.agent == nil || l.closing.Load():
+		return errors.New("the session is closing")
+	case l.turnsSpent():
+		return fmt.Errorf("its %d turns of the model are spent (--max-turns)", l.maxTurns)
 	}
-	_ = l.agent.Tell(agent.Note{
+	return l.agent.Tell(agent.Note{
 		Text:   l.texts.PrintWait(roundTime(waited), strings.Join(work, ", ")),
 		Source: "print-wait",
 		Notice: "The run has waited " + roundTime(waited) + " for background work; the model is asked whether to go on waiting.",
 		Wake:   true,
 	})
+}
+
+// LeftRunning says what the session's end would stop of what its
+// commands left running (shelltool's Manager.LeftRunning): each process
+// group, as the commands' results named it.
+func (c *controls) LeftRunning() []string {
+	l := c.cur()
+	if l.shell == nil {
+		return nil
+	}
+	return l.shell.LeftRunning()
+}
+
+// TellLeftRunning stops, as a run is about to end, what its commands left
+// running, which the end would stop, and hands the model what that was: a
+// note that wakes it, so that a server the task needs is started again
+// with setsid. They are stopped first, so that the one started again finds
+// its port free (a copy started beside the old one could not take it, the
+// old one would answer the check, and the end would then stop it: two
+// FrontierHarness tasks were lost so). It reports whether the note went to
+// the model.
+func (c *controls) TellLeftRunning(left []string) bool {
+	l := c.cur()
+	if l.agent == nil || l.closing.Load() {
+		return false
+	}
+	if l.shell != nil {
+		l.shell.StopLeftRunning()
+	}
+	return l.agent.Tell(agent.Note{
+		Text:   l.texts.PrintLeftovers(strings.Join(left, ", ")),
+		Source: "print-leftovers",
+		Notice: "The run is about to end, and stopped what its commands left running: " + strings.Join(left, ", ") + ". The model is told once, to start again with setsid what the task needs.",
+		Wake:   true,
+	}) == nil
 }
 
 // StopBackground stops everything that runs in the background of the
@@ -1524,16 +1917,24 @@ func (c *controls) StopBackground() {
 func (c *controls) StopBackgroundAgents() int {
 	l := c.cur()
 	n := len(l.backgroundAgents())
-	if n > 0 {
-		l.stopBackgroundAgents(10 * time.Second)
-	}
+	// Even with none listed: one may be being made ready, and the stop
+	// keeps it from starting (bgStops; the review of the day's code,
+	// 2026-11-20).
+	l.stopBackgroundAgents(10 * time.Second)
 	return n
 }
 
-// Background moves the command a tool call waits for to the background.
-func (c *controls) Background(callID string) bool {
+// Background moves the command a tool call waits for to the background;
+// a Bash call's command that has not started yet goes there as it starts.
+func (c *controls) Background(callID, tool string) bool {
 	l := c.cur()
-	return l.shell != nil && callID != "" && l.shell.Background(callID)
+	switch {
+	case l.shell == nil || callID == "":
+		return false
+	case tool == shelltool.BashName:
+		return l.shell.BackgroundSoon(callID)
+	}
+	return l.shell.Background(callID)
 }
 
 // Withdraw takes one of the person's queued prompts off the queue.
@@ -1612,12 +2013,18 @@ func (p *program) sessionCommand(ctx context.Context, inv cli.Invocation) (code 
 	var ask []func(trust.Question) (yes, quit bool)
 	if asker, ok := front.(Asker); ok && interactive {
 		ask = append(ask, func(q trust.Question) (bool, bool) {
+			no := "No: start with my own settings only"
+			if len(q.Yours) > 0 {
+				// (Those of the person's own that would run in the folder
+				// wait for the yes too.)
+				no = "No: not now, my own servers here waiting too"
+			}
 			ans, err := asker.AskBefore(agent.Question{
 				Kind:  "trust",
 				Title: "Trust this folder?",
 				Text:  q.String(),
 				Choices: []agent.Choice{
-					{Key: "no", Label: "No: start with my own settings only"},
+					{Key: "no", Label: no},
 					{Key: "yes", Label: "Yes: use this folder's settings"},
 				},
 			})

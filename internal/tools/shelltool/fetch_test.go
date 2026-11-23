@@ -89,7 +89,7 @@ func TestCopyFromHost(t *testing.T) {
 	if got, want := call.Args[len(call.Args)-1], script(shellquote.Quote(CopyCommand(filepath.Join(box.home, "renders", "ad.mp4"), 1<<20))); got != want {
 		t.Errorf("ssh was given\n%s\nwant\n%s", got, want)
 	}
-	if got := strings.Join(call.Args[:len(call.Args)-1], " "); got != "-T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -- root@203.0.113.7" {
+	if got := strings.Join(call.Args[:len(call.Args)-1], " "); got != "-T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -a -x -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ControlMaster=no -- root@203.0.113.7" {
 		t.Errorf("ssh's own arguments were %q", got)
 	}
 	// Nothing is left in the manager's directory, and nothing is listed
@@ -375,4 +375,26 @@ func restAfter(sent, data []byte) int {
 		return 0
 	}
 	return len(sent) - (at + end + 1) - len(data)
+}
+
+// A copy is never written through a link put where the file for it was:
+// the open fails, and the link's target is untouched.
+func TestReadCopyWritesNoLink(t *testing.T) {
+	dir := t.TempDir()
+	spool, dst, target := filepath.Join(dir, "spool"), filepath.Join(dir, "dst"), filepath.Join(dir, "target")
+	if err := os.WriteFile(spool, []byte(copyMarker+"\n5\nhello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, dst); err != nil {
+		t.Skip("no links here:", err)
+	}
+	if _, err := readCopy(spool, dst, 100); err == nil {
+		t.Error("the copy was written through a link")
+	}
+	if data, _ := os.ReadFile(target); string(data) != "keep" {
+		t.Errorf("the link's target holds %q", data)
+	}
 }

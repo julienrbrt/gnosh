@@ -163,32 +163,48 @@ func TestEditNeedsTheFileRead(t *testing.T) {
 	f.fails(f.edit, in{"file_path": missing, "old_string": "a", "new_string": "b"}, missing+" does not exist", "To make a new file, use Write")
 }
 
-func TestEditRefusesAFileChangedBehindItsBack(t *testing.T) {
+// A file changed behind the session's back may still be edited where
+// old_string matches it as it is now, once, as Claude Code lets it: the
+// edit touches that place alone, keeps the other changes, and says they
+// are there; what is not found is told to read the file again, and so is
+// an edit elsewhere afterwards.
+func TestEditOfAFileChangedBehindItsBack(t *testing.T) {
 	f := newFixture(t, Options{})
 	p := f.file("a.txt", "one two three\n")
 	f.ok(f.read, in{"file_path": p})
-	if err := os.WriteFile(p, []byte("one two three four\n"), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte("zero one two three four\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// The text is there and unique, and still the edit is refused: what
-	// the session knows of the file is no longer true.
-	f.fails(f.edit, in{"file_path": p, "old_string": "two", "new_string": "2"}, "has changed on disk", "Nothing was written", "Read it again")
-	if got := f.content(p); got != "one two three four\n" {
-		t.Fatalf("a refused edit changed the file: %q", got)
+	f.fails(f.edit, in{"file_path": p, "old_string": "five", "new_string": "5"}, "has changed on disk", "Read it again")
+	// More than one place, even with replace_all: some may lie in what
+	// the session never saw.
+	f.fails(f.edit, in{"file_path": p, "old_string": "o", "new_string": "0", "replace_all": true}, "has changed on disk", "Read it again")
+	out := f.ok(f.edit, in{"file_path": p, "old_string": "two", "new_string": "2"})
+	if !strings.Contains(out, "had changed on disk since this session last read it") {
+		t.Errorf("the reply does not say the file had changed: %s", out)
 	}
-	f.ok(f.read, in{"file_path": p})
-	f.ok(f.edit, in{"file_path": p, "old_string": "two", "new_string": "2"})
+	if got := f.content(p); got != "zero one 2 three four\n" {
+		t.Fatalf("the file holds %q", got)
+	}
 
-	// Changed after a read of only part of it: size and time tell.
+	// Changed after a read of only part of it: the edit could land in
+	// lines never shown, so it is to be read again (the review of the
+	// day's code, 2026-11-20). Read whole, then changed, it goes through,
+	// and afterwards only the edited line is known.
 	q := f.file("long.txt", manyLines(30))
 	f.ok(f.read, in{"file_path": q, "limit": 5})
 	if err := os.WriteFile(q, []byte(manyLines(31)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	f.fails(f.edit, in{"file_path": q, "old_string": "line 2\n", "new_string": "x\n"}, "has changed on disk")
-	// The earlier look no longer counts for anything.
-	f.ok(f.read, in{"file_path": q, "offset": 20, "limit": 2})
-	f.fails(f.edit, in{"file_path": q, "old_string": "line 2\n", "new_string": "x\n"}, "has not been shown", "it has seen lines 20-21")
+	f.fails(f.edit, in{"file_path": q, "old_string": "line 2\n", "new_string": "x\n"}, "has changed on disk", "Read it again")
+	f.ok(f.read, in{"file_path": q})
+	if err := os.WriteFile(q, []byte(manyLines(32)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.ok(f.edit, in{"file_path": q, "old_string": "line 2\n", "new_string": "x\n"})
+	f.fails(f.edit, in{"file_path": q, "old_string": "line 25\n", "new_string": "y\n"}, "has not been shown")
+	f.ok(f.read, in{"file_path": q, "offset": 20, "limit": 10})
+	f.ok(f.edit, in{"file_path": q, "old_string": "line 25\n", "new_string": "y\n"})
 }
 
 func TestEditTextNotFound(t *testing.T) {
@@ -711,8 +727,7 @@ func TestBeforeChange(t *testing.T) {
 	type seen struct{ path, content string }
 	var told []seen
 	refuse := false
-	var f *fixture
-	f = newFixture(t, Options{BeforeChange: func(env *core.ToolEnv, path string) error {
+	f := newFixture(t, Options{BeforeChange: func(env *core.ToolEnv, path string) error {
 		if refuse {
 			return errors.New("it could not be kept")
 		}

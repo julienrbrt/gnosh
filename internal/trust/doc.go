@@ -76,7 +76,8 @@
 // GitPrograms lists what a repository's own git settings name that git
 // would run on a mere look. It belongs in the question, and while it is
 // not empty in an untrusted folder the agent is given no git status and
-// its git commands ask first. LeadsOut says whether a path inside the
-// folder is a link that leads out of it, which is why a linked skills
-// folder is left out of an untrusted folder.
+// its git commands ask first. LeadsOut says whether a path is a link
+// that leads out of the folders given, which is why a project's skill,
+// command or agent file linked to a place outside the project is not
+// read.
 package trust

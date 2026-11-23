@@ -22,6 +22,10 @@ Commands
   list                    List the servers this folder uses, and whether each
                           connects. (Not built yet.)
   remove <name>           Remove a server. (Not built yet.)
+  login <name>            Sign in to a server at a URL that wants it. (Not
+                          built yet.)
+  logout <name>           Forget the sign-in to a server at a URL. (Not built
+                          yet.)
 
 Flags
   -h, --help

@@ -1,9 +1,12 @@
 package ui
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -67,10 +70,8 @@ type call struct {
 	action  core.Action
 	// tail is the end of the call's live output.
 	tail tailBuf
-	// hooks are the hooks that ran on the call, one line each, and
-	// hookWarn says one of them had more to say than nothing.
-	hooks    []string
-	hookWarn bool
+	// hooks are the hooks that ran on the call, one line each.
+	hooks []string
 	// subs counts the tool calls a sub-agent made under this call, and
 	// subLast is the last of them.
 	subs    int
@@ -162,6 +163,40 @@ type head struct {
 	// several lines, the code of a Gno call. code says it is code.
 	body []string
 	code bool
+}
+
+// argsInOrder is a call's arguments as key: value, in the order they were
+// written, at most n of them: a string quoted and cut short, a number or
+// a yes or no as it is, anything else left out. Arguments still being
+// written give what has arrived.
+func argsInOrder(raw []byte, n int) string {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return ""
+	}
+	var parts []string
+	for dec.More() && len(parts) < n {
+		k, err := dec.Token()
+		key, ok := k.(string)
+		if err != nil || !ok {
+			break
+		}
+		var v any
+		if dec.Decode(&v) != nil {
+			break
+		}
+		switch v := v.(type) {
+		case string:
+			v = oneLine(v)
+			if r := []rune(v); len(r) > 60 {
+				v = string(r[:60]) + "…"
+			}
+			parts = append(parts, oneLine(key)+": "+strconv.Quote(v))
+		case float64, bool:
+			parts = append(parts, fmt.Sprintf("%s: %v", oneLine(key), v))
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // argsOf reads a call's arguments, as far as they are a JSON object.
@@ -363,6 +398,11 @@ func hex4(input []byte, at int) (rune, bool) {
 // complete, and nil while they are still being written; raw is then what
 // has arrived of them.
 func (s *session) headOf(name string, raw []byte, action *core.Action) head {
+	return callHead(s.cwd, s.home, name, raw, action)
+}
+
+// callHead is headOf for a call made in the folder cwd.
+func callHead(cwd, home, name string, raw []byte, action *core.Action) head {
 	args := argsOf(raw)
 	get := func(key string) string {
 		if args != nil {
@@ -371,13 +411,22 @@ func (s *session) headOf(name string, raw []byte, action *core.Action) head {
 		v, _ := partialString(raw, key)
 		return v
 	}
-	path := func(key string) string { return showPath(s.cwd, s.home, get(key)) }
-	h := head{name: name}
+	path := func(key string) string { return showPath(cwd, home, get(key)) }
+	// The name is the model's word: on a server that takes any name, it
+	// can hold escape sequences, and the agent view drew it as it came
+	// (the TUI review of 2026-11-19).
+	h := head{name: oneLine(name)}
 	switch name {
 	case "Bash":
 		command := get("command")
 		if command == "" && action != nil {
 			command = action.Command
+		}
+		if strings.TrimSpace(command) == "" && args != nil {
+			// A call that came whole with no command ("cmd", as a model
+			// may write it) is named as any call is, not drawn as a prompt
+			// with nothing after it (seen on the devbox's screen).
+			break
 		}
 		h.shell = true
 		lines := safeLines(command)
@@ -402,15 +451,23 @@ func (s *session) headOf(name string, raw []byte, action *core.Action) head {
 		case hasLim:
 			h.arg += fmt.Sprintf(" (first %s)", count(lim, "line", "lines"))
 		}
-	case "Write", "Edit", "MultiEdit", "NotebookEdit":
+		if p := oneLine(get("pages")); p != "" {
+			h.arg += " (pages " + p + ")"
+		}
+	case "Write", "Edit", "MultiEdit":
 		h.arg = path("file_path")
+	case "NotebookEdit":
+		h.arg = path("notebook_path")
+		if id := oneLine(get("cell_id")); id != "" {
+			h.arg += " (cell " + id + ")"
+		}
 	case "Glob", "Grep":
 		h.arg = oneLine(get("pattern"))
 		if g := get("glob"); g != "" {
 			h.arg += " in files named " + oneLine(g)
 		}
 		if p := get("path"); p != "" {
-			h.arg += " under " + showPath(s.cwd, s.home, p)
+			h.arg += " under " + showPath(cwd, home, p)
 		}
 	case "gnovm_run":
 		if vm := get("name"); vm != "" && vm != "mem" && vm != "scratch" {
@@ -422,10 +479,37 @@ func (s *session) headOf(name string, raw []byte, action *core.Action) head {
 		if h.arg == "" {
 			h.arg = oneLine(get("prompt"))
 		}
+	case "LSP":
+		// The question, and where: the file, at line:character when one
+		// is given.
+		h.arg = oneLine(get("operation"))
+		if q := get("query"); q != "" {
+			h.arg += " " + oneLine(q)
+		}
+		if p := get("filePath"); p != "" {
+			at := showPath(cwd, home, p)
+			if n, ok := metaInt(args, "line"); ok && n > 0 {
+				at += fmt.Sprintf(":%d", n)
+				if c, ok := metaInt(args, "character"); ok && c > 0 {
+					at += fmt.Sprintf(":%d", c)
+				}
+			}
+			h.arg += " " + at
+		}
 	case "WebFetch":
 		h.arg = oneLine(get("url"))
 	case "WebSearch":
 		h.arg = oneLine(get("query"))
+	case "ScheduleWakeup":
+		// Its result says when the next run is ("Schedule the loop's
+		// next run" before it said nothing more).
+	case "Skill":
+		// The skill and what it was given, as Claude Code heads the call
+		// (the action's summary, for the question, names its file whole).
+		h.arg = oneLine(strings.TrimPrefix(strings.TrimSpace(get("skill")), "/"))
+		if a := oneLine(get("args")); a != "" {
+			h.arg += " " + a
+		}
 	case "TaskOutput", "TaskStop":
 		h.arg = oneLine(get("task_id"))
 	case app.DeliverToolName:
@@ -440,6 +524,14 @@ func (s *session) headOf(name string, raw []byte, action *core.Action) head {
 			}
 		}
 	default:
+		if server, tool, ok := app.MCPToolParts(name); ok {
+			// As Claude Code names an MCP tool's call: the server and the
+			// tool, then the first arguments as they were written (it read
+			// "mcp__echo__echo echo of the MCP server echo").
+			h.name = oneLine(server) + " - " + oneLine(tool) + " (MCP)"
+			h.arg = argsInOrder(raw, 3)
+			break
+		}
 		if action != nil && strings.TrimSpace(action.Summary) != "" {
 			h.arg = oneLine(action.Summary)
 			break
@@ -531,7 +623,10 @@ func (s *session) detailTip() string {
 		return ""
 	}
 	s.tipped = true
-	return " (Ctrl+O shows all of it)"
+	if h := s.transcriptHint("", "shows all of it"); h != "" {
+		return " (" + h + ")"
+	}
+	return ""
 }
 
 // limit is n while detail is off and detailLines while it is on (the
@@ -667,9 +762,19 @@ func (s *session) endBlock(c *call, ev *agent.ToolEndEvent) (rows []string, comp
 			// person sees that from the heading standing alone.
 			lines = nil
 		}
-		under = s.clipTail(lines, s.limit(tailLines))
 		code, hasCode := metaInt(res.Meta, "exitCode")
 		id, _ := res.Meta["backgroundTaskId"].(string)
+		if id != "" && !res.IsError {
+			// Started in the background: what the model is told of it
+			// (where to read, that it will be told) is the model's; the
+			// person reads where its output goes (seen on the devbox's
+			// screen: the model's words, then the same said again).
+			lines = nil
+			if file, _ := res.Meta["persistedOutputPath"].(string); file != "" {
+				lines = []string{"its output goes to " + showPath(s.cwd, s.home, file)}
+			}
+		}
+		under = s.clipTail(lines, s.limit(tailLines))
 		last := ""
 		switch {
 		case id != "":
@@ -696,6 +801,13 @@ func (s *session) endBlock(c *call, ev *agent.ToolEndEvent) (rows []string, comp
 	case res.IsError:
 		failed = true
 		summary = join("failed", took)
+		if unknown, _ := res.Meta["unknownTool"].(bool); unknown {
+			// "There is no tool named ..., so nothing ran.": the list of
+			// the tools there are, after it, is the model's.
+			if i := strings.Index(text, " so nothing ran."); i > 0 {
+				text = text[:i+len(" so nothing ran.")]
+			}
+		}
 		under = s.clipHead(safeLines(text), s.limit(errorLines))
 	case res.Display != nil && res.Display.Kind == "diff":
 		// An edit is shown as its diff. The diff's own first line names
@@ -724,6 +836,10 @@ func (s *session) endBlock(c *call, ev *agent.ToolEndEvent) (rows []string, comp
 		}
 		summary = took
 	default:
+		if ev.Name == "gnovm_run" {
+			// The receipt quotes again what the code just above says.
+			text = withoutEchoes(text, str(argsOf(input), "code"))
+		}
 		summary, under = s.resultSummary(ev.Name, res, text)
 		summary = join(summary, took)
 	}
@@ -749,6 +865,20 @@ func (s *session) resultSummary(name string, res core.ToolResult, text string) (
 	switch name {
 	case "Read":
 		file, _ := meta["file"].(map[string]any)
+		if kind, _ := meta["type"].(string); kind == "pdf" {
+			// A PDF: which of its pages were read.
+			if total, ok := metaInt(file, "numPages"); ok {
+				first, _ := metaInt(file, "firstPage")
+				last, _ := metaInt(file, "lastPage")
+				switch {
+				case first <= 1 && last >= total:
+					return count(total, "page", "pages") + " of a PDF", nil
+				case first >= last:
+					return fmt.Sprintf("page %d of %s", first, grouped(total)), nil
+				}
+				return fmt.Sprintf("pages %d-%d of %s", first, last, grouped(total)), nil
+			}
+		}
 		n, ok := metaInt(file, "numLines")
 		if !ok {
 			return count(strings.Count(strings.TrimRight(text, "\n"), "\n")+1, "line", "lines"), nil
@@ -791,6 +921,117 @@ func (s *session) resultSummary(name string, res core.ToolResult, text string) (
 		}
 	case "gnovm_run":
 		return "", s.clipHead(safeLines(text), s.limit(receiptLines))
+	case "Monitor":
+		// A Monitor started: its id and where its output goes, in the
+		// person's words (the result's are the model's: "comes to you as
+		// notices ... end your reply to wait").
+		if id, _ := meta["taskId"].(string); id != "" {
+			summary = "watching as " + oneLine(id)
+			if file, _ := meta["persistedOutputPath"].(string); file != "" {
+				under = s.body([]string{"its output goes to " + showPath(s.cwd, s.home, file)})
+			}
+			return summary, under
+		}
+	case "EnterPlanMode":
+		if on, _ := meta["planMode"].(bool); on {
+			return "plan mode on", nil
+		}
+	case "PushNotification":
+		// The result's words are the model's ("the user ... reads what
+		// you write").
+		if why, _ := meta["notSent"].(string); why != "" {
+			return "not sent: " + oneLine(why), nil
+		}
+		if strings.HasPrefix(text, "Notification sent") {
+			return "sent", nil
+		}
+	case "AskUserQuestion":
+		// The answers stand in the question's own record just above: the
+		// result's words for the model said them again, cut short.
+		return "answered", nil
+	case "Agent", "Task", "SendMessage":
+		// A sub-agent started, or given more to do, in the background:
+		// its id, in the person's words (the result's are the model's:
+		// "do not report what it found before that notice arrives").
+		if status, _ := meta["status"].(string); status == "async_launched" {
+			summary = "running in the background"
+			if id, _ := meta["agentId"].(string); id != "" {
+				summary += " as " + oneLine(id)
+			}
+			return summary, nil
+		}
+		// A report ends with the sub-agent's id for SendMessage, a line for
+		// the model (seen on the devbox's screen under the report).
+		if id, _ := meta["agentId"].(string); id != "" {
+			text = strings.TrimRight(strings.TrimSuffix(strings.TrimRight(text, "\n"), app.AgentIDLine(id)), "\n")
+		}
+	case "ScheduleWakeup":
+		// When the loop runs next (the result's "This turn ends here" is
+		// the model's); the model's reason is the call's note.
+		if when, _ := meta["nextRun"].(string); when != "" {
+			summary = "next run at " + oneLine(when)
+			if wait, _ := meta["wait"].(string); wait != "" {
+				summary += ", in " + oneLine(wait)
+			}
+			return summary, nil
+		}
+	case "Skill":
+		// The result is the skill's text under a lead written for the
+		// model ("Carry them out"), seen on the devbox's screen tags and
+		// all. A forked skill's result is its sub-agent's report, and is
+		// shown as any other.
+		switch loaded, _ := meta["loaded"].(string); loaded {
+		case "now":
+			return "loaded", nil
+		case "again":
+			return "loaded already", nil
+		}
+	case "WebSearch":
+		// The results by title and site, as a person scans them: the
+		// result lists them for the model, with the search server's
+		// address and how to read on.
+		if hits := s.searchHits(meta["results"]); len(hits) > 0 {
+			return count(len(hits), "result", "results"), s.clipHead(hits, s.limit(resultLines))
+		}
+	case "WebFetch":
+		// What came back, as Claude Code says it ("Received 1.2KB (200
+		// OK)"): the result is the smaller model's answer about the
+		// page, for the model, which the reply puts in its own words.
+		if to, _ := meta["redirect"].(string); to != "" {
+			return "redirects to " + oneLine(to) + ", on another host: not followed", nil
+		}
+		n, hasBytes := metaInt(meta, "bytes")
+		code, hasCode := metaInt(meta, "code")
+		if !hasBytes || !hasCode {
+			break
+		}
+		got := app.ByteCount(int64(n))
+		if kind, _ := meta["contentType"].(string); kind != "" {
+			got = oneLine(kind) + ", " + got
+		}
+		if file, _ := meta["savedTo"].(string); file != "" {
+			return "received " + got + " · saved to " + showPath(s.cwd, s.home, file), nil
+		}
+		status := fmt.Sprint(code)
+		if words := oneLine(str(meta, "codeText")); words != "" {
+			status += " " + words
+		}
+		return "received " + got + " (" + status + ")", nil
+	case "ExitPlanMode":
+		// The plan approved, in the person's words (the result is the
+		// model's: "carry the plan out").
+		if approved, _ := meta["approved"].(bool); approved {
+			mode, _ := meta["mode"].(string)
+			name, ok := modeNames[mode]
+			if !ok {
+				name = oneLine(mode) + " mode"
+			}
+			summary = "approved · " + name
+			if file, _ := meta["planFile"].(string); file != "" {
+				under = s.body([]string{"the plan is kept in " + showPath(s.cwd, s.home, file)})
+			}
+			return summary, under
+		}
 	}
 	lines := nonBlank(safeLines(text))
 	switch len(lines) {
@@ -804,10 +1045,47 @@ func (s *session) resultSummary(name string, res core.ToolResult, text string) (
 	return "", s.clipHead(lines, s.limit(resultLines))
 }
 
+// searchHits is a WebSearch's results as a person reads them, a title and
+// its site on each line, from the call's meta: the list as the tool made
+// it, or as it reads back from a session's file.
+func (s *session) searchHits(v any) []string {
+	var hits []string
+	add := func(title, address string) {
+		line := oneLine(title)
+		site := address
+		if u, err := url.Parse(address); err == nil && u.Hostname() != "" {
+			site = u.Hostname()
+		}
+		switch site = oneLine(site); {
+		case line == "" || title == address:
+			line = oneLine(address)
+		case site != "":
+			line += s.th.Sep + site
+		}
+		if line != "" {
+			hits = append(hits, line)
+		}
+	}
+	switch list := v.(type) {
+	case []map[string]string:
+		for _, r := range list {
+			add(r["title"], r["url"])
+		}
+	case []any:
+		for _, item := range list {
+			if r, ok := item.(map[string]any); ok {
+				title, _ := r["title"].(string)
+				address, _ := r["url"].(string)
+				add(title, address)
+			}
+		}
+	}
+	return hits
+}
+
 // nonBlank drops the blank lines of a result: its first lines under a
-// call are a few rows, none to spare for nothing (Jae, 14 November 2026:
-// "in general don't print empty lines"). The whole is still shown, as
-// it was, when more is asked for.
+// call are a few rows, none to spare for an empty one. The whole is still
+// shown, blank lines and all, when more is asked for.
 func nonBlank(lines []string) []string {
 	var out []string
 	for _, l := range lines {

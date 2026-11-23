@@ -166,6 +166,9 @@ func (m *Manager) monitorArgs(raw json.RawMessage) (bashArgs, error) {
 	if a.limit > monitorMost {
 		a.limit, a.asked = monitorMost, a.limit
 	}
+	// (A Monitor's command runs in the sandbox as a Bash command does, and
+	// has no way to ask out of it.)
+	a.sandboxed = m.sandboxes(a.command, nil, false)
 	return a, nil
 }
 

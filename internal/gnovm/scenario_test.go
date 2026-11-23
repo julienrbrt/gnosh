@@ -64,6 +64,11 @@ import (
 //	GNOVM_SCENARIO_STRICT=1   fail the test when a check fails (by default
 //	                          the checks are reported: the scenarios measure
 //	                          the model and the prompt as much as gnosh)
+//	GNOVM_SCENARIO_ARGS       flags added to every gnosh run, split on
+//	                          spaces: --disallowedTools=gnovm_run,gnovm_new,
+//	                          gnovm_list,gnovm_drop runs a scenario without
+//	                          mem, the plain harness, where a conversation
+//	                          that runs out of room is summarized
 //
 // Run it with -test.parallel below the model server's slots, so that live
 // sessions keep one: a conversation whose slot another request takes
@@ -414,6 +419,7 @@ func (r *scenarioRun) run(t *testing.T, sc *scenario, gnosh, reasoning string) {
 	}
 	env := append(os.Environ(), "XDG_CONFIG_HOME="+cfg, "XDG_DATA_HOME="+data, "TMPDIR="+filepath.Join(r.dir, "tmp"),
 		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	extra := strings.Fields(os.Getenv("GNOVM_SCENARIO_ARGS"))
 	model := scenarioModel()
 	session := ""
 	// What each turn printed goes beside project/ only after the last turn:
@@ -454,6 +460,7 @@ func (r *scenarioRun) run(t *testing.T, sc *scenario, gnosh, reasoning string) {
 				if appendPrompt != "" {
 					args = append(args, "--append-system-prompt-file", appendPrompt)
 				}
+				args = append(args, extra...)
 				args = append(args, "--", ts.prompt)
 				po := &peerOut{}
 				outsP[k] = po
@@ -498,6 +505,7 @@ func (r *scenarioRun) run(t *testing.T, sc *scenario, gnosh, reasoning string) {
 		if appendPrompt != "" {
 			args = append(args, "--append-system-prompt-file", appendPrompt)
 		}
+		args = append(args, extra...)
 		args = append(args, "--", ts.prompt)
 		turnStart := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), turnCap)
@@ -598,16 +606,6 @@ func writeScenarioConfig(t *testing.T, path, reasoning string) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, b, 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func copyIfThere(t *testing.T, from, to string) {
-	b, err := os.ReadFile(from)
-	if err != nil {
-		return
-	}
-	if err := os.WriteFile(to, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }

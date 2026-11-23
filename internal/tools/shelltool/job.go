@@ -7,11 +7,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/gnosh-ai/gnosh/internal/envscrub"
+	"github.com/gnosh-ai/gnosh/internal/sandbox"
 )
 
 // The script every shell is given. It keeps the command out of the script
@@ -83,10 +87,14 @@ type ending struct {
 	alive    []procInfo     // processes that were still alive after SIGKILL
 	held     bool           // a process the command left behind still holds its output open
 	left     []procInfo     // those processes, as far as they could be found
+	detached []procInfo     // what the command left running in its session that let go of its output (cmd >log 2>&1 &)
 	escaped  bool           // after the command was stopped, a process outside its session still held its output open
 	swept    bool           // what the command left behind was stopped at once instead of being left running
 	unread   bool           // the last of the output had not been read when the command's end was recorded
 	finalDir string         // the directory the shell said it ended in, or empty
+	// sandboxNote says what the sandbox took away that the command made
+	// (Options.Sandbox.After), or is empty.
+	sandboxNote string
 }
 
 // failed reports whether the command counts as having failed.
@@ -102,8 +110,14 @@ type job struct {
 	callID      string // the tool call waiting for it, if it started in the foreground
 	command     string
 	description string
-	dir         string // the directory it started in, on this machine
-	started     time.Time
+	// owner is the sub-agent that started it, by its session id, or ""
+	// for the session's own command.
+	owner string
+	dir   string // the directory it started in, on this machine
+	// gone is the session's working directory when it was not there any
+	// more and the command started in dir in its place (nearestStanding).
+	gone    string
+	started time.Time
 
 	host *Host        // the machine the command is for; nil for this one
 	ssh  string       // the ssh program that carries it there
@@ -117,9 +131,21 @@ type job struct {
 	out     *output
 	cwdFile string // where the shell writes the directory it ends in
 	cmdFile string // the command itself, when it was too long to pass as an argument
+	// sandboxed says the command runs inside the sandbox
+	// (Options.Sandbox), and sandboxEnv is what the sandbox sets beside
+	// the command's own variables.
+	sandboxed  bool
+	sandboxEnv []string
+	// sandboxWas is what Options.Sandbox.Before returned for the command.
+	sandboxWas any
+	roots      []string // the session's folders, for the sandbox
 
 	sink atomic.Pointer[progressSink] // where live output goes while a call is listening
 	mon  *watcher                     // a Monitor's command: what passes its lines on; nil for any other
+
+	// letGo says that what the command left holding its output let go of
+	// it later and runs on, kept on the books to be stopped at Close.
+	letGo atomic.Bool
 
 	// intake is held while a piece of output is read from the pipe and
 	// taken in, so that whoever else holds it knows that none is on its way.
@@ -151,6 +177,7 @@ func newJob(m *Manager, a bashArgs, dir string) *job {
 		dir:         dir,
 		host:        a.host,
 		spool:       a.spool,
+		sandboxed:   a.sandboxed,
 		stop:        make(chan endReason, 1),
 		move:        make(chan struct{}, 1),
 		exited:      make(chan struct{}),
@@ -205,7 +232,19 @@ func (j *job) launch(dir, name string) error {
 			}
 			script, arg = fileWrapper, j.cmdFile
 		}
-		cmd = exec.Command(m.shell, "-c", script, filepath.Base(m.shell), j.cwdFile, arg, m.opt.EnvFile)
+		argv := []string{m.shell, "-c", oomFirst + script, filepath.Base(m.shell), j.cwdFile, arg, m.opt.EnvFile}
+		if j.sandboxed {
+			wrapped, err := j.sandbox(argv)
+			if err != nil {
+				r.Close()
+				w.Close()
+				return fail(err)
+			}
+			argv = wrapped
+		} else if m.opt.Isolate != nil {
+			argv = m.opt.Isolate(argv)
+		}
+		cmd = exec.Command(argv[0], argv[1:]...)
 		cmd.Stdout, cmd.Stderr = w, w
 	} else {
 		// The command's own two streams are joined on the other machine
@@ -224,7 +263,12 @@ func (j *job) launch(dir, name string) error {
 		j.out.where = " on this machine"
 	}
 	cmd.Dir = j.dir
-	cmd.Env = commandEnv(m.opt.Environ(), j.dir, m.opt.Env)
+	// The mark goes last, where the settings' own env cannot take it out;
+	// the sandbox's own places for temporary files and caches before it.
+	cmd.Env = commandEnv(m.opt.Environ(), j.dir, append(append(slices.Clip(m.opt.Env), j.sandboxEnv...), m.markEntry()))
+	if m.opt.Scrub {
+		cmd.Env = envscrub.Env(cmd.Env)
+	}
 	cmd.Stdin = nil // the null device
 	// A session of its own: the shell leads a new process group, which is
 	// what gets signalled, and has no terminal, so nothing in it can stop
@@ -474,11 +518,32 @@ func (j *job) finish(why endReason, limit time.Duration) {
 		}
 	}
 	e.finalDir = j.finalDir()
+	if sb := m.opt.Sandbox; j.sandboxed && sb != nil && sb.After != nil {
+		e.sandboxNote = sb.After(j.sandboxWas)
+	}
 	if j.cmdFile != "" {
 		os.Remove(j.cmdFile)
 	}
 	e.at = m.opt.Now()
 
+	if why == endExited && !e.held {
+		// What the command left running that let go of its output (cmd
+		// >log 2>&1 &, a server started so) is still in its session: it is
+		// kept on the books and stopped when the session ends, as what
+		// holds the output is. One that started a session of its own
+		// (setsid) is not in it, and is left alone.
+		if left, err := m.procs(j.pid); err == nil && len(left) > 0 {
+			// A process that let go of the output as it ended may not have
+			// gone at that look: it was left running only if it is still
+			// there a moment later.
+			if left = m.stillThere(j.pid, left); len(left) > 0 {
+				e.detached = left
+				if !m.keepDetached(j.pid, left) {
+					m.sweep(j.pid, left) // (the manager is closing)
+				}
+			}
+		}
+	}
 	if e.held && !m.linger(j, e.left) {
 		// The manager is closing, or is already listening to as many
 		// processes left behind as it will: this one is stopped here and
@@ -558,6 +623,10 @@ func (j *job) catchUp() {
 	}
 }
 
+// maxCwdFile is the most of the file in which a shell says where it ended
+// that is read: a path is far shorter.
+const maxCwdFile = 64 << 10
+
 // finalDir reads, and removes, the file in which the shell said where it
 // ended. It returns that directory with its symbolic links resolved, or ""
 // when the shell said nothing usable. The file is written by the shell the
@@ -565,7 +634,7 @@ func (j *job) catchUp() {
 // there counts, and it is resolved here again, so that nothing written into
 // the file can pass a link off as a place inside the session's roots.
 func (j *job) finalDir() string {
-	data, err := os.ReadFile(j.cwdFile)
+	data, err := readCwdFile(j.cwdFile)
 	os.Remove(j.cwdFile)
 	if err != nil {
 		return ""
@@ -689,4 +758,30 @@ func waitFor(ch <-chan struct{}, d time.Duration) bool {
 	case <-timer.C:
 		return false
 	}
+}
+
+// sandbox wraps the shell's command line in the sandbox, which reaches the
+// files of gnosh's own the shell uses: the one it writes its last
+// directory to (made now, since only a file that is there can be given),
+// the command's file and the environment file.
+func (j *job) sandbox(argv []string) ([]string, error) {
+	if err := os.WriteFile(j.cwdFile, nil, 0o600); err != nil {
+		return nil, fmt.Errorf("shelltool: making the file for the last directory: %w", err)
+	}
+	expose := []sandbox.Exposed{{Path: j.cwdFile, Write: true}}
+	if j.cmdFile != "" {
+		expose = append(expose, sandbox.Exposed{Path: j.cmdFile})
+	}
+	if f := j.m.opt.EnvFile; f != "" {
+		expose = append(expose, sandbox.Exposed{Path: f})
+	}
+	wrapped, env, err := j.m.opt.Sandbox.Wrap(j.dir, j.roots, argv, expose)
+	if err != nil {
+		return nil, refusal("The command was not run: it would run in the sandbox, and the sandbox cannot start (" + err.Error() + ").")
+	}
+	j.sandboxEnv = env
+	if b := j.m.opt.Sandbox.Before; b != nil {
+		j.sandboxWas = b(j.roots)
+	}
+	return wrapped, nil
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/core"
 	"github.com/gnosh-ai/gnosh/internal/hooks"
 	"github.com/gnosh-ai/gnosh/internal/tools/shelltool"
+	"github.com/gnosh-ai/gnosh/internal/transcript"
 )
 
 // crashDir is the folder a session's crash files and log go to: the
@@ -215,13 +216,14 @@ func (g *fileLog) event(ev any) {
 	case *agent.DriverEvent:
 		g.logf("turn", "the check %s holds the turn open (%d in a row, checkpoint %v): %s", ev.Name, ev.Streak, ev.Checkpoint, ev.Objection)
 	case *agent.SummaryEvent:
-		g.logf("context", "summary %s (%s): %d tokens before, %d after, error %v", ev.Phase, ev.Trigger, ev.PreTokens, ev.PostTokens, ev.Err)
+		g.logf("context", "summary %s (%s): %d tokens before, %d after%s", ev.Phase, ev.Trigger, ev.PreTokens, ev.PostTokens, failedWith(ev.Err))
 	case *agent.RoomEvent:
 		g.logf("context", "about %d tokens slid out of the view: %s", ev.Freed, ev.Notice)
 	case *agent.ContextEvent:
 		g.debugf("context", "about %d of %d tokens (room is made at %d)", ev.Context.Used, ev.Context.Window, ev.Context.Point)
 	case *agent.SideEvent:
-		g.logf("model", "side request (%s) to %s/%s took %s: error %v", ev.Purpose, ev.Provider, ev.Model, ev.Duration.Round(time.Millisecond), ev.Err)
+		g.logf("model", "side request (%s) to %s/%s took %s: prompt %d (cached %d), written %d%s", ev.Purpose, ev.Provider, ev.Model, ev.Duration.Round(time.Millisecond),
+			ev.Usage.PromptTokens(), ev.Usage.CacheReadTokens, ev.Usage.OutputTokens, failedWith(ev.Err))
 	case *agent.LoopEvent:
 		g.logf("turn", "/loop on %v after %d turns: %s", ev.On, ev.Turns, ev.Why)
 	case *agent.PromptReturnedEvent:
@@ -241,6 +243,16 @@ func (g *fileLog) event(ev any) {
 	}
 }
 
+// failedWith is ", failed: <err>" for a log line, or nothing when err is
+// nil: a line that says "error <nil>" each time a thing went right is one
+// more to pass over when looking for what went wrong.
+func failedWith(err error) string {
+	if err == nil {
+		return ""
+	}
+	return ", failed: " + err.Error()
+}
+
 // crashFile is where a fatal error of the Go runtime, and a panic gnosh
 // caught, are written, so that what happened is still there when the
 // screen has scrolled on. It lives beside the project's sessions. A nil
@@ -253,8 +265,11 @@ type crashFile struct {
 }
 
 // openCrashFile makes the session's crash file, and when this run is the
-// whole process, points the Go runtime at it. An earlier crash that nobody
-// has been told of is told now.
+// whole process, points the Go runtime at it and holds the file's lock
+// while it runs. An earlier crash that nobody has been told of is told
+// now. An empty crash file nobody holds is a run's that ended without
+// closing it (killed, or the machine went down): it is removed, so that a
+// folder does not fill up with files that look like crashes.
 func openCrashFile(p *program, l *live) *crashFile {
 	dir := l.crashDir()
 	if dir == "" || os.MkdirAll(dir, 0o700) != nil {
@@ -263,7 +278,13 @@ func openCrashFile(p *program, l *live) *crashFile {
 	if old, _ := filepath.Glob(filepath.Join(dir, "crash-*.log")); len(old) > 0 {
 		for _, path := range old {
 			info, err := os.Stat(path)
-			if err != nil || info.Size() == 0 {
+			if err != nil {
+				continue
+			}
+			if info.Size() == 0 {
+				if !transcript.InUse(path) {
+					_ = os.Remove(path)
+				}
 				continue
 			}
 			l.notice(agent.LevelWarning, "crash", fmt.Sprintf("Something in gnosh crashed in this folder on %s. What was written down about it is in %s.",
@@ -282,6 +303,7 @@ func openCrashFile(p *program, l *live) *crashFile {
 		return c
 	}
 	c.f = f
+	transcript.Hold(f)
 	if debug.SetCrashOutput(f, debug.CrashOptions{}) == nil {
 		c.own = true
 	}
@@ -456,6 +478,23 @@ func toolLine(name string, input []byte) string {
 				line += " on " + oneLine(host, 60)
 			}
 			line += ")"
+		}
+		return line
+	}
+	if op, _ := args["operation"].(string); name == lspToolName && op != "" {
+		// What is asked, and where: the file, at line:character.
+		line := name + ": " + oneLine(op, 40)
+		if q, _ := args["query"].(string); q != "" {
+			line += " " + oneLine(q, 80)
+		}
+		if p, _ := args["filePath"].(string); p != "" {
+			line += " " + oneLine(p, 200)
+			if n, ok := args["line"].(float64); ok && n >= 1 {
+				line += fmt.Sprintf(":%d", int(n))
+				if c, ok := args["character"].(float64); ok && c >= 1 {
+					line += fmt.Sprintf(":%d", int(c))
+				}
+			}
 		}
 		return line
 	}

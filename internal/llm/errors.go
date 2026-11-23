@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +25,9 @@ type errorRule struct {
 	codes []string
 	// phrases are parts of error messages, in lower case.
 	phrases []string
+	// inMessage reads the phrases in the error's own message alone, not
+	// in the rest of the body, which may quote the request.
+	inMessage bool
 	// status are ranges of HTTP statuses, both ends included.
 	status [][2]int
 }
@@ -92,11 +96,6 @@ var errorRules = []errorRule{
 			"overloaded_error", "overloaded", "server_is_overloaded", "server_overloaded", "engine_overloaded",
 			"service_unavailable_error", "service_unavailable", "provider_overloaded", "unavailable_error", "unavailable",
 		},
-		phrases: []string{"overloaded"},
-	},
-	{
-		kind:  core.ErrServer,
-		codes: []string{"api_error", "server_error", "internal_server_error", "internal_error", "internal", "timeout_error", "timeout", "provider_unavailable", "server", "unmapped"},
 	},
 	{
 		kind: core.ErrInvalidRequest,
@@ -104,6 +103,19 @@ var errorRules = []errorRule{
 			"invalid_request_error", "invalid_request", "invalid_argument", "invalid_prompt", "unprocessable",
 			"not_found_error", "not_found", "model_not_found", "content_policy_violation", "refusal",
 		},
+	},
+	{
+		// A message that says the service is overloaded. It comes after
+		// the codes that say a request is refused, and before a server's
+		// own, which an overloaded one may give: a request refused as
+		// invalid whose message or body only quoted the word (a C++
+		// "overloaded function") was waited on for ever, as a busy service
+		// is (the model client review of 2026-11-19).
+		kind: core.ErrOverloaded, phrases: []string{"overloaded"}, inMessage: true,
+	},
+	{
+		kind:  core.ErrServer,
+		codes: []string{"api_error", "server_error", "internal_server_error", "internal_error", "internal", "timeout_error", "timeout", "provider_unavailable", "server", "unmapped"},
 	},
 	{kind: core.ErrAuth, status: [][2]int{{401, 403}}},
 	{kind: core.ErrRateLimit, status: [][2]int{{429, 429}}},
@@ -113,8 +125,9 @@ var errorRules = []errorRule{
 }
 
 // classify runs a failure through errorRules. status is zero when there
-// was none, codes and text are in lower case.
-func classify(status int, codes []string, text string) (core.ErrorKind, bool) {
+// was none; codes, the error's message and text (the message and the
+// start of the body) are in lower case.
+func classify(status int, codes []string, message, text string) (core.ErrorKind, bool) {
 	for _, r := range errorRules {
 		for _, c := range r.codes {
 			for _, have := range codes {
@@ -123,8 +136,12 @@ func classify(status int, codes []string, text string) (core.ErrorKind, bool) {
 				}
 			}
 		}
+		where := text
+		if r.inMessage {
+			where = message
+		}
 		for _, ph := range r.phrases {
-			if strings.Contains(text, ph) {
+			if strings.Contains(where, ph) {
 				return r.kind, true
 			}
 		}
@@ -148,6 +165,9 @@ type errorInfo struct {
 	status int
 	// retryAfter is a wait the body asks for, or zero.
 	retryAfter time.Duration
+	// tokens and window are llama.cpp's n_prompt_tokens and n_ctx, on
+	// a request too long for the model, or zero.
+	tokens, window int
 }
 
 // readErrorBody reads a service's error out of a response body or out of
@@ -216,6 +236,13 @@ func (info *errorInfo) take(e map[string]any) {
 		case json.Number:
 			if n, err := strconv.Atoi(v.String()); err == nil && n >= 100 && n <= 599 && info.status == 0 {
 				info.status = n
+			}
+		}
+	}
+	for k, to := range map[string]*int{"n_prompt_tokens": &info.tokens, "n_ctx": &info.window} {
+		if v, ok := e[k].(json.Number); ok && *to == 0 {
+			if n, err := strconv.Atoi(v.String()); err == nil && n > 0 {
+				*to = n
 			}
 		}
 	}
@@ -327,7 +354,7 @@ func (p *provider) apiError(status int, header http.Header, body []byte) *core.P
 	// The telling words are usually in the message, but a service that
 	// passes on another's failure may only quote them further down.
 	text := strings.ToLower(info.message + "\n" + string(clip(body, 4096)))
-	kind, ok := classify(status, info.codes, text)
+	kind, ok := classify(status, info.codes, strings.ToLower(info.message), text)
 	if !ok {
 		// No status and nothing recognisable: the service broke off an
 		// answer without a reason anyone can act on.
@@ -340,6 +367,12 @@ func (p *provider) apiError(status int, header http.Header, body []byte) *core.P
 		Status:   status,
 		Message:  info.message,
 		Body:     string(clip(body, bodyStart)),
+	}
+	if kind == core.ErrContextTooLong {
+		e.Tokens, e.Window = info.tokens, info.window
+		if e.Tokens == 0 && e.Window == 0 {
+			e.Tokens, e.Window = tooLongNumbers(info.message)
+		}
 	}
 	if header != nil {
 		e.RetryAfter = retryAfterHeader(header, p.now)
@@ -370,6 +403,43 @@ func (p *provider) apiError(status int, header http.Header, body []byte) *core.P
 		}
 	}
 	return e
+}
+
+// The numbers of a "too long" message, as the services write them:
+//
+//	This model's maximum context length is 32768 tokens. However, you requested 40000 tokens (35000 in the messages, 5000 in the completion).   vLLM
+//	... However, you requested 5000 output tokens and your prompt contains at least 30000 input tokens, for a total of ...                     vLLM, later
+//	This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.                                     OpenAI
+//	prompt is too long: 210000 tokens > 200000 maximum                                                                                          Anthropic
+var (
+	maxContextRe = regexp.MustCompile(`maximum context length is (\d+) tokens`)
+	inMessagesRe = regexp.MustCompile(`\((\d+) in the messages|prompt contains at least (\d+) input tokens`)
+	requestedRe  = regexp.MustCompile(`(?:requested|resulted in) (\d+) tokens`)
+	tooLongRe    = regexp.MustCompile(`prompt is too long: (\d+) tokens > (\d+) maximum`)
+)
+
+// tooLongNumbers reads how many tokens a refused request held, as the
+// service counted them, and how many its model holds, out of its
+// message; zero for what it does not say.
+func tooLongNumbers(msg string) (tokens, window int) {
+	num := func(re *regexp.Regexp, i int) int {
+		if m := re.FindStringSubmatch(msg); m != nil {
+			for _, g := range m[i:] {
+				if n, err := strconv.Atoi(g); err == nil {
+					return n
+				}
+			}
+		}
+		return 0
+	}
+	if t := num(tooLongRe, 1); t > 0 {
+		return t, num(tooLongRe, 2)
+	}
+	window = num(maxContextRe, 1)
+	if tokens = num(inMessagesRe, 1); tokens == 0 {
+		tokens = num(requestedRe, 1)
+	}
+	return tokens, window
 }
 
 // retryAfterHeader reads how long a response asks the caller to wait: the
@@ -418,6 +488,11 @@ func scale(f float64, unit time.Duration) time.Duration {
 // only say it in words: "Please try again in 1.5s" (OpenAI, Groq),
 // "retry after 26 seconds" (Azure).
 func retryHint(msg string) time.Duration {
+	// (A hint is a few words near the start; an error a server streams
+	// may be megabytes.)
+	if len(msg) > maxHintRead {
+		msg = msg[:maxHintRead]
+	}
 	low := strings.ToLower(msg)
 	for _, lead := range []string{"try again in ", "retry after ", "retry in "} {
 		i := strings.Index(low, lead)
@@ -431,19 +506,47 @@ func retryHint(msg string) time.Duration {
 	return 0
 }
 
+// maxHintRead is how much of an error message retryHint reads.
+const maxHintRead = 4 << 10
+
 // leadingDuration reads a time span from the start of s, which is in lower
-// case: "20ms", "1.5s", "6m0s", "26 seconds".
+// case: "20ms", "1.5s", "6m0s", "26 seconds". Go writes spans as "6m0s",
+// so the parts that follow one another at once are added up, a few of
+// them. (It called itself for each part, and a message of a million
+// "1s" ran the stack out, which no recover catches: the model client
+// review of 2026-11-19.)
 func leadingDuration(s string) (time.Duration, bool) {
+	var total time.Duration
+	read := false
+	for range 4 {
+		d, rest, ok := spanPart(s)
+		if !ok {
+			break
+		}
+		read = true
+		if total > math.MaxInt64-d {
+			total = math.MaxInt64
+		} else {
+			total += d
+		}
+		s = rest
+	}
+	return total, read
+}
+
+// spanPart reads one number and its unit from the start of s, and returns
+// what follows them.
+func spanPart(s string) (time.Duration, string, bool) {
 	n := 0
 	for n < len(s) && (s[n] >= '0' && s[n] <= '9' || s[n] == '.') {
 		n++
 	}
 	if n == 0 {
-		return 0, false
+		return 0, s, false
 	}
 	f, err := strconv.ParseFloat(s[:n], 64)
 	if err != nil {
-		return 0, false
+		return 0, s, false
 	}
 	rest := strings.TrimLeft(s[n:], " ")
 	u := 0
@@ -461,12 +564,7 @@ func leadingDuration(s string) (time.Duration, bool) {
 	case "h", "hr", "hrs", "hour", "hours":
 		unit = time.Hour
 	default:
-		return 0, false
+		return 0, s, false
 	}
-	d := scale(f, unit)
-	// Go writes spans as "6m0s": keep reading while more follows at once.
-	if more, ok := leadingDuration(rest[u:]); ok && d < math.MaxInt64-more {
-		d += more
-	}
-	return d, true
+	return scale(f, unit), rest[u:], true
 }

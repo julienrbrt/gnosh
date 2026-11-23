@@ -3,7 +3,10 @@ package config
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -96,7 +99,7 @@ next:
 const box = `"providers": {"qwen": {"type": "llamacpp", "baseUrl": "http://127.0.0.1:8080"}}, "models": {"qwen/qwen3.8-27b": {"contextWindow": 262144}}, "model": "qwen/qwen3.8-27b"`
 
 func TestDoctorAllWell(t *testing.T) {
-	m := &fakeMachine{}
+	m := &fakeMachine{programs: []string{"pdfinfo", "pdftotext"}}
 	findings := doctor(t, withConfig("{"+box+"}"), m)
 	if !CanRun(findings) {
 		t.Errorf("a good setup can run a turn: %v", findings)
@@ -111,6 +114,7 @@ func TestDoctorAllWell(t *testing.T) {
 	wantFinding(t, findings, "models", Fine, "model: qwen/qwen3.8-27b", "thinking on")
 	wantFinding(t, findings, "models", Fine, "small model: not chosen", "the session's model does the side jobs")
 	wantFinding(t, findings, "tools", Fine, "needs no outside program")
+	wantFinding(t, findings, "tools", Fine, "PDFs are read as text")
 	wantFinding(t, findings, "trust", Fine, "no settings of its own")
 	wantFinding(t, findings, "environment", Fine)
 }
@@ -240,7 +244,9 @@ const hookFile = `{` + box + `,
       {"matcher": "Edit", "hooks": [{"type": "command", "command": "gofmt -l ."}]},
       {"hooks": [{"type": "command", "command": "./hooks/missing.sh"}]}],
     "PermissionRequest": [{"hooks": [{"type": "command", "command": "./hooks/answer.sh"}]}],
-    "SessionStart": [{"hooks": [{"type": "command", "command": "[ -f .env ] && echo ready"}]}]
+    "SessionStart": [{"hooks": [{"type": "command", "command": "[ -f .env ] && echo ready"}]}],
+    "PreModelSwitch": [{"hooks": [{"type": "command", "command": "./hooks/models.sh"}]}],
+    "PostToolBatch": [{"hooks": [{"type": "command", "command": "./hooks/batch.sh"}]}]
   }
 }`
 
@@ -259,11 +265,14 @@ func TestDoctorHooks(t *testing.T) {
 	wantFinding(t, findings, "hooks", Note, "PostToolUse:", "the file /work/proj/hooks/missing.sh is not there")
 	wantFinding(t, findings, "hooks", Note, "PermissionRequest", "every question it matches is put to you instead")
 	wantFinding(t, findings, "hooks", Fine, "SessionStart", "echo ready")
+	wantFinding(t, findings, "hooks", Fail, "PreModelSwitch", "every switch to a model it matches")
+	wantFinding(t, findings, "hooks", Fail, "PostToolBatch", "every turn at its first round of tool calls")
 	wantFinding(t, findings, "hooks", Fine, "Stop:", "present.sh")
 
 	// With everything in place there is nothing to fail on.
 	m = &fakeMachine{programs: []string{"python3", "gofmt", "nosuchprogram"}, files: []string{
-		"/work/proj/hooks/present.sh", "/work/proj/hooks/tests.sh", "/work/proj/hooks/guard.py", "/work/proj/hooks/missing.sh", "/work/proj/hooks/answer.sh"}}
+		"/work/proj/hooks/present.sh", "/work/proj/hooks/tests.sh", "/work/proj/hooks/guard.py", "/work/proj/hooks/missing.sh", "/work/proj/hooks/answer.sh",
+		"/work/proj/hooks/models.sh", "/work/proj/hooks/batch.sh"}}
 	if findings = doctor(t, withConfig(hookFile), m); !CanRun(findings) {
 		t.Errorf("with every program and script there, a turn can run: %v", findings)
 	}
@@ -275,7 +284,7 @@ func TestDoctorHooks(t *testing.T) {
 	if !CanRun(findings) {
 		t.Errorf("in safe mode a hook that cannot run holds nothing up: %v", findings)
 	}
-	wantFinding(t, findings, "hooks", Note, "8 hooks are configured and none runs", "safe mode")
+	wantFinding(t, findings, "hooks", Note, "10 hooks are configured and none runs", "safe mode")
 	wantFinding(t, findings, "config", Note, "safe mode is on", "--safe-mode", "hooks, instruction files, skills on disk and custom commands are off")
 }
 
@@ -284,7 +293,7 @@ func TestDoctorTheRest(t *testing.T) {
 	in := inputs(untrustedProject())
 	in.Trusted = false
 	findings := doctor(t, in, &fakeMachine{})
-	wantFinding(t, findings, "trust", Note, "not trusted", "22 of its settings are held", `"provider evil (openai-compatible) at https://203.0.113.5/v1"`, "and 17 more", "gnosh trust", "--trust-folder")
+	wantFinding(t, findings, "trust", Note, "not trusted", "23 of its settings are held", `"provider evil (openai-compatible) at https://203.0.113.5/v1" (`+projJSON+`:`, "and 18 more", "gnosh trust", "--trust-folder")
 	wantFinding(t, findings, "config", Note, "held: "+projJSON, "the project's settings", "only what restricts the agent")
 	wantFinding(t, findings, "config", Note, "held: "+localJSON)
 	in.Trusted = true
@@ -422,4 +431,58 @@ func showFindings(findings []Finding) string {
 		all = append(all, f.String())
 	}
 	return strings.Join(all, "\n")
+}
+
+// Without poppler a PDF is not read, and doctor says what to install.
+func TestDoctorSaysWhetherPDFsAreRead(t *testing.T) {
+	findings := doctor(t, withConfig("{"+box+"}"), &fakeMachine{programs: []string{"pdftotext"}})
+	wantFinding(t, findings, "tools", Note, "PDFs are not read as text", "poppler-utils")
+}
+
+// gnosh doctor says whether each language server's program is there, and,
+// in a folder that is not trusted, that the servers wait for it.
+func TestDoctorSaysWhetherLanguageServersCanStart(t *testing.T) {
+	cfg := `{` + box + `, "lspServers": {"gopls": {"command": "gopls", "extensionToLanguage": {".go": "go"}}, "pyright": {"command": "pyright-langserver", "extensionToLanguage": {".py": "python"}}}}`
+	findings := doctor(t, withConfig(cfg), &fakeMachine{programs: []string{"gopls"}})
+	wantFinding(t, findings, "tools", Fine, "the language server gopls (for .go) is installed")
+	wantFinding(t, findings, "tools", Note, "the language server pyright (for .py) cannot start: pyright-langserver is not installed")
+	in := withConfig(cfg)
+	in.Trusted = false
+	findings = doctor(t, in, &fakeMachine{programs: []string{"gopls"}})
+	wantFinding(t, findings, "tools", Note, "the language server gopls (for .go) is installed, and waits for this folder to be trusted")
+
+	// A server whose env names a PATH is looked for there, as it is
+	// started, and not on gnosh's own.
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "pyright-langserver"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg = `{` + box + `, "lspServers": {"gopls": {"command": "gopls", "env": {"PATH": "/nowhere"}, "extensionToLanguage": {".go": "go"}}, "pyright": {"command": "pyright-langserver", "env": {"PATH": ` + strconv.Quote(bin) + `}, "extensionToLanguage": {".py": "python"}}}}`
+	findings = doctor(t, withConfig(cfg), &fakeMachine{programs: []string{"gopls"}})
+	wantFinding(t, findings, "tools", Note, "the language server gopls (for .go) cannot start: gopls is not installed")
+	wantFinding(t, findings, "tools", Fine, "the language server pyright (for .py) is installed")
+	// A path from / is looked at too, where the PATH is the server's own.
+	cfg = `{` + box + `, "lspServers": {"pyright": {"command": "/nowhere/pyright-langserver", "env": {"PATH": ` + strconv.Quote(bin) + `}, "extensionToLanguage": {".py": "python"}}}}`
+	findings = doctor(t, withConfig(cfg), &fakeMachine{programs: []string{"gopls"}})
+	wantFinding(t, findings, "tools", Note, "the language server pyright (for .py) cannot start")
+}
+
+// gnosh doctor says how the sandbox stands when the settings turn it on:
+// fine when it runs, a note when it cannot, a failure with
+// failIfUnavailable.
+func TestDoctorSaysHowTheSandboxStands(t *testing.T) {
+	check := func(text string, ok bool) []Finding {
+		t.Helper()
+		cfg, problems, _ := Load(withConfig(`{` + box + `, "sandbox": ` + text + `}`))
+		pr := (&fakeMachine{}).probes()
+		pr.Sandbox = func() (bool, string, string, string) {
+			return ok, "bubblewrap is not installed", "/usr/bin/bwrap", "this bubblewrap cannot keep sandboxed commands from making user namespaces of their own"
+		}
+		return Doctor(context.Background(), cfg, problems, pr)
+	}
+	wantFinding(t, check(`{"enabled": true, "autoAllowBashIfSandboxed": true}`, true), "tools", Fine, "the sandbox is on: the shell's commands run in it (/usr/bin/bwrap)", "they run without asking")
+	wantFinding(t, check(`{"enabled": true}`, true), "tools", Note, "the sandbox here: this bubblewrap cannot keep sandboxed commands from making user namespaces")
+	wantFinding(t, check(`{"enabled": true, "autoAllowBashIfSandboxed": true, "filesystem": {"disabled": true}}`, true), "tools", Fine, "each asks as it would without it, autoAllowBashIfSandboxed or not")
+	wantFinding(t, check(`{"enabled": true}`, false), "tools", Note, "the sandbox is on and cannot run here: bubblewrap is not installed")
+	wantFinding(t, check(`{"enabled": true, "failIfUnavailable": true}`, false), "tools", Fail, "with failIfUnavailable, and cannot run here")
 }

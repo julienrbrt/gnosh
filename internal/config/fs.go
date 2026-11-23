@@ -36,6 +36,24 @@ func (OS) ReadFile(name string) ([]byte, error) { return os.ReadFile(name) }
 // Stat describes a file, following links.
 func (OS) Stat(name string) (fs.FileInfo, error) { return os.Stat(name) }
 
+// Lstat describes a file without following a link at its end.
+func (OS) Lstat(name string) (fs.FileInfo, error) { return os.Lstat(name) }
+
+// lstater is an FS that can tell a link from what it leads to.
+type lstater interface {
+	Lstat(name string) (fs.FileInfo, error)
+}
+
+// linkedFile reports whether name is a link, on an FS that can tell.
+func linkedFile(fsys FS, name string) bool {
+	lf, ok := fsys.(lstater)
+	if !ok {
+		return false
+	}
+	info, err := lf.Lstat(name)
+	return err == nil && info.Mode()&fs.ModeSymlink != 0
+}
+
 // Owner returns the id of the user who owns a file.
 func (OS) Owner(name string) (int, bool) {
 	info, err := os.Stat(name)

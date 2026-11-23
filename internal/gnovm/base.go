@@ -64,11 +64,28 @@ func nativeResolver(pkgPath string, name gno.Name) func(*gno.Machine) {
 	case pkgPath == "chain" && name == "emit":
 		return func(*gno.Machine) {}
 	case pkgPath == "fmt":
-		return fmtNative(name)
+		return polled(fmtNative(name))
 	case pkgPath == memLibPath:
-		return memNative(name)
+		return polled(memNative(name))
 	}
 	return stdlibs.NativeResolver(pkgPath, name)
+}
+
+// polled is a native that looks first at the call's wall clock, and for a
+// stop: a native costs a flat amount of gas whatever it does, and the
+// meter looks only every pollEvery gas, so a loop of mem.Find calls, each
+// reading every row, ran for minutes between looks while it held mem's
+// lock, and Esc was not seen (the gno review of 2026-11-19).
+func polled(f func(*gno.Machine)) func(*gno.Machine) {
+	if f == nil {
+		return nil
+	}
+	return func(m *gno.Machine) {
+		if g, ok := m.GasMeter.(*callMeter); ok {
+			g.poll()
+		}
+		f(m)
+	}
 }
 
 // getPackage is the base store's package getter: it runs a library package

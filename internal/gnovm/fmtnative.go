@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	gno "github.com/gnolang/gno/gnovm/pkg/gnolang"
 	storetypes "github.com/gnolang/gno/tm2/pkg/store/types"
@@ -36,6 +37,12 @@ const (
 	maxFmtOutput = 1 << 20
 	// maxFmtDepth is how deep nested values are followed.
 	maxFmtDepth = 10
+	// maxFmtRaw caps the bytes of the strings and byte slices one call
+	// takes in as operands: Go's fmt builds all of its text before the
+	// output is cut to maxFmtOutput, and operands that share one string
+	// cost the VM its bytes once (the gno review of 2026-11-19: four
+	// thousand operands holding one 4 MB string built 16 GB).
+	maxFmtRaw = 2 * maxFmtOutput
 )
 
 // fmtGas is what a native fmt call costs, before fmtElemGas: the GnoVM
@@ -118,9 +125,26 @@ func fmtOperands(m *gno.Machine, args *gno.TypedValue) ([]gno.TypedValue, []any,
 	return tvs, out, budget
 }
 
-// fmtBudget is what is left of a call's output, and the composite elements
-// it has formatted.
-type fmtBudget struct{ left, elems int }
+// fmtBudget is what is left of a call's output, the composite elements it
+// has formatted, and the bytes of strings and byte slices taken in (raw,
+// up to maxFmtRaw).
+type fmtBudget struct{ left, elems, raw int }
+
+// take is as much of a string or of bytes, n long, as the call still takes
+// in, and says whether it was cut.
+func (b *fmtBudget) take(n int) (keep int, cut bool) {
+	keep = min(n, max(maxFmtRaw-b.raw, 0))
+	b.raw += keep
+	return keep, keep < n
+}
+
+// cutText is s cut to at most n bytes, at a character's start.
+func cutText(s string, n int) string {
+	for n > 0 && n < len(s) && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
 
 // listOf returns the elements of a slice or array value.
 func listOf(store gno.Store, tv gno.TypedValue) []gno.TypedValue {
@@ -141,6 +165,41 @@ func listOf(store gno.Store, tv gno.TypedValue) []gno.TypedValue {
 		return v.List
 	}
 	return nil
+}
+
+// bytesOf copies the bytes of a byte slice or array value, as many as the
+// call still takes in.
+func bytesOf(store gno.Store, tv gno.TypedValue, budget *fmtBudget) []byte {
+	var data []byte
+	var list []gno.TypedValue
+	switch v := tv.V.(type) {
+	case *gno.SliceValue:
+		base := v.GetBase(store)
+		if base == nil {
+			return []byte{}
+		}
+		if base.Data != nil {
+			data = base.Data[v.Offset : v.Offset+v.Length]
+		} else {
+			list = base.List[v.Offset : v.Offset+v.Length]
+		}
+	case *gno.ArrayValue:
+		data, list = v.Data, v.List
+	}
+	n := len(data)
+	if data == nil {
+		n = len(list)
+	}
+	keep, _ := budget.take(n)
+	out := make([]byte, keep)
+	if data != nil {
+		copy(out, data[:keep])
+		return out
+	}
+	for i := range out {
+		out[i] = list[i].GetUint8()
+	}
+	return out
 }
 
 func byteElems(data []byte) []gno.TypedValue {
@@ -166,7 +225,11 @@ func goOperand(store gno.Store, tv gno.TypedValue, budget *fmtBudget) any {
 	case gno.BoolKind:
 		return tv.GetBool()
 	case gno.StringKind:
-		return tv.GetString()
+		s := tv.GetString()
+		if keep, cut := budget.take(len(s)); cut {
+			return cutText(s, keep) + "…"
+		}
+		return s
 	case gno.IntKind:
 		return int(tv.GetInt())
 	case gno.Int8Kind:
@@ -193,13 +256,10 @@ func goOperand(store gno.Store, tv gno.TypedValue, budget *fmtBudget) any {
 		return math.Float64frombits(tv.GetFloat64())
 	case gno.SliceKind, gno.ArrayKind:
 		// A byte slice formats as Go's does: %s and %q as text, %x in hex.
+		// Its bytes are read as they are held, and only as many as the
+		// call takes in: a value for each byte took forty times its size.
 		if et := elemType(tv.T); et != nil && et.Kind() == gno.Uint8Kind {
-			elems := listOf(store, tv)
-			b := make([]byte, len(elems))
-			for i := range elems {
-				b[i] = elems[i].GetUint8()
-			}
-			return b
+			return bytesOf(store, tv, budget)
 		}
 	}
 	return &gnoValue{store: store, tv: tv, budget: budget}
@@ -306,6 +366,9 @@ func (g *gnoValue) write(b *strings.Builder, st fmt.State, verb rune) {
 			b.WriteString("[")
 		}
 		for i, e := range listOf(g.store, tv) {
+			if b.Len() > g.budget.left {
+				break
+			}
 			if i > 0 {
 				b.WriteString(sep(sharp))
 			}
@@ -463,6 +526,16 @@ func number(tv gno.TypedValue) float64 {
 func prepareFormat(format string, tvs []gno.TypedValue, args []any) (string, error) {
 	f := []byte(format)
 	arg := 0
+	// The widths and precisions of all the directives together are capped
+	// too: each pads its operand, and %[1]65536d written a hundred
+	// thousand times built 6.5 GB (the gno review of 2026-11-19).
+	total := 0
+	add := func(n int) error {
+		if total += max(n, -n); total > maxFmtOutput {
+			return fmt.Errorf("fmt: the widths and precisions of the format add up to over %d", maxFmtOutput)
+		}
+		return nil
+	}
 directives:
 	for i := 0; i < len(f); i++ {
 		if f[i] != '%' {
@@ -482,6 +555,10 @@ directives:
 				if arg >= 0 && arg < len(args) {
 					if n, ok := args[arg].(int); ok && (n > maxFmtWidth || n < -maxFmtWidth) {
 						return "", fmt.Errorf("fmt: a width or precision of %d is over %d", n, maxFmtWidth)
+					} else if ok {
+						if err := add(n); err != nil {
+							return "", err
+						}
 					}
 				}
 				arg++
@@ -491,6 +568,9 @@ directives:
 					if n = n*10 + int(f[i]-'0'); n > maxFmtWidth {
 						return "", fmt.Errorf("fmt: a width or precision over %d", maxFmtWidth)
 					}
+				}
+				if err := add(n); err != nil {
+					return "", err
 				}
 				continue
 			case c == '%':

@@ -116,6 +116,9 @@ type TurnResult struct {
 	// Driver is the driver that halted the turn or at whose checkpoint the
 	// model stopped.
 	Driver string
+	// Planned is, for EndHalted, that the tool that ended the turn meant
+	// to (MetaPlanned): the turn is done, nothing went wrong.
+	Planned bool
 	// Err is the failure of an EndFailed turn, in plain words.
 	Err error
 	// ErrorKind sorts that failure: "rate_limit", "overloaded",
@@ -163,6 +166,13 @@ type Prompt struct {
 	// Later holds a prompt sent while a turn runs until that turn has
 	// ended, instead of handing it to the model between two rounds.
 	Later bool
+	// Own marks a prompt gnosh sends for itself (/loop's next prompt, the
+	// "go on" after the session moved): stopping a turn drops it, or the
+	// work would start again. A hidden prompt the person caused (a
+	// !command's output, a skill, /review) is theirs and stays in line;
+	// stopping dropped every hidden prompt, and a !command's output never
+	// reached the model (the agent loop review of 2026-11-19).
+	Own bool
 	// Meta travels with the prompt into its events.
 	Meta map[string]any
 }
@@ -206,6 +216,9 @@ type Note struct {
 	// that the model reacts to it at once. Without it a note waits for
 	// the next request.
 	Wake bool
+	// recorded marks a note Record put in while a turn ran: when no
+	// request takes it, it is written to the log as the turn ends.
+	recorded bool
 }
 
 // QueuedPrompt is a prompt that waits for its turn.
@@ -254,6 +267,10 @@ type Answer struct {
 	Text string
 	// Data is anything else the asker and the front end have agreed on.
 	Data any
+	// By names who gave the answer when it was not the person at the
+	// front end: "the channel hook", for a channel that relays permission
+	// questions. "" is the person.
+	By string
 }
 
 // BusyEvent says a prompt has made the session busy.
@@ -423,6 +440,10 @@ type RetryEvent struct {
 	// Discarded says a reply had begun to arrive and is thrown away: the
 	// next try writes it afresh.
 	Discarded bool
+	// FellBack names the fallback model the turn goes on with, at once and
+	// for the rest of the turn (Options.Fallbacks), or is empty when the
+	// same model is asked again after Wait.
+	FellBack string
 }
 
 // ToolStartEvent says a tool call is about to be put to the gate and run.
@@ -500,6 +521,10 @@ type NoticeEvent struct {
 	// the line.
 	Source string
 	Text   string
+	// TurnEnd marks the notice that says how a turn ended, in the words
+	// of the TurnEndEvent that comes right after it: a front end that
+	// shows that event itself leaves the notice out.
+	TurnEnd bool
 }
 
 // NoteEvent says a note of the harness's own was put in front of the
@@ -550,6 +575,11 @@ type SummaryEvent struct {
 	Phase string
 	// Trigger is "auto" or "manual".
 	Trigger string
+	// Part says which part of the conversation the summary is of, when it
+	// is not all of it: "before" a prompt of the person's, which the
+	// summary takes the place of, or "after" one, whose summary goes to
+	// the person's command and is not kept (SummaryPart).
+	Part string
 	// PreTokens and PostTokens are about how long the conversation was
 	// before and after.
 	PreTokens  int
@@ -691,4 +721,14 @@ func (c ContextStatus) Room() int {
 		return 0
 	}
 	return c.Point - c.Used
+}
+
+// ResultMost is the most tokens one tool result may take before the loop
+// cuts it, a quarter of the window (fitResultToWindow), or 0 while the
+// window is not known, when nothing is cut.
+func (c ContextStatus) ResultMost() int {
+	if !c.Known || c.Window <= 0 {
+		return 0
+	}
+	return c.Window / resultShare
 }

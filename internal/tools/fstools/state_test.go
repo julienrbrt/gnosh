@@ -192,7 +192,7 @@ func TestMarkRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.setTime(f.file("changes.txt", "after, and longer\n"), 5)
-	f.fails(f.edit, in{"file_path": q, "old_string": "after", "new_string": "x"}, "has changed on disk")
+	f.fails(f.edit, in{"file_path": q, "old_string": "before", "new_string": "x"}, "has changed on disk")
 
 	// Through a link it is the target that is marked.
 	link := f.symlink("shown-elsewhere.txt", "link")
@@ -246,13 +246,15 @@ func TestRecordUnchanged(t *testing.T) {
 }
 
 func TestSessionLock(t *testing.T) {
-	s := &session{files: map[string]*fileRecord{}, locks: map[string]chan struct{}{}}
-	unlock, err := s.lock(context.Background(), "/a")
+	// (The table of locks is the process's: the paths are this test's own.)
+	a, b := t.TempDir()+"/a", t.TempDir()+"/b"
+	s := &session{files: map[string]*fileRecord{}}
+	unlock, err := s.lock(context.Background(), a)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Another file is free.
-	other, err := s.lock(context.Background(), "/b")
+	other, err := s.lock(context.Background(), b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,13 +262,13 @@ func TestSessionLock(t *testing.T) {
 	// The same file waits, and gives up when its context does.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, err := s.lock(ctx, "/a"); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := s.lock(ctx, a); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("a second lock on a held file: err = %v", err)
 	}
 	// Once released, it can be taken again.
 	got := make(chan struct{})
 	go func() {
-		u, err := s.lock(context.Background(), "/a")
+		u, err := s.lock(context.Background(), a)
 		if err == nil {
 			u()
 		}
@@ -283,6 +285,42 @@ func TestSessionLock(t *testing.T) {
 // A session that is made to forget a file must read it again before it
 // may change it: that is what keeps a model from editing a file from a
 // copy it can no longer see.
+// Recent lists the files the session read or wrote last, the most recent
+// first: a read, a write and an edit each make a file the most recent.
+func TestRecent(t *testing.T) {
+	f := newFixture(t, Options{})
+	a := f.file("a.txt", "one\n")
+	b := f.file("b.txt", "two\n")
+	c := f.file("c.txt", "three\n")
+	for _, p := range []string{a, b, c} {
+		f.ok(f.read, in{"file_path": p})
+	}
+	d := f.path("d.txt")
+	f.ok(f.write, in{"file_path": d, "content": "four\n"})
+	f.ok(f.edit, in{"file_path": a, "old_string": "one", "new_string": "1"})
+	f.ok(f.read, in{"file_path": b})
+	paths := func(st []FileState) []string {
+		var out []string
+		for _, s := range st {
+			out = append(out, s.Path)
+		}
+		return out
+	}
+	if got, want := paths(Recent(f.env, 3)), []string{b, a, d}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Recent(3) = %v, want %v", got, want)
+	}
+	if got, want := paths(Recent(f.env, 9)), []string{b, a, d, c}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Recent(9) = %v, want %v", got, want)
+	}
+	if st := Recent(f.env, 9); !st[2].Written || st[3].Written {
+		t.Errorf("Recent says the wrong files were written: %+v", st)
+	}
+	ForgetAll(f.env)
+	if got := Recent(f.env, 3); len(got) != 0 {
+		t.Errorf("Recent after ForgetAll = %v", paths(got))
+	}
+}
+
 func TestForget(t *testing.T) {
 	f := newFixture(t, Options{})
 	a := f.file("a.txt", "one\ntwo\n")

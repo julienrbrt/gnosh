@@ -53,6 +53,8 @@ func TestCheckRefusesWhatIsNotTheOpenWeb(t *testing.T) {
 		"http://localhost:8080/x", "https://LOCALHOST/", "https://api.localhost/", "https://intranet/page",
 		"https://127.0.0.1/", "https://10.0.0.5/", "https://192.168.1.91:8080/", "https://[::1]/", "https://169.254.169.254/latest",
 		"https://100.64.1.2/", "ftp://example.org/x", "file:///etc/passwd", "https://user:pw@example.org/", "not a url",
+		"https://example.org/" + strings.Repeat("a", MaxURL),
+		"https://*.com/x", "https://pypi*.org/simple", // a wildcard is no host
 	} {
 		if _, err := Check(raw, false); !errors.Is(err, ErrRefused) {
 			t.Errorf("%q: got %v, want a refusal", raw, err)
@@ -91,6 +93,31 @@ func TestFetch(t *testing.T) {
 		w.Header().Set("Content-Type", "image/png")
 		w.Write([]byte{0x89, 'P', 'N', 'G', 0, 0, 0xff, 0xfe})
 	})
+	// A PDF, all of it ASCII, and a text, each sent as octet-stream; a PDF
+	// sent with no type at all; bytes that are not UTF-8, of a type that
+	// says nothing.
+	mux.HandleFunc("/octet-pdf", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write([]byte("%PDF-1.7\n1 0 obj << /Type /Catalog >> endobj\n%%EOF\n"))
+	})
+	mux.HandleFunc("/octet-text", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write([]byte("just words\n"))
+	})
+	mux.HandleFunc("/untyped-pdf", func(w http.ResponseWriter, r *http.Request) {
+		w.Header()["Content-Type"] = nil
+		w.Write([]byte("%PDF-1.4\n%%EOF\n"))
+	})
+	// A shell installer with its archive after the script: it begins as
+	// text, and is not.
+	mux.HandleFunc("/installer", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write([]byte("#!/bin/sh\nexec tail -n +3 \"$0\" | tar xz\n\x1f\x8b\x08\x00\xff\xfe\x00\x00"))
+	})
+	mux.HandleFunc("/latin", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-thing")
+		w.Write([]byte{'a', 0xe9, 'b'})
+	})
 	srv := httptest.NewTLSServer(mux)
 	defer srv.Close()
 	tlsConf := srv.Client().Transport.(*http.Transport).TLSClientConfig
@@ -121,9 +148,32 @@ func TestFetch(t *testing.T) {
 		t.Errorf("a page over the bound: bytes %d, cut %v, %v", p.Bytes, p.Cut, err)
 	}
 
-	// What is not text is refused.
-	if _, err := Fetch(ctx, srv.URL+"/binary", o); err == nil || !strings.Contains(err.Error(), "image/png") {
-		t.Errorf("a picture: %v", err)
+	// What is not text comes back as its bytes, for the tool to keep, with
+	// what it is: read from its first bytes when the server said only
+	// octet-stream, or nothing.
+	p, err = Fetch(ctx, srv.URL+"/binary", o)
+	if err != nil || p.ContentType != "image/png" || len(p.Body) != 8 || p.Text != "" {
+		t.Errorf("a picture: %+v, %v", p, err)
+	}
+	p, err = Fetch(ctx, srv.URL+"/octet-pdf", o)
+	if err != nil || p.ContentType != "application/pdf" || !strings.HasPrefix(string(p.Body), "%PDF-1.7") || p.Text != "" {
+		t.Errorf("a PDF sent as octet-stream: %+v, %v", p, err)
+	}
+	p, err = Fetch(ctx, srv.URL+"/octet-text", o)
+	if err != nil || p.ContentType != "text/plain" || p.Text != "just words\n" || p.Body != nil {
+		t.Errorf("a text sent as octet-stream: %+v, %v", p, err)
+	}
+	p, err = Fetch(ctx, srv.URL+"/untyped-pdf", o)
+	if err != nil || p.ContentType != "application/pdf" || p.Body == nil {
+		t.Errorf("a PDF sent with no type: %+v, %v", p, err)
+	}
+	p, err = Fetch(ctx, srv.URL+"/installer", o)
+	if err != nil || p.Body == nil || p.Text != "" || p.ContentType != "application/octet-stream" {
+		t.Errorf("an installer that begins as text: %+v, %v", p, err)
+	}
+	p, err = Fetch(ctx, srv.URL+"/latin", o)
+	if err != nil || p.ContentType != "application/x-thing" || string(p.Body) != "a\xe9b" || p.Text != "" {
+		t.Errorf("bytes that are not UTF-8: %+v, %v", p, err)
 	}
 
 	// Without AllowPrivate the test server, on this machine, is refused

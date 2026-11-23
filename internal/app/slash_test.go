@@ -189,10 +189,23 @@ func TestClaudeCodeCommands(t *testing.T) {
 	if strings.Contains(exported, "\n\n") {
 		t.Errorf("the export holds an empty line:\n%s", exported)
 	}
+	if info, err := os.Stat(w.Path("talk.txt")); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("the export is %v (%v), want the person's alone (0600)", info.Mode().Perm(), err)
+	}
 	s.typeLine("/export talk.txt")
 	s.see("is there already, and /export writes over nothing")
 	s.typeLine("/export")
 	s.see("The conversation is in " + w.Dir + "/")
+	// A folder named gets the file of the usual name in it, not a file
+	// beside it (the hosts review of 2026-11-19).
+	if err := os.Mkdir(w.Path("exports"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.typeLine("/export exports")
+	s.see("The conversation is in " + w.Dir + "/exports/")
+	if w.Exists("exports.txt") {
+		t.Error("/export of a folder wrote a file beside it")
+	}
 
 	// /init asks the model to improve the GNOSH.md there is.
 	s.typeLine("/init")
@@ -265,14 +278,15 @@ func TestSlashCommandsAsARunsPrompt(t *testing.T) {
 	}
 	r = run(t, w, "-c", "-p", "/compact").wantCode(t, 0)
 	has(t, "/compact", r.out, "The conversation was summarized")
+	// A run keeps no choice for later sessions, as Claude Code's -p keeps
+	// none, and max holds for the session alone (the settings-commands
+	// review of 2026-11-20).
 	r = run(t, w, "-p", "/no_think").wantCode(t, 0)
-	has(t, "/no_think", r.out, "Thinking is off for local/test-model")
+	has(t, "/no_think", r.out, "Thinking is off for local/test-model", "in this run only")
 	r = run(t, w, "-p", "/effort").wantCode(t, 0)
-	has(t, "/effort", r.out, "Thinking for local/test-model: off.", "Its levels are off, on")
+	has(t, "/effort: the run kept nothing", r.out, "Thinking for local/test-model: on.", "Its levels are off, on")
 	r = run(t, w, "-p", "/effort max").wantCode(t, 0)
-	has(t, "/effort max", r.out, "Thinking is on for local/test-model")
-	r = run(t, w, "-p", "/effort").wantCode(t, 0)
-	has(t, "/effort after max: the level was saved", r.out, "Thinking for local/test-model: on.")
+	has(t, "/effort max", r.out, "Thinking is on for local/test-model", "in this session only")
 	r = run(t, w, "-p", "/effort lots").wantCode(t, 1)
 	has(t, "/effort lots", r.err, `"lots" is not one of the thinking levels of local/test-model (off, on). Nothing changed`)
 	r = run(t, w, "-p", "/effort auto").wantCode(t, 0)
@@ -343,6 +357,32 @@ func TestCopyCommand(t *testing.T) {
 	s.typeLine("/export --clipboard")
 	s.see("]52;c;")
 	s.see("The conversation (")
+	s.typeLine("/exit")
+	s.exit()
+}
+
+// What goes on the clipboard has no control characters but tab and the
+// line breaks: pasted into a terminal next, an escape sequence in a reply
+// (ESC [201~ ends a bracketed paste) could have the rest taken as typed
+// (the TUI review of 2026-11-19).
+func TestCopyLeavesControlCharactersOut(t *testing.T) {
+	w := apptest.NewWorld(t, apptest.Reply{Text: "run this:\x1b[201~\rrm -rf ~\r\nok\tdone\x07"})
+	got := w.Path("clipboard.txt")
+	for _, name := range []string{"pbcopy", "wl-copy", "xclip", "xsel"} {
+		w.Script(w.Root+"/clipbin/"+name, `cat > "`+got+`"`)
+	}
+	w.PathFirst = append(w.PathFirst, w.Root+"/clipbin")
+	s := sitWith(t, w, func(o *Options) {
+		o.Environ = append(o.Environ, "DISPLAY=:0", "WAYLAND_DISPLAY=wayland-0")
+	})
+	s.see("Type a prompt and Enter.")
+	s.typeLine("hello")
+	s.see("-- done in ")
+	s.typeLine("/copy")
+	s.see("is on the clipboard.")
+	if b, err := os.ReadFile(got); err != nil || string(b) != "run this:[201~\nrm -rf ~\nok\tdone" {
+		t.Errorf("the clipboard tool was given %q (%v)", b, err)
+	}
 	s.typeLine("/exit")
 	s.exit()
 }

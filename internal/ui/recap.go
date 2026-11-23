@@ -6,9 +6,13 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/markdown"
 )
 
-// recapLines is how many lines of the model's last answer the recap of a
-// session opened again shows; Ctrl+O shows all of it.
-const recapLines = 30
+// recapLines and recapPromptLines are how many lines of the model's last
+// answer and of the last prompt the recap of a session opened again
+// shows; Ctrl+O shows all of them.
+const (
+	recapLines       = 30
+	recapPromptLines = 10
+)
 
 // recap shows where a session that was opened again left off, as Claude
 // Code shows a resumed session's conversation: the last prompt the person
@@ -45,16 +49,38 @@ func (s *session) recap() {
 	}
 	th := &s.th
 	s.begin(blkTurn)
-	s.put(wrap(s.m, th.Quiet.Render("Where this session left off (Ctrl+O shows all of it):"), s.cols, "", "")...)
+	head := "Where this session left off:"
+	if h := s.transcriptHint("", "shows all of it"); h != "" {
+		head = "Where this session left off (" + h + "):"
+	}
+	s.put(wrap(s.m, th.Quiet.Render(head), s.cols, "", "")...)
+	rest := "…"
+	if h := s.transcriptHint("", "shows the rest"); h != "" {
+		rest = "… (" + h + ")"
+	}
 	s.begin(blkPrompt)
 	mark := th.Prompt.Render(th.PromptMark)
 	indent := strings.Repeat(" ", s.m.Width(th.PromptMark))
-	for i, l := range safeLines(entries[last].Message.Text()) {
+	// What was typed, as the transcript view shows it: the first text,
+	// without what gnosh and the hooks added, and no more than a screenful.
+	typed := ""
+	if texts := blockTexts(entries[last].Message); len(texts) > 0 {
+		typed = texts[0]
+	}
+	plines := safeLines(typed)
+	cut := len(plines) > recapPromptLines
+	if cut {
+		plines = plines[:recapPromptLines]
+	}
+	for i, l := range plines {
 		first := indent
 		if i == 0 {
 			first = mark
 		}
 		s.put(wrap(s.m, th.PromptText.Render(l), s.cols, first, indent)...)
+	}
+	if cut {
+		s.put(wrap(s.m, th.Quiet.Render(rest), s.cols, indent, indent)...)
 	}
 	if answer == "" {
 		return
@@ -62,7 +88,7 @@ func (s *session) recap() {
 	md := markdown.New(markdown.Options{Width: s.cols, Profile: s.th.Profile, Theme: s.th.Markdown, Metrics: s.m})
 	lines := append(md.Write(answer), md.Close()...)
 	if len(lines) > recapLines {
-		lines = append(lines[:recapLines], th.Quiet.Render("… (Ctrl+O shows the rest)"))
+		lines = append(lines[:recapLines], th.Quiet.Render(rest))
 	}
 	s.begin(blkAnswer)
 	s.put(lines...)

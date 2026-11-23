@@ -31,6 +31,9 @@ type change struct {
 	after string
 	// same says that the file already holds exactly after.
 	same bool
+	// kept says what of the file's own form Write kept that the content
+	// given did not have (keepForm), or "".
+	kept string
 	// summary is one line saying what the change is.
 	summary string
 
@@ -43,6 +46,10 @@ type change struct {
 	lines      []int
 	edits      []lineEdit
 	rec        fileRecord
+	// stale says the file had changed on disk since the session last
+	// read it: the edit goes where old_string matches the file as it is
+	// now, as Claude Code lets it (edit.go).
+	stale bool
 }
 
 // action is the change as a permission check sees it.
@@ -152,20 +159,20 @@ func (o *Options) beforeChange(env *core.ToolEnv, c *change) *failure {
 }
 
 // commit makes a change: it writes the file and takes back whatever it
-// had made if the write fails. It returns the info of the written file and
-// whether it had to be written in place.
-func commit(sys *fileOps, c *change) (fs.FileInfo, bool, *failure) {
+// had made if the write fails. It returns the info of the written file and,
+// when it had to be written in place, why.
+func commit(sys *fileOps, c *change) (fs.FileInfo, string, *failure) {
 	var made []string
 	if c.old == nil {
 		var err error
 		if made, err = makeParents(filepath.Dir(c.loc.real)); err != nil {
-			return nil, false, failf("%s could not be written: %v. Nothing was written.", c.loc.abs, err)
+			return nil, "", failf("%s could not be written: %v. Nothing was written.", c.loc.abs, err)
 		}
 	}
 	info, inPlace, err := sys.replaceFile(c.loc.real, []byte(c.after), c.old)
 	if err != nil {
 		removeDirs(made)
-		return nil, false, failf("%s could not be written: %v.", c.loc.abs, err)
+		return nil, "", failf("%s could not be written: %v.", c.loc.abs, err)
 	}
 	return info, inPlace, nil
 }
@@ -302,9 +309,31 @@ func (t *writeTool) plan(call core.ToolCall, env *core.ToolEnv) (*change, *failu
 	if !utf8.Valid(before) && strings.Contains(content, replacement) {
 		return c, failf("%s is not valid UTF-8, and the new content holds U+FFFD, the mark %s shows in place of bytes it cannot decode. Writing it would make that damage permanent. Nothing was written. Leave those characters out, or change the file with a shell command that keeps its encoding.", loc.abs, o.ReadName)
 	}
-	c.same = c.before == content
+	c.after, c.kept = keepForm(c.before, content)
+	c.same = c.before == c.after
 	c.summary = fmt.Sprintf("Overwrite %s (%s, was %s)", loc.abs, lines, countOf(lineCount(c.before), "line", "lines"))
 	return c, nil
+}
+
+// byteOrderMark is the mark some files begin with.
+const byteOrderMark = "\uFEFF"
+
+// keepForm is the content a Write gives a file, with the file's own line
+// endings and byte order mark where the content given has neither: Read
+// shows the model neither, so a whole file written back came out with LF
+// on every line and no mark (the Edit/Write review of 2026-11-19). kept
+// says what was kept, or "".
+func keepForm(before, after string) (string, string) {
+	var kept []string
+	if strings.HasPrefix(before, byteOrderMark) && !strings.HasPrefix(after, byteOrderMark) {
+		after = byteOrderMark + after
+		kept = append(kept, "its byte order mark")
+	}
+	if n := strings.Count(before, "\n"); n > 0 && strings.Count(before, "\r\n") == n && !strings.Contains(after, "\r") && strings.Contains(after, "\n") {
+		after = strings.ReplaceAll(after, "\n", "\r\n")
+		kept = append(kept, "its CRLF line endings")
+	}
+	return after, strings.Join(kept, " and ")
 }
 
 // Describe says what a Write call would do, with the diff it would make.
@@ -319,6 +348,7 @@ func (t *writeTool) Describe(call core.ToolCall, env *core.ToolEnv) (core.Action
 	if f != nil {
 		return core.Action{Kind: core.ActionEdit, Paths: c.loc.paths(), Summary: c.summary}, f
 	}
+	t.sys.judge(call.ID, c.loc.real)
 	return c.action(), nil
 }
 
@@ -345,6 +375,9 @@ func (t *writeTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolE
 	}
 	if c.loc.real != where.real {
 		return refused(failf("%s leads somewhere else than it did a moment ago (%s, not %s). Nothing was written. Run the call again if that is what you mean.", c.loc.abs, c.loc.real, where.real))
+	}
+	if was, moved := t.sys.judgedElsewhere(call.ID, c.loc.real); moved {
+		return refused(failf("%s leads somewhere else than when the call was looked at (%s, not %s): a link or a folder on the way changed in between. Nothing was written. Run the call again if that is what you mean.", c.loc.abs, c.loc.real, was))
 	}
 	if err := ctx.Err(); err != nil {
 		return core.ToolResult{}, fmt.Errorf("%s of %s stopped before anything was written: %w", o.WriteName, c.loc.abs, context.Cause(ctx))
@@ -389,9 +422,14 @@ func (t *writeTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolE
 	default:
 		text = fmt.Sprintf("Wrote %s%s (%s), replacing its %s.", c.loc.abs, c.loc.viaLink(), size, byteSize(c.old.Size()))
 	}
-	if inPlace {
-		text += " The file was overwritten where it is, because its directory did not allow replacing it in one step."
+	if c.kept != "" {
+		text += " It keeps " + c.kept + ", which the content given did not have."
+	}
+	if inPlace != "" {
+		text += " The file was overwritten where it is, because " + inPlace + "."
 		meta["inPlace"] = true
+	} else if n := otherNames(c.old); n > 0 {
+		text += fmt.Sprintf(" It had %s by hard links, which still hold the old content.", countOf(n, "other name", "other names"))
 	}
 	res := core.TextResult(text)
 	res.Display = c.display()

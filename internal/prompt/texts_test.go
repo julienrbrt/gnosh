@@ -141,21 +141,25 @@ const (
 
 // budgets holds the texts that have a budget of their own.
 var budgets = map[string]int{
-	textCore:           1100,
-	textSecurity:       100,
-	textNoTools:        30,
-	textMemory:         budgetMemory,
-	textMemoryFull:     budgetMemoryFull,
-	textGno:            130,
-	textDeliver:        270,
-	textEnvironment:    220,
-	textMissingResult:  200,
-	textMemLine:        75,
-	textFrameLine:      110,
-	textSummary:        220,
-	textCloseReview:    760,
-	textGoalJudge:      490,
-	textCloseRequest:   180,
+	textCore:          1100,
+	textSecurity:      100,
+	textNoTools:       30,
+	textMemory:        budgetMemory,
+	textMemoryFull:    budgetMemoryFull,
+	textGno:           130,
+	textDeliver:       270,
+	textEnvironment:   240, // (two wordings of its first line, one printed)
+	textMissingResult: 200,
+	textMemLine:       75,
+	textFrameLine:     110,
+	textSummary:       220,
+	textSummaryPart:   220,
+	textSummaryFrom:   220,
+	// (Both grew by the line that an indented "the user:" is never the
+	// user's word: the side-request review of 2026-11-19.)
+	textCloseReview:    820,
+	textGoalJudge:      560,
+	textCloseRequest:   190, // with the counts of what a long todo leaves out
 	textGoalRequest:    80,
 	textNamer:          110,
 	textCoreAnyRole:    60,
@@ -163,6 +167,9 @@ var budgets = map[string]int{
 	textStyleConcise:   180,
 	textStyleExplain:   220,
 	textStyleLearning:  320,
+	// (Only in the system prompt of a sub-agent whose kind keeps a
+	// memory.)
+	textAgentMemory: 220,
 }
 
 func TestBudgets(t *testing.T) {

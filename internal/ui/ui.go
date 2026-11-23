@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,15 +64,16 @@ type Options struct {
 // terminal is dumb. The app then uses its plain front end, which reads
 // lines and works anywhere.
 func New(o Options) func(app.FrontendInfo) app.Frontend {
-	if o.Open == nil {
-		if !term.IsTerminal(o.In) || !term.IsTerminal(o.Out) {
-			return nil
-		}
-		if o.Getenv != nil && strings.EqualFold(o.Getenv("TERM"), "dumb") {
-			return nil
-		}
+	if !canDraw(o) {
+		return nil
 	}
 	return func(info app.FrontendInfo) app.Frontend { return newUI(o, info) }
+}
+
+// canDraw reports whether this process has a terminal an interface could
+// draw on (see New).
+func canDraw(o Options) bool {
+	return o.Open != nil || term.IsTerminal(o.In) && term.IsTerminal(o.Out) && (o.Getenv == nil || !strings.EqualFold(o.Getenv("TERM"), "dumb"))
 }
 
 // UI is the interactive session a person sees and types into: gnosh's
@@ -225,6 +227,10 @@ func tmuxFeatures() string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+// ShowsSuggestions says the box shows the person's likely next prompt
+// (app.Suggester).
+func (u *UI) ShowsSuggestions() bool { return true }
 
 // Event takes in one thing the session reports. It only puts it in line
 // for the loop and returns, so a screen that is slow to draw never holds
@@ -465,8 +471,12 @@ func (u *UI) open() error {
 
 	// The renderer begins at the cursor and takes it to be at the start
 	// of an empty line. The command before gnosh may have left it in the
-	// middle of one, so a terminal that answers questions is asked.
+	// middle of one, so a terminal that answers questions is asked. The
+	// answer also tells the renderer which row of the screen it begins
+	// on, so that it can keep the live region at the bottom of the screen
+	// once the region gets there; an answer that comes late still does.
 	if u.caps.Answered && t.QueryCursorPosition() == nil {
+		u.r.AskedCursor()
 		timer := time.NewTimer(200 * time.Millisecond)
 		defer timer.Stop()
 	wait:
@@ -477,9 +487,12 @@ func (u *UI) open() error {
 					break wait
 				}
 				if r, isReply := ev.(term.Reply); isReply && r.Kind == term.ReplyCursorPosition {
+					row := r.Row
 					if r.Col > 1 {
 						_, _ = t.Write([]byte("\r\n"))
+						row = min(row+1, rows)
 					}
+					u.r.CursorAnswer(row)
 					break wait
 				}
 				u.ahead = append(u.ahead, ev)
@@ -512,6 +525,10 @@ func (u *UI) shut() {
 		// screen, and the panel's.
 		_, _ = u.s.view.p.Close()
 		u.s.view = nil
+	}
+	if u.s != nil && u.s.agents != nil {
+		_, _ = u.s.agents.scr.p.Close()
+		u.s.agents = nil
 	}
 	if u.s != nil && u.s.panel != nil {
 		_, _ = u.s.panel.Close()
@@ -552,10 +569,20 @@ func (u *UI) AskBefore(q agent.Question) (ans agent.Answer, err error) {
 		cols, rows = 80, 24
 	}
 	qs := newQuestion(&u.th, u.m, cols, q, -1)
-	opened := u.now()
+	// The guard of the session's questions (session.open): no key answers
+	// until the question has been on the screen guardShown and the person
+	// has stopped typing for guardPause. Someone still typing their first
+	// prompt as gnosh starts goes on typing it; a j or a 2 in it moved to
+	// or picked "Yes" and trusted the folder unread (the TUI review of
+	// 2026-11-19).
+	quiet := u.now().Add(guardShown)
+	if slices.ContainsFunc(u.ahead, typing) {
+		// Typed while gnosh started: someone is typing right now.
+		quiet = u.now().Add(guardPause)
+	}
 	record := func(words string) {
 		title := oneLine(firstNonEmpty(q.Title, q.Kind, "question"))
-		_ = u.r.Commit(wrap(u.m, u.th.Answer.Render(oneLine(words)), cols, u.th.Ask.Render(u.th.AskMark)+" "+title+" ", "  ")...)
+		_ = u.r.Commit(answerRows(&u.th, u.m, cols, title, []string{oneLine(words)})...)
 	}
 	for {
 		qs.ui.SetMaxHeight(max(liveBound(rows), 3))
@@ -590,11 +617,15 @@ func (u *UI) AskBefore(q agent.Question) (ans agent.Answer, err error) {
 					return agent.Answer{}, errors.New("left before the question was answered")
 				}
 			}
-			if u.now().Sub(opened) < guardShown {
-				// Typed before the question could have been read: not
-				// meant for it. It is kept for the prompt box, like
-				// everything typed before gnosh was ready.
+			if now := u.now(); now.Before(quiet) {
+				// Typed before the question could have been read, or in
+				// the middle of a sentence: not meant for it. It is kept
+				// for the prompt box, like everything typed before gnosh
+				// was ready, and the question waits for a pause.
 				u.ahead = append(u.ahead, ev)
+				if typing(ev) {
+					quiet = now.Add(guardPause)
+				}
 				continue
 			}
 			res := qs.ui.Handle(ev)
@@ -609,6 +640,16 @@ func (u *UI) AskBefore(q agent.Question) (ans agent.Answer, err error) {
 			return ans, nil
 		}
 	}
+}
+
+// typing reports whether ev is something the person typed: a key or a
+// paste.
+func typing(ev term.Event) bool {
+	switch ev.(type) {
+	case term.Key, term.Paste:
+		return true
+	}
+	return false
 }
 
 // Run drives the session from its first prompt to its end and returns the
@@ -630,14 +671,19 @@ func (u *UI) Run(ctx context.Context, c app.Controls) (code int) {
 		cols, rows = 80, 24
 	}
 	s := newSession(config{
-		theme: u.th, metrics: u.m, now: u.now, controls: c, renderer: u.r, host: u,
-		cols: cols, rows: rows, home: u.env("HOME"), selectKey: selectKey(u.env("TERM_PROGRAM")),
-		branch: gitBranch, files: listDir,
+		theme: u.th, profile: u.profile(), light: u.caps.LightBackground, themed: u.o.Theme == nil,
+		metrics: u.m, now: u.now, controls: c, renderer: u.r, host: u,
+		cols: cols, rows: rows, home: u.env("HOME"), selectKey: selectKey(termProgram(u.env)),
+		branch: gitBranch, files: listDir, project: listProject,
+		programs: func() []string { return pathPrograms(u.env("PATH")) },
 	})
 	u.s = s
 	s.start()
-	// The verbose option: reasoning and whole outputs as they come.
-	s.detail = s.info.Verbose
+	// The viewMode and verbose options: reasoning and whole outputs as
+	// they come, or focus view.
+	s.setView(viewOf(s.info))
+	// The theme option: the interface's colours.
+	s.setTheme(s.info.Theme)
 	// The editorMode and vimInsertModeRemaps options: vim's keys.
 	s.ed.SetVimRemaps(s.info.VimRemaps)
 	s.ed.SetVim(s.info.Vim)
@@ -651,8 +697,8 @@ func (u *UI) Run(ctx context.Context, c app.Controls) (code int) {
 		u.ahead = u.ahead[1:]
 		u.terminal(ev)
 	}
-	if strings.TrimSpace(u.first) != "" {
-		s.send(editor.Draft{Text: u.first})
+	if d := (editor.Draft{Text: u.first}); strings.TrimSpace(d.Text) != "" && s.cleanToSend(&d, editor.ModePrompt) {
+		s.send(d)
 	}
 	u.draw()
 
@@ -758,6 +804,13 @@ func (u *UI) terminal(ev term.Event) {
 func (u *UI) terminalOne(ev term.Event) {
 	switch ev := ev.(type) {
 	case term.Reply:
+		if ev.Kind == term.ReplyCursorPosition {
+			// Where the cursor is, as the renderer asked (askCursor).
+			if u.r != nil {
+				u.r.CursorAnswer(ev.Row)
+			}
+			return
+		}
 		// An answer that came later than the probe waited for it.
 		if u.caps.Note(ev) {
 			u.setModes()
@@ -782,6 +835,22 @@ func (u *UI) draw() {
 		return
 	}
 	u.s.frame()
+	u.askCursor()
+}
+
+// askCursor asks the terminal which row the cursor is on when the
+// renderer has lost track of it (the terminal was resized, or lent to the
+// shell or an editor), so that the live region can keep to the bottom of
+// the screen again. It asks only while the session draws on the
+// scrollback itself: on the side panel's screen, or a view's, the answer
+// would tell of the wrong screen.
+func (u *UI) askCursor() {
+	if u.t == nil || u.r == nil || !u.caps.Answered || u.s == nil || u.s.r != screen(u.r) || !u.r.WantsCursor() {
+		return
+	}
+	if u.t.QueryCursorPosition() == nil {
+		u.r.AskedCursor()
+	}
 }
 
 // heard is a signal that one of the two sides has told of and the other
@@ -1020,8 +1089,8 @@ func noteSeq(channel, text string, env func(string) string) string {
 			return ""
 		case env("KITTY_WINDOW_ID") != "" || env("TERM") == "xterm-kitty":
 			kind = "osc99"
-		case env("TERM_PROGRAM") == "iTerm.app" || env("TERM_PROGRAM") == "WezTerm" ||
-			env("TERM_PROGRAM") == "ghostty" || env("TERM") == "xterm-ghostty":
+		case termProgram(env) == "iTerm.app" || termProgram(env) == "WezTerm" ||
+			termProgram(env) == "ghostty" || env("TERM") == "xterm-ghostty":
 			kind = "osc9"
 		default:
 			return ""
@@ -1035,6 +1104,20 @@ func noteSeq(channel, text string, env func(string) string) string {
 		seq += term.Bell
 	}
 	return seq
+}
+
+// termProgram is the terminal's name as it sets TERM_PROGRAM; or, where
+// that is not passed on (ssh), iTerm2's as it names itself in LC_TERMINAL,
+// which ssh passes on with the locale's variables by default (Claude Code
+// 2.1.326 reaches iTerm2 over ssh so).
+func termProgram(env func(string) string) string {
+	if p := env("TERM_PROGRAM"); p != "" {
+		return p
+	}
+	if env("LC_TERMINAL") == "iTerm2" {
+		return "iTerm.app"
+	}
+	return ""
 }
 
 // copy puts text on the person's clipboard through the terminal (OSC 52):
@@ -1080,12 +1163,19 @@ func (u *UI) edit(draft string) (string, error) {
 	if program == "" {
 		return "", errors.New("Set VISUAL or EDITOR to edit the prompt in your own editor.")
 	}
-	f, err := os.CreateTemp(u.env("TMPDIR"), "gnosh-prompt-*.md")
+	// In a folder of its own, gone with all in it after: an editor's
+	// backup or swap file beside the draft kept what was pasted into it,
+	// in a folder others can list (the plan review of 2026-11-19).
+	dir, err := os.MkdirTemp(u.env("TMPDIR"), "gnosh-prompt-")
+	if err != nil {
+		return "", fmt.Errorf("The prompt could not be written to a file for the editor: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	f, err := os.OpenFile(filepath.Join(dir, "prompt.md"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("The prompt could not be written to a file for the editor: %v", err)
 	}
 	path := f.Name()
-	defer os.Remove(path)
 	_, werr := f.WriteString(draft)
 	if cerr := f.Close(); werr == nil {
 		werr = cerr
@@ -1124,7 +1214,7 @@ func (u *UI) editFile(path string) error {
 	if program == "" {
 		return errors.New("Set VISUAL or EDITOR to open it in your own editor.")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("%s cannot be made: %v", filepath.Dir(path), err)
 	}
 	ran, err := u.runEditor(program, path)

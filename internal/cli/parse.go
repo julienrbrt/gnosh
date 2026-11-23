@@ -79,6 +79,8 @@ func (t *Table) walk(args []string) (*parsed, *Error) {
 			p.early = len(p.args)
 		case strings.HasPrefix(a, "--"):
 			i, err = p.word(args, i)
+		case a == "-" && p.cmd != nil && p.cmd.dashIsStdin:
+			err = p.plain(args, i)
 		case a == "-":
 			err = &Error{Kind: ErrUsage, Typed: a, Message: fmt.Sprintf(
 				"- by itself means nothing to gnosh, so %s. Text piped in is read without being asked for; to send a dash as an argument, put -- before it.",
@@ -430,6 +432,11 @@ func (p *parsed) unknownCommand(word string) *Error {
 		msg += fmt.Sprintf(" Did you mean %s?", near)
 	}
 	e.Message = msg + fmt.Sprintf(" Its commands are %s.", oneOf(names, "and"))
+	if c.parent != nil && c.parent.parent == nil {
+		// (A command first on the line: the words may have been a prompt
+		// that begins with its name.)
+		e.Message += " " + asPrompt(p.name+" "+word)
+	}
 	return e
 }
 

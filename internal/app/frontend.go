@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"time"
@@ -58,6 +59,14 @@ type Asker interface {
 	// AskBefore puts the question and returns the answer. An error means
 	// the person left instead of answering.
 	AskBefore(q agent.Question) (agent.Answer, error)
+}
+
+// Suggester is a Frontend that shows the person's likely next prompt
+// (SuggestionEvent) in its box. Only for one is the model asked for it
+// (promptSuggestionEnabled): a front end with no box to show it in would
+// pass over what the request made.
+type Suggester interface {
+	ShowsSuggestions() bool
 }
 
 // FrontendInfo is what the maker of an interactive front end is given
@@ -140,7 +149,8 @@ type Controls interface {
 	// shutdown short.
 	Signals() <-chan os.Signal
 	// Notify fires the person's Notification hooks: kind is
-	// "permission_prompt" (a question has waited a while) or "idle_prompt"
+	// "permission_prompt" (a question has waited a while), "push_notification"
+	// (the model's PushNotification) or "idle_prompt"
 	// (a turn finished a while ago and nothing was typed since). It does
 	// not wait for them.
 	Notify(kind, title, message string)
@@ -206,8 +216,10 @@ type SessionControls interface {
 	// waiting for to the background, where it keeps running, and reports
 	// whether there was such a command. The call returns at once with the
 	// command's task id. It works for a call of the model's and for a
-	// command started with Shell.
-	Background(callID string) bool
+	// command started with Shell. tool is the call's tool: a Bash call
+	// whose command has not started yet (its permission is checked, its
+	// PreToolUse hooks run) goes to the background as it starts.
+	Background(callID, tool string) bool
 	// History returns the prompts the person sent from this folder, in
 	// earlier sessions and in this one, the oldest first: what Up and a
 	// search of the history reach. It reads the folder's most recent
@@ -257,6 +269,14 @@ type SessionControls interface {
 	// the picker that /mcp with nothing after it opens; what is done to
 	// one is the command /mcp reconnect, enable or disable and its name.
 	MCPChoices() []MCPChoice
+	// HookChoices lists the hooks in force, for the read-only browser that
+	// /hooks with nothing after it opens, and a note on those configured
+	// and not in force.
+	HookChoices() ([]HookChoice, string)
+	// AgentChoices lists the kinds of sub-agent, for the read-only browser
+	// that /agents with nothing after it opens, and whether the model can
+	// start them (the Agent tool is on).
+	AgentChoices() ([]AgentChoice, bool)
 	// PermissionRules returns the permission mode and the rules in force,
 	// for the picker that /permissions with nothing after it opens;
 	// adding and taking out a rule are the commands /permissions allow,
@@ -323,6 +343,12 @@ type SessionInfo struct {
 	Model    string
 	Address  string
 	Thinking string
+	// ThinkingBudget is the most tokens the model may think before a
+	// reply (thinkingBudget, MAX_THINKING_TOKENS; 0 for no cap), and
+	// BudgetNote the words the server puts at the end of a thought it cut
+	// there, by which the interface knows one was cut.
+	ThinkingBudget int
+	BudgetNote     string
 	// MCPServers are the session's MCP servers and how each stands:
 	// "pending", "connected" or "failed".
 	MCPServers []MCPServerStatus
@@ -346,6 +372,21 @@ type SessionInfo struct {
 	// Verbose says the interface shows the model's reasoning and the
 	// calls' whole output as they come (the verbose option).
 	Verbose bool
+	// ViewMode is the viewMode option, when something set it: "default",
+	// "verbose" or "focus" (each run of tool calls folded into one line).
+	// It wins over Verbose; "" leaves Verbose to decide.
+	ViewMode string
+	// HideTurnDuration says a turn that ended as it should goes without
+	// the line that says how long it took (the showTurnDuration option
+	// off, as the session has it now).
+	HideTurnDuration bool
+	// ListIgnored says the @ file picker lists what git ignores too (the
+	// respectGitignore option off, as the session has it now).
+	ListIgnored bool
+	// FileSuggestion says a command of the person's offers the paths an @
+	// mention completes to (Claude Code's fileSuggestion), which the
+	// controls' SuggestFiles runs, in place of the picker's own search.
+	FileSuggestion bool
 	// SidePanel says the session starts with the side panel on (the
 	// sidePanel option).
 	SidePanel bool
@@ -366,6 +407,13 @@ type SessionInfo struct {
 	// "terminal_bell", "iterm2", "iterm2_with_bell", "kitty", "ghostty"
 	// or "notifications_disabled".
 	NotifChannel string
+	// Theme is the theme option: "auto", "dark", "light" or "ansi".
+	Theme string
+	// AskTimeout is how long a question of the model's (AskUserQuestion)
+	// may go without a key before the interface closes it by itself, with
+	// what was picked by then and the Choice AskedAway (the
+	// askUserQuestionTimeout option); zero for never.
+	AskTimeout time.Duration
 	// Vim says the box takes vim's keys (the editorMode option, "vim"),
 	// and VimRemaps are the INSERT-mode pairs that stand for Esc (the
 	// vimInsertModeRemaps option).
@@ -423,6 +471,28 @@ type CommandInfo struct {
 	InRun bool
 }
 
+// RestartEvent says the session closes for gnosh to start again at once
+// and go on with it elsewhere: a tool moved it (EnterWorktree,
+// ExitWorktree), and its turn has ended. A front end ends Run as it does
+// after /restart, with Why, a line for the person, said first; the new
+// start says itself where the session is.
+type RestartEvent struct {
+	Why string
+}
+
+// PushEvent asks the front end to tell the person something the model
+// thinks worth calling them back for (PushNotification): a desktop note by
+// their channel (preferredNotifChannel) and their Notification hooks, of
+// the type "push_notification". A front end that sees the person at the
+// terminal (a key pressed in the last half minute) sends nothing: what
+// the model writes reaches them already. It answers on Reply, once, with
+// what it did in a few words ("sent", or why not); a front end that knows
+// nothing of it never answers, and the tool says so.
+type PushEvent struct {
+	Message string
+	Reply   chan<- string
+}
+
 // StatusEvent says that named facts for a status line have changed: see
 // SessionControls.Status for the names. A fact with an empty value is taken off.
 type StatusEvent struct {
@@ -449,11 +519,25 @@ type QuestionData struct {
 	// CommentOnYes says that words given with a yes (Answer.Text) are
 	// passed on to the model, as words given with a no are.
 	CommentOnYes bool
+	// Input is the input of the call the question is about, for the
+	// channels that relay permission questions (channelrelay.go).
+	Input json.RawMessage
+	// PersonOnly says the question is for the person alone: a call that
+	// throws away what cannot be got back (core.Action.Confirm), or one
+	// the engine found could destroy what has to be kept. No channel is
+	// sent it.
+	PersonOnly bool
+	// Stops is what a bare "no" stops, when it is not the turn: "that
+	// sub-agent", for a question of a sub-agent in the background.
+	Stops string
 }
 
 // Deadline is when the question is taken back unanswered, or the zero
 // time.
 func (d QuestionData) Deadline() time.Time { return d.Until }
+
+// NoStops is what a bare "no" stops, or "" for the turn.
+func (d QuestionData) NoStops() string { return d.Stops }
 
 // TasksEvent says the session's task list has changed, and carries all of
 // it: the list a front end shows under the prompt, in order. An empty list
@@ -467,6 +551,8 @@ type TasksEvent struct {
 // CapEvent says a non-interactive run reached the number of replies it was
 // given with --max-turns, and its turn is being stopped there.
 type CapEvent struct {
-	// Turns is the number that was given.
+	// Turns is the number that was given, and Turn the turn that reached
+	// it.
 	Turns int
+	Turn  string
 }

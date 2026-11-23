@@ -25,9 +25,8 @@ type session struct {
 	mu sync.Mutex
 	// files is keyed by the real path of a file: links followed.
 	files map[string]*fileRecord
-	// locks holds, per real path, a one-slot channel that a call fills
-	// while it changes the file.
-	locks map[string]chan struct{}
+	// ticks counts the looks and writes, for each record's order.
+	ticks uint64
 }
 
 // span is a run of line numbers, first and last included. Lines count from
@@ -55,6 +54,9 @@ type fileRecord struct {
 	lines int
 	// written says that the session itself has written the file.
 	written bool
+	// order is when the session last read or wrote the file: the higher,
+	// the more recent.
+	order uint64
 }
 
 // sessionOf returns the file state of the session env belongs to, making
@@ -65,7 +67,6 @@ func sessionOf(env *core.ToolEnv) *session {
 	}
 	v, _ := env.Store.LoadOrStore(sessionKey{}, &session{
 		files: make(map[string]*fileRecord),
-		locks: make(map[string]chan struct{}),
 	})
 	return v.(*session)
 }
@@ -142,12 +143,19 @@ func (s *session) saw(real string, v sighting) {
 		if known {
 			delete(s.files, real)
 			if rec.written {
-				s.files[real] = &fileRecord{modTime: rec.modTime, size: rec.size, lines: rec.lines, written: true, sum: rec.sum, hasSum: rec.hasSum}
+				s.files[real] = &fileRecord{modTime: rec.modTime, size: rec.size, lines: rec.lines, written: true, sum: rec.sum, hasSum: rec.hasSum, order: s.tick()}
 			}
 		}
 		return
 	}
+	rec.order = s.tick()
 	s.files[real] = &rec
+}
+
+// tick returns the next order for a record. s.mu is held.
+func (s *session) tick() uint64 {
+	s.ticks++
+	return s.ticks
 }
 
 // wrote records that the session has just written the file. info and sum
@@ -164,6 +172,7 @@ func (s *session) wrote(real string, info fs.FileInfo, sum [sha256.Size]byte, al
 		all:     all,
 		lines:   lines,
 		written: true,
+		order:   s.tick(),
 	}
 	if !all {
 		rec.seen = append([]span(nil), seen...)
@@ -174,17 +183,21 @@ func (s *session) wrote(real string, info fs.FileInfo, sum [sha256.Size]byte, al
 	s.files[real] = rec
 }
 
+// fileLocks holds, per real path, a one-slot channel that a call fills
+// while it changes the file. It is one table for the whole process: a
+// session and its sub-agents, each with its own record of what it read,
+// take turns on a file too. Each passed its check against what it had
+// read, and the later write undid the earlier one (the Edit/Write review
+// of 2026-11-19); now the later one finds the file changed, and is told to
+// read it again.
+var fileLocks sync.Map // real path → chan struct{}
+
 // lock waits for the turn to change the file at the real path, so that two
 // calls on one file run one after the other and neither loses the other's
 // change. It returns the function that gives the turn up.
 func (s *session) lock(ctx context.Context, real string) (unlock func(), err error) {
-	s.mu.Lock()
-	ch, ok := s.locks[real]
-	if !ok {
-		ch = make(chan struct{}, 1)
-		s.locks[real] = ch
-	}
-	s.mu.Unlock()
+	v, _ := fileLocks.LoadOrStore(real, make(chan struct{}, 1))
+	ch := v.(chan struct{})
 	if ctx.Err() != nil {
 		return nil, context.Cause(ctx)
 	}
@@ -361,6 +374,30 @@ func States(env *core.ToolEnv) []FileState {
 	return out
 }
 
+// Recent lists the files the session read or wrote last, the most recent
+// first, at most n of them: for a caller that gives the model back the
+// files it was working on (after a summary, which takes them out of its
+// view).
+func Recent(env *core.ToolEnv, n int) []FileState {
+	s := sessionOf(env)
+	s.mu.Lock()
+	type ordered struct {
+		st    FileState
+		order uint64
+	}
+	all := make([]ordered, 0, len(s.files))
+	for path, rec := range s.files {
+		all = append(all, ordered{FileState{Path: path, ModTime: rec.modTime, Size: rec.size, Full: rec.all, Written: rec.written}, rec.order})
+	}
+	s.mu.Unlock()
+	sort.Slice(all, func(i, j int) bool { return all[i].order > all[j].order })
+	out := make([]FileState, 0, min(n, len(all)))
+	for _, o := range all[:min(n, len(all))] {
+		out = append(out, o.st)
+	}
+	return out
+}
+
 // MarkRead records that the model has seen the whole of the file at path
 // as it is on disk now, as if Read had just shown it. It is for a caller
 // that showed the file to the model some other way: a shell command that
@@ -428,6 +465,23 @@ func Forget(env *core.ToolEnv, paths ...string) []string {
 		}
 		s.mu.Unlock()
 	}
+	sort.Strings(dropped)
+	return dropped
+}
+
+// ForgetAll forgets every file the session has read or written, as Forget
+// forgets some: for a summary, which takes the whole conversation out of
+// the model's view, with every copy of a file it held. It returns the
+// files whose record it dropped, sorted.
+func ForgetAll(env *core.ToolEnv) []string {
+	s := sessionOf(env)
+	s.mu.Lock()
+	dropped := make([]string, 0, len(s.files))
+	for real := range s.files {
+		dropped = append(dropped, real)
+	}
+	clear(s.files)
+	s.mu.Unlock()
 	sort.Strings(dropped)
 	return dropped
 }

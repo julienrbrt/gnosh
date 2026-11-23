@@ -136,6 +136,13 @@ func DesktopNote(kind, text string) string {
 	text = stripControls(text)
 	switch kind {
 	case "osc9":
+		if text != "" && text[0] >= '0' && text[0] <= '9' {
+			// Terminals that read ConEmu's OSC 9 take a note that begins
+			// with a number and a ";" as a command of theirs (a progress
+			// bar, the tab's title), and a note may begin with the
+			// model's words (the terminal review of 2026-11-19).
+			text = "gnosh: " + text
+		}
 		return "\x1b]9;" + text + "\x1b\\"
 	case "osc99":
 		return "\x1b]99;;" + text + "\x1b\\"

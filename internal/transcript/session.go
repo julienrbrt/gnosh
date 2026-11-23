@@ -60,6 +60,68 @@ func (s *Session) SetCwd(dir string) {
 	s.cwd = dir
 }
 
+// MovedKey is the key of the meta entry Move writes; its value is the
+// folder the session was moved to.
+const MovedKey = "moved"
+
+// Move puts the session in another working directory, as /cd does: its
+// file goes under the project directory of cwd, an absolute path, and a
+// meta entry (MovedKey) records the folder. From then on the session is
+// listed with that folder's sessions (List), and new entries are stamped
+// with it. A session with no file yet only takes the folder. A file of the
+// session's id already there is an error, as is a read-only session; when
+// the entry cannot be written the file is put back.
+func (s *Session) Move(cwd string) error {
+	if !filepath.IsAbs(cwd) {
+		return fmt.Errorf("transcript: a session's working directory must be an absolute path, not %q", cwd)
+	}
+	cwd = filepath.Clean(cwd)
+	s.mu.Lock()
+	switch {
+	case s.readOnly:
+		s.mu.Unlock()
+		return fmt.Errorf("transcript: moving session %s: %w", s.id, ErrReadOnly)
+	case s.closed:
+		s.mu.Unlock()
+		return fmt.Errorf("transcript: moving session %s: %w", s.id, ErrClosed)
+	}
+	from, oldCwd := s.path, s.cwd
+	to := filepath.Join(s.st.ProjectDir(cwd), s.id+".jsonl")
+	if s.f == nil {
+		// Nothing is written yet: the file will be made where it belongs.
+		s.path, s.start, s.cwd = to, cwd, cwd
+		s.mu.Unlock()
+		return nil
+	}
+	if to != from {
+		if _, err := os.Lstat(to); err == nil {
+			s.mu.Unlock()
+			return fmt.Errorf("transcript: moving session %s: %s is there already", s.id, to)
+		}
+		if err := os.MkdirAll(filepath.Dir(to), 0o700); err != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("transcript: moving session %s: %w", s.id, err)
+		}
+		if err := os.Rename(from, to); err != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("transcript: moving session %s: %w", s.id, err)
+		}
+	}
+	// (The open file goes on being written where it now is: a rename
+	// keeps it, and keeps its writer's lock.)
+	s.path, s.cwd = to, cwd
+	s.mu.Unlock()
+	if _, err := s.Append(MetaEntry(MovedKey, cwd)); err != nil {
+		s.mu.Lock()
+		if to == from || os.Rename(to, from) == nil {
+			s.path, s.cwd = from, oldCwd
+		}
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
 // Warnings returns what was wrong with the session's file when it was
 // opened but could be got past: a torn last line, corrupt lines, a branch
 // whose parent is missing.
@@ -179,11 +241,17 @@ func (s *Session) AppendAll(entries ...Entry) ([]Entry, error) {
 			return nil, err
 		}
 	}
+	before := int64(-1)
+	if fi, err := s.f.Stat(); err == nil {
+		before = fi.Size()
+	}
 	n, err := s.f.Write(buf)
 	if err != nil {
-		if n > 0 {
-			// Part of it may be in the file: the next write starts on a
-			// line of its own, and a load leaves the torn line out.
+		if n > 0 && (before < 0 || s.f.Truncate(before) != nil) {
+			// Part of it may be in the file, and could not be taken back
+			// off (the whole lines of it would come back as entries the
+			// session never had): the next write starts on a line of its
+			// own, and a load leaves the torn line out.
 			s.open = true
 		}
 		return nil, fmt.Errorf("transcript: appending to session %s: %w (nothing was recorded)", s.id, err)

@@ -427,29 +427,44 @@ const maxShown = 24000
 // written lays events out as text for a judge to read: the prompts typed,
 // what the agent said and called, and what its tools returned, a failed
 // call's result marked so. Hidden text of the harness and the frame
-// events are left out.
+// events are left out. Each event begins a line of its own with who it
+// is, and every further line of it is indented (under): a "the user:" in
+// a tool's output, a file or the agent's own words never stands where the
+// user's word does (the side-request review of 2026-11-19).
 func written(events []event, c clips) string {
 	var b strings.Builder
 	for i := range events {
 		e := &events[i]
 		switch e.kind {
 		case evPrompt:
-			b.WriteString("the user: " + clipText(e.text, c.user) + "\n")
+			b.WriteString("the user: " + under(clipText(e.text, c.user)) + "\n")
 		case evSaid:
-			b.WriteString("the agent: " + clipText(e.text, c.said) + "\n")
+			b.WriteString("the agent: " + under(clipText(e.text, c.said)) + "\n")
 		case evCall:
-			b.WriteString("the agent called " + e.tool + ": " + clipText(callText(e), c.input) + "\n")
+			b.WriteString("the agent called " + oneLineName(e.tool) + ": " + under(clipText(callText(e), c.input)) + "\n")
 			switch {
 			case !e.answered:
 				b.WriteString("the call has no result\n")
 			case e.failed:
-				b.WriteString("the tool failed: " + clipText(e.text, c.result) + "\n")
+				b.WriteString("the tool failed: " + under(clipText(e.text, c.result)) + "\n")
 			default:
-				b.WriteString("the tool returned: " + clipText(e.text, c.result) + "\n")
+				b.WriteString("the tool returned: " + under(clipText(e.text, c.result)) + "\n")
 			}
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// under indents every line of s but the first by two spaces, once the
+// line breaks a model may read as one (carriage return, next line, line
+// and paragraph separators) are made line feeds.
+func under(s string) string {
+	return strings.ReplaceAll(prompt.Lines(s), "\n", "\n  ")
+}
+
+// oneLineName is a tool's name on one line.
+func oneLineName(s string) string {
+	return strings.Join(strings.Fields(prompt.Lines(s)), " ")
 }
 
 // callText is a call as a judge reads it: a command's line, a mem call's

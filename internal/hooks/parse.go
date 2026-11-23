@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 )
 
@@ -32,16 +33,18 @@ import (
 //   - an event name that is not exactly one of gnosh's;
 //   - a name written twice in one object (JSON readers keep only one of
 //     the two, so a list of hooks would vanish);
-//   - a hook type other than "command" (http, mcp_tool, prompt, agent);
-//   - a shell other than bash, an "onFailure" other than "continue", an
+//   - a hook type other than "command", "http", "mcp_tool", "prompt" and
+//     "agent";
+//   - a shell other than bash, an "onFailure" other than "continue" or
+//     "block", an
 //     "if" that is not a string, "args" that are not a list of strings,
 //     "async" or "asyncRewake" that is not true or false;
 //   - any field gnosh does not know;
 //   - a matcher on an event that takes none, or one that cannot be read;
 //   - no command, or a timeout that is not a number of seconds above zero.
 //
-// Accepted, and changing nothing: "once", and the default values "shell":
-// "bash" and "onFailure": "continue". (gnosh blocks when a
+// Accepted, and changing nothing: "once", the default value "shell":
+// "bash", and "onFailure": "continue" or "block". (gnosh blocks when a
 // hook fails, whatever "onFailure" says.)
 //
 // When anything is wrong the error is a *ConfigError listing every
@@ -210,22 +213,23 @@ func (p *blockParser) handler(event Event, pattern, place string, raw json.RawMe
 	case !hasType:
 		p.fail(place, "the hook has no \"type\". gnosh runs command hooks: \"type\": \"command\".")
 		return
-	case kind != "command" && kind != "http" && kind != "mcp_tool":
-		p.fail(place, "the hook has \"type\": %s. gnosh runs command hooks, http hooks and mcp_tool hooks only, so this hook would not run as written.", quote(kind))
+	case kind != "command" && kind != "http" && kind != "mcp_tool" && kind != "prompt" && kind != "agent":
+		p.fail(place, "the hook has \"type\": %s. gnosh runs command hooks, http hooks, mcp_tool hooks, prompt hooks and agent hooks only, so this hook would not run as written.", quote(kind))
 		return
 	}
 	// The fields of one type are a mistake on another.
-	only := map[string]string{"command": "command", "args": "command", "async": "command", "asyncRewake": "command", "shell": "command",
-		"url": "http", "headers": "http", "allowedEnvVars": "http",
-		"server": "mcp_tool", "tool": "mcp_tool", "input": "mcp_tool"}
+	only := map[string][]string{"command": {"command"}, "args": {"command"}, "async": {"command"}, "asyncRewake": {"command"}, "shell": {"command"},
+		"url": {"http"}, "headers": {"http"}, "allowedEnvVars": {"http"},
+		"server": {"mcp_tool"}, "tool": {"mcp_tool"}, "input": {"mcp_tool"},
+		"prompt": {"prompt", "agent"}, "model": {"prompt", "agent"}, "continueOnBlock": {"prompt"}}
 	for _, f := range fields {
-		if want, ok := only[f.key]; ok && want != kind && !isNull(f.value) {
+		if kinds, ok := only[f.key]; ok && !slices.Contains(kinds, kind) && !isNull(f.value) {
 			p.fail(place, "the hook has %s, which a hook of \"type\": %s does not take.", quote(f.key), quote(kind))
 			return
 		}
 	}
 
-	h := Hook{Event: event, Matcher: pattern, Source: p.at(place)}
+	h := Hook{Event: event, Matcher: pattern, Source: p.at(place), Agent: kind == "agent"}
 	before := len(p.cfg.problems)
 	badCommand := false
 	for _, f := range fields {
@@ -276,11 +280,13 @@ func (p *blockParser) handler(event Event, pattern, place string, raw json.RawMe
 			}
 		case "onFailure":
 			switch s, ok := asString(f.value); {
-			case ok && s == "continue":
-			case ok && s == "block":
-				p.fail(place, "the hook has \"onFailure\": \"block\". gnosh does not take this setting, and does not need it: a hook that fails already blocks, on every event that can block. Remove \"onFailure\".")
+			case ok && (s == "continue" || s == "block"):
+				// A hook that fails blocks, on every event that can block,
+				// whatever this says: "block" says just that. It stopped
+				// startup, though Claude Code's command, http and mcp_tool
+				// hooks take it (Claude Code 2.1.328).
 			default:
-				p.fail(place, "the hook has \"onFailure\": %s, which gnosh does not know. Remove it: a hook that fails blocks, on every event that can block.", written)
+				p.fail(place, "the hook has \"onFailure\": %s, which gnosh does not know (it takes \"continue\" or \"block\"). Remove it: a hook that fails blocks, on every event that can block.", written)
 			}
 		case "if":
 			s, ok := asString(f.value)
@@ -310,6 +316,19 @@ func (p *blockParser) handler(event Event, pattern, place string, raw json.RawMe
 				break
 			}
 			h.Input = append(json.RawMessage(nil), f.value...)
+		case "prompt":
+			if h.Prompt, ok = asString(f.value); !ok || strings.TrimSpace(h.Prompt) == "" {
+				p.fail(place, "\"prompt\" is the rule or the condition the model judges, as a string; this one is %s.", kindOf(f.value))
+				badCommand = true
+			}
+		case "model":
+			if h.Model, ok = asString(f.value); !ok {
+				p.fail(place, "\"model\" must be a string; this one is %s.", kindOf(f.value))
+			}
+		case "continueOnBlock":
+			if h.ContinueOnBlock, ok = asBool(f.value); !ok {
+				p.fail(place, "\"continueOnBlock\" must be true or false; this one is %s.", kindOf(f.value))
+			}
 		case "url":
 			if h.URL, ok = asString(f.value); !ok || h.URL == "" {
 				p.fail(place, "\"url\" is the address the event is sent to, as a string; this one is %s.", kindOf(f.value))
@@ -339,6 +358,14 @@ func (p *blockParser) handler(event Event, pattern, place string, raw json.RawMe
 		default:
 			p.fail(place, "the hook has %s, which gnosh does not know. A command hook has \"type\", \"command\" and \"timeout\".", quote(f.key))
 		}
+	}
+	if kind == "prompt" && h.Prompt == "" && !badCommand {
+		p.fail(place, "the prompt hook has no \"prompt\": the rule or the condition the model judges.")
+		badCommand = true
+	}
+	if kind == "agent" && h.Prompt == "" && !badCommand {
+		p.fail(place, "the agent hook has no \"prompt\": the task its sub-agent is given.")
+		badCommand = true
 	}
 	if kind == "http" && h.URL == "" && !badCommand {
 		p.fail(place, "the http hook has no \"url\" to send the event to.")

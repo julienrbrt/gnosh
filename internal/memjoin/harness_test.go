@@ -646,13 +646,3 @@ func lastUser(t *testing.T, r apptest.Request) string {
 
 // coreText is a message of one text block.
 func coreText(s string) core.Message { return core.UserText(s) }
-
-// mustJSON writes v as JSON.
-func mustJSON(t *testing.T, v any) string {
-	t.Helper()
-	raw, err := json.Marshal(v)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(raw)
-}

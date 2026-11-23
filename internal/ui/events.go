@@ -26,7 +26,8 @@ import (
 // statusFacts is what an event of the session's may have to put facts on
 // the status line that the loop's own events do not carry. The facts are
 // named: "frame" (the frame the session is in), "background" (how many
-// commands run in the background), "goal" and "session" (the session's
+// commands run in the background), "agents" (how many runs in the
+// background wait on the person), "goal" and "session" (the session's
 // name). A fact that is left out stays as it was; an empty one is taken
 // off. (The task list has an event of its own, app.TasksEvent.)
 type statusFacts interface {
@@ -37,17 +38,38 @@ type statusFacts interface {
 // hand for the live region while the reasoning is shown folded.
 const thinkKeep = 1 << 16
 
-// metaPastes is the key under which a prompt carries the parts of its
-// text that were pasted and shown folded in the prompt box, as a
-// []editor.Span, in Prompt.Meta. The session code may use it to tell the
-// model what was pasted; the interface uses it to show the prompt the way
-// the box showed it.
-const metaPastes = "pastes"
+// pastesOf is the parts of a prompt's text that were pasted and shown
+// folded in the prompt box, from its Meta (app.MetaPasted): the interface
+// shows the prompt the way the box showed it, and the session tells the
+// model which lines were pasted.
+func pastesOf(meta map[string]any) []editor.Span {
+	ranges, _ := meta[app.MetaPasted].([][2]int)
+	var spans []editor.Span
+	for _, r := range ranges {
+		spans = append(spans, editor.Span{Start: r[0], End: r[1]})
+	}
+	return spans
+}
+
+// pastedMeta is a prompt's Meta for the pastes of a draft, or nil.
+func pastedMeta(spans []editor.Span) map[string]any {
+	if len(spans) == 0 {
+		return nil
+	}
+	ranges := make([][2]int, len(spans))
+	for i, sp := range spans {
+		ranges[i] = [2]int{sp.Start, sp.End}
+	}
+	return map[string]any{app.MetaPasted: ranges}
+}
 
 // handle takes in one thing the session reported.
 func (s *session) handle(ev any) {
 	s.dirty = true
 	s.heard = s.now()
+	// A question or a turn that comes while a picker's list is read goes
+	// first.
+	defer s.listCheck()
 	if e, ok := ev.(agent.Event); ok {
 		if m := e.EventMeta(); m != nil && m.Agent != "" {
 			s.subAgent(ev, m)
@@ -72,6 +94,9 @@ func (s *session) handle(ev any) {
 	case *app.ServerLoadEvent:
 		// What the model server is doing while the reply has not begun.
 		s.load = ev.Text
+	case *app.ModeEvent:
+		// The session changed the mode itself, in the middle of a turn.
+		s.mode = ev.Mode
 	case *agent.ThinkingEvent:
 		s.thinking(ev.Text)
 	case *agent.TextEvent:
@@ -115,6 +140,14 @@ func (s *session) handle(ev any) {
 	case *agent.AnswerEvent:
 		s.answered(ev)
 	case *agent.NoticeEvent:
+		if ev.TurnEnd {
+			// turnEnd says how the turn ended, with its times, right after.
+			break
+		}
+		if ev.Source == agent.SourceProviderBack && s.retries > 0 {
+			// (alive says it, with the tries counted: it was said twice.)
+			break
+		}
 		s.notice(ev.Level, ev.Text)
 	case *agent.NoteEvent:
 		if ev.Note.Notice != "" {
@@ -127,9 +160,12 @@ func (s *session) handle(ev any) {
 		case ev.Checkpoint:
 			s.say(fmt.Sprintf("The turn goes on: %s objects, %d times in a row now, so the model is asked whether there is a real reason to stop: %s",
 				ev.Name, ev.Streak, oneLine(ev.Objection)))
+		case s.hookSaid != "" && oneLine(ev.Objection) == s.hookSaid:
+			s.say(fmt.Sprintf("The turn goes on: %s objects, as the hook above says.", ev.Name))
 		default:
 			s.say(fmt.Sprintf("The turn goes on: %s objects: %s", ev.Name, oneLine(ev.Objection)))
 		}
+		s.hookSaid = ""
 	case *agent.ContextEvent:
 		s.ctxs = ev.Context
 	case *agent.RoomEvent:
@@ -163,9 +199,27 @@ func (s *session) handle(ev any) {
 	case *app.TasksEvent:
 		s.tasks = ev.Tasks
 		s.dirty = true
+	case *app.PushEvent:
+		ev.Reply <- s.push(ev.Message)
+	case *app.RestartEvent:
+		// A tool moved the session (EnterWorktree, ExitWorktree): it
+		// closes, and gnosh starts again where it moved, as after
+		// /restart.
+		if ev.Why != "" {
+			s.say(ev.Why)
+		}
+		s.restarting = true
+		s.leave(0, "other")
 	case *app.DeliverablesEvent:
 		s.deliv = ev.List
 		s.dirty = true
+	case *app.SuggestionEvent:
+		// The person's likely next prompt (promptSuggestionEnabled): shown
+		// in the box while it is empty and nothing runs.
+		if !s.busy && s.ed.IsEmpty() {
+			s.suggestion = oneLine(ev.Text)
+			s.dirty = true
+		}
 	case *app.StatusLineEvent:
 		s.custom, s.customPad = ev.Lines, ev.Padding
 		s.dirty = true
@@ -231,10 +285,7 @@ func (s *session) prompt(ev *agent.PromptEvent) {
 		// this event, and it is shown then.
 		return
 	}
-	d := editor.Draft{Text: ev.Prompt.Text}
-	if spans, ok := ev.Prompt.Meta[metaPastes].([]editor.Span); ok {
-		d.Pastes = spans
-	}
+	d := editor.Draft{Text: ev.Prompt.Text, Pastes: pastesOf(ev.Prompt.Meta)}
 	for i, p := range s.sending {
 		if p.id == ev.ID {
 			d = p.draft
@@ -292,6 +343,7 @@ func mentionsSaid(parts []agent.Part) string {
 func (s *session) request(ev *agent.RequestEvent) {
 	switch ev.Purpose {
 	case "main":
+		s.suggestion = ""
 		s.endReply()
 		s.reply = reply{}
 		s.model, s.estimate, s.attempt = ev.Model, ev.Estimate, ev.Attempt
@@ -372,10 +424,22 @@ func (s *session) endThinking() {
 	}
 	// Folded: one line says that the model thought and for how long. The
 	// words are in the session's file, where the transcript view (Ctrl+O)
-	// shows them.
+	// shows them. In focus view, the time goes into the run's fold line.
 	rp.thinkRest = ""
-	line := s.th.Thinking.Render(s.th.ThinkMark+" thought for "+span(took)) +
-		s.th.Quiet.Render(s.th.Sep+"Ctrl+O shows it")
+	if s.focus {
+		s.fold.thought += took
+		return
+	}
+	said := s.th.ThinkMark + " thought for " + span(took)
+	if s.thoughtToBudget() {
+		// The server cut the thought at its budget and put gnosh's note
+		// at its end: so that a thought that stops short reads as that.
+		said += fmt.Sprintf(", up to its budget of %d tokens", s.info.ThinkingBudget)
+	}
+	line := s.th.Thinking.Render(said)
+	if h := s.transcriptHint(s.th.Sep, "shows it"); h != "" {
+		line += s.th.Quiet.Render(h)
+	}
 	s.begin(blkThinking)
 	s.put(fit(s.m, line, s.cols))
 }
@@ -468,6 +532,12 @@ func (s *session) replied(ev *agent.ReplyEvent) {
 // cut writes a call that never got a result into the scrollback, with the
 // reason, and takes it out of the calls in flight.
 func (s *session) cut(c *call, why string) {
+	if s.focus {
+		s.fold.add(&agent.ToolEndEvent{CallID: c.id, Name: c.name, Denied: true})
+		s.drop(c)
+		s.dirty = true
+		return
+	}
 	var action *core.Action
 	if c.started {
 		action = &c.action
@@ -506,6 +576,12 @@ func (s *session) retry(ev *agent.RetryEvent) {
 	} else {
 		s.endThinking()
 	}
+	if ev.FellBack != "" {
+		// Not a wait: the fallback model is asked at once.
+		s.notice(agent.LevelWarning, ev.Message)
+		s.retries, s.retryKind = 0, ""
+		return
+	}
 	kind := fmt.Sprintf("%s/%d", ev.Kind, ev.Status)
 	if s.retries == 0 {
 		s.retrySince = now
@@ -527,13 +603,22 @@ func (s *session) toolEnd(ev *agent.ToolEndEvent) {
 		s.drop(c)
 	}
 	s.noteChange(ev)
-	rows, compact := s.endBlock(c, ev)
-	kind := blkTool
-	if compact {
-		kind = blkToolLine
+	if s.foldsCall(c, ev) {
+		s.fold.add(ev)
+		s.dirty = true
+	} else {
+		rows, compact := s.endBlock(c, ev)
+		kind := blkTool
+		if compact && len(ev.Result.Notes) == 0 {
+			kind = blkToolLine
+		}
+		for _, n := range ev.Result.Notes {
+			// (Under the call: what came of it besides its result.)
+			rows = append(rows, wrap(s.m, s.th.Quiet.Render(oneLine(n)), s.cols, "  ", "  ")...)
+		}
+		s.begin(kind)
+		s.put(rows...)
 	}
-	s.begin(kind)
-	s.put(rows...)
 	started := false
 	for _, x := range s.calls {
 		started = started || x.started
@@ -558,6 +643,9 @@ func (s *session) hooks(ev *app.HookEvent) {
 	for _, r := range ev.Records {
 		// The words are the hook package's own account of the record.
 		line := "hook: " + oneLine(r.String())
+		if reason := oneLine(r.Reason); string(r.Result) == "blocked" && reason != "" && strings.HasSuffix(line, reason) {
+			s.hookSaid = reason
+		}
 		// "none" is that package's word for a hook that ran and had
 		// nothing to say, and "background" for one started in the
 		// background, which decides nothing.
@@ -573,7 +661,8 @@ func (s *session) hooks(ev *app.HookEvent) {
 			s.notice(agent.LevelWarning, line)
 		}
 	}
-	if silent > 0 && c != nil {
+	if silent > 0 && c != nil && !s.focus {
+		// (In focus view a call whose hooks said nothing folds.)
 		c.hooks = append(c.hooks, fmt.Sprintf("%s ran on %s and had nothing to say",
 			count(silent, "hook", "hooks"), oneLine(fmt.Sprint(ev.Event))))
 	}
@@ -583,13 +672,31 @@ func (s *session) hooks(ev *app.HookEvent) {
 func (s *session) summary(ev *agent.SummaryEvent) {
 	switch {
 	case ev.Phase == "start":
-		s.say(fmt.Sprintf("Summarizing the conversation to make room (%s). On a local model this can take minutes; Esc stops it.", ev.Trigger))
+		stop := "."
+		if k := s.keyHint("chat:cancel", "Esc"); k != "" {
+			stop = "; " + k + " stops it."
+		}
+		switch ev.Part {
+		case "before":
+			s.say("Summarizing the conversation before your prompt; what followed it stays. On a local model this can take minutes" + stop)
+		case "after":
+			s.say("Summarizing what followed your prompt, to go back to before it. On a local model this can take minutes" + stop)
+		default:
+			s.say(fmt.Sprintf("Summarizing the conversation to make room (%s). On a local model this can take minutes%s", ev.Trigger, stop))
+		}
 		s.setPhase(phSummary)
 	case ev.Err != nil:
 		s.notice(agent.LevelWarning, fmt.Sprintf("No summary was made: %v", ev.Err))
 		s.setPhase(phWorking)
+	case ev.Part == "after":
+		// (The rewind that follows says what became of it.)
+		s.setPhase(phWorking)
 	default:
-		s.say(fmt.Sprintf("The conversation was summarized: about %s tokens before, about %s after.", tokens(ev.PreTokens), tokens(ev.PostTokens)))
+		what := "The conversation was summarized"
+		if ev.Part == "before" {
+			what = "The conversation before your prompt was summarized"
+		}
+		s.say(fmt.Sprintf("%s: about %s tokens before, about %s after.", what, tokens(ev.PreTokens), tokens(ev.PostTokens)))
 		s.setPhase(phWorking)
 		s.ctxs = s.c.Context()
 	}
@@ -598,6 +705,10 @@ func (s *session) summary(ev *agent.SummaryEvent) {
 // turnEnd writes how a turn ended. Every way a turn can end is said in
 // plain words; a stopped turn says that the person stopped it.
 func (s *session) turnEnd(res agent.TurnResult) {
+	// (The model may have made or removed files: the fuzzy @ search lists
+	// the project again when it is next used.)
+	s.index.stale = true
+	s.suggest.answers = nil
 	s.endReply()
 	for _, c := range append([]*call(nil), s.calls...) {
 		s.cut(c, "no result: the turn ended first")
@@ -605,6 +716,7 @@ func (s *session) turnEnd(res agent.TurnResult) {
 	s.reply = reply{}
 	s.stopping = false
 	s.retries, s.retryKind = 0, ""
+	s.failHint = ""
 
 	th := &s.th
 	var stats []string
@@ -624,12 +736,27 @@ func (s *session) turnEnd(res agent.TurnResult) {
 	detail := strings.TrimSpace(res.Detail)
 	switch res.Reason {
 	case agent.EndCompleted:
+		if s.info.HideTurnDuration {
+			// (The showTurnDuration option is off.)
+			break
+		}
 		s.begin(blkTurn)
 		s.put(wrap(s.m, th.Quiet.Render("done"+tail), s.cols, "", "  ")...)
 	case agent.EndStopped:
 		s.begin(blkTurn)
 		s.put(wrap(s.m, th.WarnLabel.Render("stopped")+th.Quiet.Render(" by you"+tail+th.Sep+"what was done is kept"), s.cols, "", "  ")...)
 	case agent.EndHalted:
+		if res.Planned {
+			// A tool that ended the turn as it meant to (a self-paced
+			// /loop's run that scheduled the next one, a move into a work
+			// tree): done, not a warning that it "was ended"; its call
+			// above says what comes next.
+			if !s.info.HideTurnDuration {
+				s.begin(blkTurn)
+				s.put(wrap(s.m, th.Quiet.Render("done"+tail), s.cols, "", "  ")...)
+			}
+			break
+		}
 		s.notice(agent.LevelWarning, "The turn was ended"+tail+": "+firstNonEmpty(detail, "something ended it and gave no reason")+".")
 	case agent.EndModelStopped:
 		words := "The model chose to stop" + tail + ". Its reason: " + firstNonEmpty(detail, "(it gave none)")
@@ -643,6 +770,7 @@ func (s *session) turnEnd(res agent.TurnResult) {
 			words = res.Err.Error()
 		}
 		s.notice(agent.LevelError, firstNonEmpty(words, "The turn failed, and nothing said why."))
+		s.failHint = failHintFor(res.ErrorKind)
 	}
 	s.setPhase(phWorking)
 	s.refresh()
@@ -662,10 +790,7 @@ func (s *session) returned(ev *agent.PromptReturnedEvent) {
 	if ev.Prompt.Hidden {
 		return
 	}
-	d := editor.Draft{Text: ev.Prompt.Text}
-	if spans, ok := ev.Prompt.Meta[metaPastes].([]editor.Span); ok {
-		d.Pastes = spans
-	}
+	d := editor.Draft{Text: ev.Prompt.Text, Pastes: pastesOf(ev.Prompt.Meta)}
 	s.restore(d)
 	s.attach = append(s.attach, ev.Prompt.Attachments...)
 	s.notice(agent.LevelWarning, "Your prompt was not sent: "+firstNonEmpty(ev.Reason, string(ev.Why))+"\nIt is back in the prompt box.")
@@ -708,4 +833,11 @@ func (s *session) retitle() {
 	}
 	s.titled = want
 	_ = s.host.title(want)
+}
+
+// thoughtToBudget reports whether the thought of the reply now arriving
+// was cut at its budget: it ends with the note the server puts there.
+func (s *session) thoughtToBudget() bool {
+	note := strings.TrimSpace(s.info.BudgetNote)
+	return note != "" && s.info.ThinkingBudget > 0 && strings.HasSuffix(strings.TrimSpace(s.reply.think.String()), note)
 }

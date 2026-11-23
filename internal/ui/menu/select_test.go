@@ -115,6 +115,27 @@ func TestSelectMoves(t *testing.T) {
 	g.screen(-1, 0, "Pick one", "  1. Option 1", "  2. Option 2", "  3. Option 3", "> 4. Option 4", "Enter choose · ↑↓ move · Esc cancel")
 }
 
+// On a question about letting something happen the cursor keys stop at
+// the ends, and a number past the last option goes to the no without
+// choosing it.
+func TestSelectNoWrap(t *testing.T) {
+	s := numbered(3, SelectOptions{NoWrap: true, RefuseRow: 3})
+	g := newRig(t, 40, s)
+	for _, c := range []struct {
+		key  string
+		want int
+	}{
+		{`<Up>`, 0}, {`"k"`, 0}, {`<End>`, 2}, {`<Down>`, 2}, {`"j"`, 2}, {`<Tab>`, 2}, {`<Home>`, 0}, {`"7"`, 2}, {`<Up>`, 1},
+	} {
+		if res := g.do(c.key).last; res.Done {
+			t.Fatalf("%s chose option %d", c.key, res.Index)
+		}
+		if s.Selected() != c.want {
+			t.Fatalf("after %s the cursor is on option %d, want %d", c.key, s.Selected(), c.want)
+		}
+	}
+}
+
 // Enter, the number and the option's own key all choose.
 func TestSelectChooses(t *testing.T) {
 	for _, k := range []string{`<Down> <Down> <Enter>`, `"3"`, `<End> <Up> <Ctrl+M>`, `<Down>*2 <Ctrl+J>`} {

@@ -111,8 +111,10 @@ var roTable = map[string]roSpec{
 	// attached, and is left out: "od -w file" must not lose its file.)
 	"od": {short: "abcdfilosvx", valued: "AjNSt",
 		long: "--address-radix= --skip-bytes= --read-bytes= --strings --strings= --format= --output-duplicates --width= --endian= --traditional"},
+	// (hexdump's --format-file is left out: the file it names is read, and
+	// only the -f spelling of it is followed as one.)
 	"hexdump": {short: "bcCdovx", valued: "ens", pathFlags: "f",
-		long: "--one-byte-octal --one-byte-char --canonical --two-bytes-decimal --two-bytes-octal --two-bytes-hex --format= --format-file= --length= --skip= --no-squeezing --color --color="},
+		long: "--one-byte-octal --one-byte-char --canonical --two-bytes-decimal --two-bytes-octal --two-bytes-hex --format= --length= --skip= --no-squeezing --color --color="},
 	"cut":      {short: "sz", valued: "dfcb", long: "--delimiter= --fields= --characters= --bytes= --only-delimited --complement --output-delimiter= --zero-terminated"},
 	"tr":       {short: "dscCt", ops: opsWords, long: "--delete --squeeze-repeats --complement --truncate-set1"},
 	"basename": {short: "az", valued: "s", ops: opsWords, long: "--multiple --suffix= --zero"},
@@ -146,6 +148,11 @@ type cmdFacts struct {
 	fsEdit bool
 	// reads and writes are the operands the command reads and changes.
 	reads, writes []word
+	// lands are the places a copy (cp, mv, ln, install, rsync, scp) puts
+	// its sources in a folder (copyLanding). They are held to the Read and
+	// Edit rules and the protected paths; where the copy lands for the
+	// working directories, cpLands says.
+	lands []copyLanding
 	// rewrites are files the command may put back as they are (see
 	// sedFacts): nothing in them changes, but a link among them would be
 	// replaced by a copy of what it leads to.
@@ -344,6 +351,7 @@ func facts(words []word) (f cmdFacts) {
 		if !f.readOnly && !f.fsEdit {
 			f.reads = moreWords(f.reads, namedFiles(f.name, args))
 			f.reads = moreWords(f.reads, mentioned(f.name, args))
+			f.writes = moreWords(f.writes, outputs(f.name, args))
 		}
 	}()
 	// A program reached by a path is not the one the table describes.
@@ -435,7 +443,14 @@ func facts(words []word) (f cmdFacts) {
 					f.why = "a file name pattern stands where " + f.name + "'s own pattern goes"
 					return f
 				}
-				ops = ops[1:]
+				// A computed word outside quotes is cut into words at its
+				// blanks: the first is the pattern and the others are
+				// files the command reads ("grep `git status` x" read the
+				// .env git status named; oracle seed 134). Such a word is
+				// held as a file too.
+				if !mayBecomeWords(ops[0]) {
+					ops = ops[1:]
+				}
 			}
 		}
 		if spec.max > 0 && len(ops) > spec.max {
@@ -500,166 +515,6 @@ func moreWords(ws, more []word) []word {
 	return ws
 }
 
-// namedFiles returns the arguments of a command of the read-only table
-// that may name files, when the command could not be judged in full:
-// every argument that is not a flag, and for a command that takes a
-// pattern first, every one after it.
-func namedFiles(name string, args []word) []word {
-	name = progKey(name)
-	spec, ok := roTable[name]
-	switch {
-	case name == "git" || name == "find" || name == "stat" || name == "test" || name == "[":
-	case !ok || spec.ops == opsWords || spec.ops == opsNone:
-		return nil
-	}
-	if spec.ops == opsPattern {
-		return patternFiles(name, args)
-	}
-	var out []word
-	for _, a := range args {
-		if a.static() && strings.HasPrefix(a.joined(), "-") && !a.tilde {
-			continue
-		}
-		out = append(out, a)
-		if name == "git" && a.static() {
-			if p, ok := revPath(a.joined()); ok {
-				out = append(out, partOf(a, p))
-			}
-		}
-	}
-	return out
-}
-
-// patternValued are the letters that take a value, for the programs
-// whose first operand is a pattern or a program text and not a file.
-var patternValued = map[string]string{
-	"grep": "efmABCdD", "egrep": "efmABCdD", "fgrep": "efmABCdD", "rg": "efgtTABCmjMdEr", "awk": "efvF",
-}
-
-// patternFiles returns the files such a program is handed: its operands
-// but the first, which is the pattern (to awk, the program), unless a
-// flag gave that (grep -e x, grep -ex, awk -f prog); and the file a flag
-// names for it (grep -f file). The value of any other flag is passed
-// over, wherever it is written: "grep -A 2 x f" reads f and nothing
-// named 2.
-func patternFiles(name string, args []word) []word {
-	valued := patternValued[progKey(name)]
-	var out []word
-	sawPat, rest := false, false
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if rest || !a.static() || !strings.HasPrefix(a.joined(), "-") || a.tilde || a.joined() == "-" {
-			out = append(out, a)
-			continue
-		}
-		s := a.joined()
-		switch {
-		case s == "--":
-			rest = true
-		case strings.HasPrefix(s, "--"):
-			// --regexp=x gives the pattern (--source=x, to awk), --file=f
-			// a file of them.
-			switch flag, val, has := strings.Cut(s, "="); {
-			case flag == "--file" && has:
-				sawPat = true
-				out = append(out, partOf(a, val))
-			case flag == "--file" && i+1 < len(args):
-				sawPat = true
-				i++
-				out = append(out, args[i])
-			case flag == "--regexp" || flag == "--source" || flag == "--file":
-				sawPat = true
-				if !has {
-					i++ // the pattern is the next word
-				}
-			}
-		default:
-			// Letters: one that takes a value ends them, with the value
-			// written onto it or in the next word. -e gives the pattern
-			// and -f a file of them.
-		letters:
-			for j := 1; j < len(s); j++ {
-				c := s[j]
-				if strings.IndexByte(valued, c) < 0 {
-					continue
-				}
-				sawPat = sawPat || c == 'e' || c == 'f'
-				switch {
-				case j+1 < len(s) && c == 'f':
-					out = append(out, partOf(a, s[j+1:]))
-				case j+1 < len(s):
-				case i+1 < len(args):
-					i++
-					if c == 'f' {
-						out = append(out, args[i])
-					}
-				}
-				break letters
-			}
-		}
-	}
-	// (A first operand that is a file name pattern or braces is several
-	// words to the shell, and all but the first of those are files.)
-	if !sawPat && len(out) > 0 && !out[0].glob && !out[0].brace {
-		out = out[1:]
-	}
-	return out
-}
-
-// wordsOnly are the builtins and programs whose arguments are words and
-// not files, beside those the table of read-only commands says so of.
-var wordsOnly = map[string]bool{
-	"export": true, "declare": true, "typeset": true, "local": true, "readonly": true, "alias": true, "unalias": true,
-	"set": true, "shopt": true, "read": true, "eval": true, "trap": true, "let": true, ":": true, "true": true, "false": true,
-	"exit": true, "return": true, "shift": true, "unset": true, "wait": true, "kill": true, "jobs": true, "type": true,
-	"hash": true, "getopts": true, "mapfile": true, "readarray": true, "compgen": true, "complete": true, "umask": true,
-	"ulimit": true, "bg": true, "fg": true, "disown": true, "break": true, "continue": true, "history": true, "fc": true,
-	"pushd": true, "popd": true, "dirs": true, "enable": true, "builtin": true, "command": true, "exec": true, "time": true,
-	"sleep": true, "seq": true, "expr": true, "yes": true, "git": true, "find": true, "sed": true, "cd": true, "test": true,
-	"[": true, "[[": true, "date": true, "mkdir": true, "touch": true, "rm": true, "rmdir": true, "mv": true, "cp": true,
-	"printf": true, "echo": true, "ssh": true,
-}
-
-// mentioned returns the words of a command that may name a file, for a
-// program this package knows nothing about (tar, openssl, docker, a
-// shell handed a script): every argument that is no flag, what stands
-// after the = of one that is (--env-file=.env), and what stands after an
-// @. They are held against the Read and Edit rules like the operands of
-// a program that is known: a rule on .env is a rule on "base64 .env"
-// and on "tar cf x.tar .env" alike. (A word that only looks like a file
-// is refused too: "mytool --exclude .env".)
-func mentioned(name string, args []word) []word {
-	name = progKey(name)
-	if _, ok := roTable[name]; ok || wordsOnly[name] {
-		return nil
-	}
-	var out []word
-	for _, a := range args {
-		if !a.static() {
-			if !strings.HasPrefix(a.raw, "-") {
-				out = append(out, a)
-			}
-			continue
-		}
-		l := a.joined()
-		_, val, eq := strings.Cut(l, "=")
-		switch {
-		case eq && val != "":
-			// (bash expands a tilde after the = of a word that looks
-			// like an assignment: "tool cfg=~/x".)
-			part := partOf(a, val)
-			part.tilde = a.eqTilde && strings.HasPrefix(val, "~")
-			out = append(out, part)
-		case strings.HasPrefix(l, "@") && len(l) > 1:
-			out = append(out, partOf(a, l[1:]))
-		}
-		if !strings.HasPrefix(l, "-") || a.tilde {
-			out = append(out, a)
-		}
-	}
-	return out
-}
-
 // hasLong reports whether args holds the flag as a word of its own.
 func hasLong(args []word, flag string) bool {
 	for _, a := range args {
@@ -668,143 +523,6 @@ func hasLong(args []word, flag string) bool {
 		}
 	}
 	return false
-}
-
-// fillTargets records the files the well-known file commands read and
-// write, whatever their flags, so that Read and Edit deny rules and the
-// protected paths can be checked even when the command is not otherwise
-// understood.
-func fillTargets(f *cmdFacts, args []word) {
-	var ops []word
-	for _, a := range args {
-		if a.static() && strings.HasPrefix(a.joined(), "-") && !a.tilde {
-			continue
-		}
-		ops = append(ops, a)
-	}
-	// outFlag returns the files a command is told to write by one of the
-	// flags given: "-o file", "-ofile", "--output file", "--output=file".
-	outFlag := func(flags ...string) []word {
-		var out []word
-		for i, a := range args {
-			if !a.static() {
-				continue
-			}
-			l := a.joined()
-			for _, fl := range flags {
-				switch {
-				case l == fl && i+1 < len(args):
-					out = append(out, args[i+1])
-				case strings.HasPrefix(fl, "--") && strings.HasPrefix(l, fl+"="):
-					out = append(out, partOf(a, l[len(fl)+1:]))
-				case !strings.HasPrefix(fl, "--") && strings.HasPrefix(l, fl) && len(l) > len(fl):
-					out = append(out, partOf(a, l[len(fl):]))
-				}
-			}
-		}
-		return out
-	}
-	// (By the program's key: these are for the rules that guard.)
-	switch progKey(f.name) {
-	case "sort":
-		f.reads, f.writes = ops, outFlag("-o", "--output")
-	case "uniq":
-		// The second file is the one uniq writes, and a pattern may be
-		// two files.
-		f.reads = ops
-		if len(ops) > 1 {
-			f.writes = ops[1:]
-		}
-		for _, o := range ops {
-			if o.glob || o.brace {
-				f.writes = ops // which of them is the second file, nobody knows
-				break
-			}
-		}
-	case "curl":
-		f.writes = outFlag("-o", "--output")
-		// What curl sends: the file after -T, and after an @ in the data
-		// it is given ("-d @.env", "-F f=@.env").
-		f.reads = outFlag("-T", "--upload-file")
-		for _, a := range args {
-			if !a.static() {
-				continue
-			}
-			if _, file, ok := strings.Cut(a.joined(), "@"); ok && file != "" && !strings.Contains(a.joined(), "://") {
-				f.reads = append(f.reads, partOf(a, strings.TrimSuffix(strings.TrimPrefix(file, "\""), "\"")))
-			}
-		}
-	case "wget":
-		f.writes = outFlag("-O", "--output-document")
-	case "time":
-		f.writes = outFlag("-o", "--output")
-	case "git":
-		f.writes = outFlag("--output")
-	case "cat", "head", "tail", "less", "more", "nl", "bat", "batcat", "wc", "cut", "tac", "strings", "xxd", "hexdump", "od", "base64", "source", ".",
-		"vim", "vi", "nvim", "nano", "emacs", "view", "open", "xdg-open", "code", "jq", "yq", "cmp", "comm", "paste", "join", "column", "rev", "fold", "fmt",
-		"md5sum", "sha1sum", "sha256sum", "sha512sum", "shasum", "cksum", "md5", "b2sum", "zcat", "bzcat", "xzcat", "zstdcat", "pbcopy":
-		f.reads = ops
-	case "gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "zstd", "unzstd", "mkfifo", "mknod", "chgrp", "chflags":
-		f.writes = ops
-	case "perl", "ruby":
-		// -i edits in place the files named after the script.
-		for _, a := range args {
-			if l := a.lit(); len(l) > 1 && l[0] == '-' && l[1] != '-' && strings.Contains(l, "i") && !strings.HasPrefix(l, "-e") {
-				f.writes = ops
-				break
-			}
-		}
-	case "grep", "egrep", "fgrep", "rg", "awk":
-		// The first operand is the pattern or the program, unless a flag
-		// gave that, or it is a file name pattern or braces.
-		f.reads = patternFiles(f.name, args)
-	case "tee", "touch", "mkdir", "rm", "rmdir", "truncate", "shred", "unlink", "chmod", "chown":
-		f.writes = ops
-	case "mv":
-		f.writes = ops
-	case "cp", "ln", "install", "rsync", "scp":
-		if len(ops) > 0 {
-			f.reads = ops[:len(ops)-1]
-			f.writes = ops[len(ops)-1:]
-		}
-	case "sed":
-		// The script is the first operand unless -e or -f gave one.
-		hasE := false
-		inPlace := false
-		for _, a := range args {
-			l := a.lit()
-			if l == "-e" || l == "-f" || strings.HasPrefix(l, "--expression") || strings.HasPrefix(l, "--file") {
-				hasE = true
-			}
-			if strings.HasPrefix(l, "-") && !strings.HasPrefix(l, "--") && strings.Contains(l, "i") || strings.HasPrefix(l, "--in-place") {
-				inPlace = true
-			}
-		}
-		if !hasE && len(ops) > 0 && !ops[0].glob && !ops[0].brace {
-			ops = ops[1:]
-		}
-		if inPlace {
-			f.writes = ops
-		} else {
-			f.reads = ops
-		}
-	case "dd":
-		for _, a := range ops {
-			l := a.lit()
-			// bash expands a tilde after the = of a word like this one.
-			operand := func(v string) word {
-				w := partOf(a, v)
-				w.tilde = a.eqTilde && strings.HasPrefix(v, "~")
-				return w
-			}
-			if v, ok := strings.CutPrefix(l, "of="); ok {
-				f.writes = append(f.writes, operand(v))
-			}
-			if v, ok := strings.CutPrefix(l, "if="); ok {
-				f.reads = append(f.reads, operand(v))
-			}
-		}
-	}
 }
 
 // cdFacts judges cd: with one plain directory it only moves the shell.
@@ -1800,5 +1518,8 @@ func fsFacts(f *cmdFacts, args []word) {
 		f.reads, f.writes = ops[:len(ops)-1:len(ops)-1], ops[len(ops)-1:]
 	}
 	f.writes = append(f.writes[:len(f.writes):len(f.writes)], late...)
+	if f.name == "cp" || f.name == "mv" {
+		_, _, f.lands = copiedInto(f.name, args)
+	}
 	f.fsEdit = true
 }

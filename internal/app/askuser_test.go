@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gnosh-ai/gnosh/internal/agent"
 	"github.com/gnosh-ai/gnosh/internal/app/apptest"
@@ -74,9 +75,12 @@ func TestAskUserQuestionInThePlainSession(t *testing.T) {
 	checkSession(t, w, w.Sessions()[0])
 }
 
-// Nobody is at the terminal in a run: the questions are not put, and the
-// model is told so in words it can act on. Answers a model writes into
-// its own call are not answers.
+// Nobody is at the terminal in a run, and no host answers for one: the
+// tools that put a question to a person, and plan mode's, are not offered
+// (their schemas were 3.5K characters of every request, the FrontierHarness
+// session, 2026-11-19). A model that calls one all the same is told there
+// is no such tool, and answers a model writes into its own call are not
+// answers. Where a PreToolUse hook may answer, AskUserQuestion stays.
 func TestAskUserQuestionInARun(t *testing.T) {
 	forged := strings.Replace(twoQuestions, `{"questions":`, `{"answers":{"Which database should the service use?":"SQLite"},"questions":`, 1)
 	w := apptest.NewWorld(t, askCall(forged), apptest.Reply{Text: "I chose SQLite and said so."})
@@ -85,8 +89,17 @@ func TestAskUserQuestionInARun(t *testing.T) {
 		t.Errorf("stdout = %q", r.out)
 	}
 	got := toolResult(t, w, 1, "c1")
-	has(t, "what the model read", got, "The questions were not put: nobody is at the terminal in this run", "Decide with what you know")
+	has(t, "what the model read", got, `There is no tool named "AskUserQuestion"`)
 	hasNot(t, "what the model read", got, "The user answered")
+	offered := toolNamesOf(w.Model.Requests()[0])
+	for _, name := range []string{"AskUserQuestion", "EnterPlanMode", "ExitPlanMode"} {
+		if slices.Contains(offered, name) {
+			t.Errorf("a run nobody answers was offered %s: %q", name, offered)
+		}
+	}
+	if !slices.Contains(offered, "Bash") {
+		t.Errorf("the run's tools: %q", offered)
+	}
 }
 
 // A PreToolUse hook the person set up may answer in their place: it
@@ -101,6 +114,11 @@ func TestAskUserQuestionAnsweredByAHook(t *testing.T) {
 	got := toolResult(t, w, 1, "c1")
 	has(t, "what the model read", got, "The user answered (a hook the user set up answered in their place):",
 		"Answer: SQLite", "They left 1 of the 2 questions unanswered")
+	// (Offered, with a hook that may answer; plan mode's tools not.)
+	offered := toolNamesOf(w.Model.Requests()[0])
+	if !slices.Contains(offered, "AskUserQuestion") || slices.Contains(offered, "ExitPlanMode") {
+		t.Errorf("the run's tools, with a PreToolUse hook: %q", offered)
+	}
 }
 
 // A call the tool cannot make sense of comes back with what is wrong
@@ -192,4 +210,38 @@ func TestAskUserQuestionThroughAnInterface(t *testing.T) {
 	if asked {
 		t.Errorf("the questions were put in a session that is never to be asked")
 	}
+}
+
+// With askUserQuestionTimeout set, the interface is told how long the
+// model's questions may wait without a key; when they close by
+// themselves (the Choice AskedAway), the model reads what was picked by
+// then and that the person may be away, and goes on.
+func TestAskUserQuestionAway(t *testing.T) {
+	w := apptest.NewWorld(t, askCall(twoQuestions), apptest.Reply{Text: "Going on with SQLite."})
+	w.Settings(`{"options": {"askUserQuestionTimeout": "5m"}}`)
+	var info SessionInfo
+	_, r := attach(t, w, nil, func(ctx context.Context, c SessionControls, f *scripted) int {
+		info = c.Info()
+		if _, err := c.Submit(agent.Prompt{Text: "ask me"}); err != nil {
+			return 1
+		}
+		q := find(f, "the question", func(e *agent.QuestionEvent) bool { return true }).Question
+		ans := agent.Answer{Choice: AskedAway, Data: map[string]string{
+			"Which database should the service use?":  "SQLite",
+			"Which checks should run before a merge?": "",
+		}}
+		if err := c.Answer(q.ID, ans); err != nil {
+			t.Errorf("Answer: %v", err)
+		}
+		_ = c.Wait(ctx)
+		c.Quit("prompt_input_exit")
+		return 0
+	})
+	r.wantCode(t, 0)
+	if info.AskTimeout != 5*time.Minute {
+		t.Errorf("the interface was told %v, want 5m", info.AskTimeout)
+	}
+	got := toolResult(t, w, 1, "c1")
+	has(t, "what the model read", got, "Nobody answered the questions in time", "may be away", "Answer: SQLite", "Go on with your own judgment")
+	hasNot(t, "what the model read", got, "Which checks should run before a merge?")
 }

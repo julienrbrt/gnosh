@@ -1,14 +1,21 @@
 package config
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"maps"
+	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/gnosh-ai/gnosh/internal/filelock"
 )
 
 // State is what the user chose inside gnosh, kept between sessions: the
@@ -31,10 +38,20 @@ type State struct {
 	// as the JSON value a config file's "options" would hold. They are
 	// read as gnosh.json's are.
 	Options map[string]json.RawMessage
+	// ReviewMaxFindings is how many findings /code-review reports, chosen
+	// with --max-findings: a number, or "all". Empty means no choice: as
+	// many as the review's level asks.
+	ReviewMaxFindings string
 
 	// extra holds keys this gnosh does not know, so that writing the file
 	// back does not drop what another version put there.
 	extra map[string]json.RawMessage
+	// read are the options as the file held them when it was read: one
+	// that is written back unchanged is not checked again, so an option
+	// another version of gnosh saved, which this one does not know, does
+	// not stop every later choice from being saved (the settings-commands
+	// review of 2026-11-20).
+	read map[string]json.RawMessage
 }
 
 // stateVersion is the version written to the state file.
@@ -51,10 +68,11 @@ type stateFile struct {
 	Thinking          map[string]string          `json:"thinking,omitempty"`
 	AutoCompactWindow int                        `json:"autoCompactWindow,omitempty"`
 	Options           map[string]json.RawMessage `json:"options,omitempty"`
+	ReviewMaxFindings string                     `json:"reviewMaxFindings,omitempty"`
 }
 
 // stateKeys are the keys of stateFile, which extra never holds.
-var stateKeys = []string{"version", "models", "thinking", "autoCompactWindow", "options"}
+var stateKeys = []string{"version", "models", "thinking", "autoCompactWindow", "options", "reviewMaxFindings"}
 
 // ReadState reads the state file. A file that is not there gives an empty
 // State. A file that cannot be read or understood also gives an empty
@@ -75,7 +93,12 @@ func ReadState(fsys FS, path string) (State, []Problem) {
 	if err := json.Unmarshal(data, &f); err != nil {
 		return warn("the state file is not JSON gnosh can read, so the model and thinking level chosen earlier are not in force. Choosing them again with /model writes a new file.")
 	}
-	st := State{Model: f.Models.Model, SmallModel: f.Models.SmallModel, Thinking: f.Thinking, AutoCompactWindow: f.AutoCompactWindow, Options: f.Options}
+	st := State{Model: f.Models.Model, SmallModel: f.Models.SmallModel, Thinking: f.Thinking, AutoCompactWindow: f.AutoCompactWindow, Options: f.Options, read: maps.Clone(f.Options)}
+	if ValidReviewMaxFindings(f.ReviewMaxFindings) {
+		// (One this gnosh cannot read is left out, not an error: /code-
+		// review then reports as its level asks.)
+		st.ReviewMaxFindings = f.ReviewMaxFindings
+	}
 	var all map[string]json.RawMessage
 	if json.Unmarshal(data, &all) == nil {
 		for _, k := range stateKeys {
@@ -107,15 +130,34 @@ func (st State) check() error {
 	if w := st.AutoCompactWindow; w != 0 && (w < 100000 || w > 1000000) {
 		return fmt.Errorf("the auto-compact window %d is not between 100000 and 1000000", w)
 	}
+	if !ValidReviewMaxFindings(st.ReviewMaxFindings) {
+		return fmt.Errorf("%q is not a number of findings (or all)", st.ReviewMaxFindings)
+	}
 	for key, raw := range st.Options {
 		if key == "autoCompactWindow" {
 			return errors.New("autoCompactWindow has a slot of its own")
+		}
+		if was, ok := st.read[key]; ok && bytes.Equal(was, raw) {
+			// As it was on disk: carried through, whether or not this
+			// gnosh knows it.
+			continue
 		}
 		if err := CheckOption(key, raw); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// ValidReviewMaxFindings reports whether s is a number of findings for
+// /code-review to report: a whole number from 1 to 1000, "all", or ""
+// for no choice.
+func ValidReviewMaxFindings(s string) bool {
+	if s == "" || s == "all" {
+		return true
+	}
+	n, err := strconv.Atoi(s)
+	return err == nil && n >= 1 && n <= 1000 && strconv.Itoa(n) == s
 }
 
 // validModelRef reports whether s has the form provider/id.
@@ -134,7 +176,7 @@ func WriteState(fsys WriteFS, path string, st State) error {
 	var f stateFile
 	f.Version = stateVersion
 	f.Models.Model, f.Models.SmallModel = st.Model, st.SmallModel
-	f.Thinking, f.AutoCompactWindow, f.Options = st.Thinking, st.AutoCompactWindow, st.Options
+	f.Thinking, f.AutoCompactWindow, f.Options, f.ReviewMaxFindings = st.Thinking, st.AutoCompactWindow, st.Options, st.ReviewMaxFindings
 	known, err := json.Marshal(f)
 	if err != nil {
 		return fmt.Errorf("the state file %s was not written: %w", path, err)
@@ -164,11 +206,31 @@ func WriteState(fsys WriteFS, path string, st State) error {
 }
 
 // UpdateState changes the state file: it reads the file as it is now,
-// hands the State to change, and writes the result. Reading again just
+// hands the State to change, and writes the result, one gnosh at a time
+// (a lock beside the file, on the machine's own disk). Reading again just
 // before writing keeps what another session saved a moment ago. If the
 // file could not be understood, change starts from an empty State and the
-// unreadable file is replaced.
+// unreadable file is replaced; a file that is there and cannot be read is
+// left as it is, and nothing is written, since what it holds would be
+// lost (the settings-commands review of 2026-11-20: two gnosh saving at
+// once lost one choice, and a file gnosh could not read was replaced
+// whole by the one new choice).
 func UpdateState(fsys WriteFS, path string, change func(*State)) error {
+	if _, ok := fsys.(OS); ok {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return fmt.Errorf("the state file %s was not written: its directory could not be made: %w", path, err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		release, err := filelock.File(ctx, path+".lock")
+		if err != nil {
+			return fmt.Errorf("the state file %s is being written by another gnosh: %w", path, err)
+		}
+		defer release()
+	}
+	if _, err := fsys.ReadFile(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("the state file %s could not be read (%v), so it was not written: what it holds would be lost", path, err)
+	}
 	st, _ := ReadState(fsys, path)
 	st.Thinking = maps.Clone(st.Thinking)
 	st.Options = maps.Clone(st.Options)

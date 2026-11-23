@@ -152,14 +152,16 @@ func forks(args []string) bool {
 }
 
 // forkOption reports whether the value of an -o, "key=value" or "key
-// value", is ForkAfterAuthentication yes.
+// value", is ForkAfterAuthentication yes (or true, which ssh takes as
+// yes).
 func forkOption(s string) bool {
 	s = strings.TrimSpace(s)
 	k, v, ok := strings.Cut(s, "=")
 	if !ok {
 		k, v, ok = strings.Cut(s, " ")
 	}
-	return ok && strings.EqualFold(strings.TrimSpace(k), "ForkAfterAuthentication") && strings.EqualFold(strings.TrimSpace(v), "yes")
+	v = strings.TrimSpace(v)
+	return ok && strings.EqualFold(strings.TrimSpace(k), "ForkAfterAuthentication") && (strings.EqualFold(v, "yes") || strings.EqualFold(v, "true"))
 }
 
 // pass writes what comes from r on to out as it comes, and hands found

@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/gnosh-ai/gnosh/internal/agent"
 	"github.com/gnosh-ai/gnosh/internal/prompt"
@@ -38,6 +39,18 @@ func (l *live) backgroundEnded(e shelltool.Ended) {
 		// Its time ran out, it printed too much, or it was stopped.
 		end.State = prompt.BackgroundStopped
 	}
+	if e.Owner != "" {
+		// A sub-agent started it. While the sub-agent works, the news is
+		// its own, as it was told it would be.
+		if sub := l.runningSub(e.Owner); sub != nil && sub.Tell(agent.Note{Text: l.texts.BackgroundEnded(end), Source: "task-notification"}) == nil {
+			return
+		}
+		// It has ended: the session's model is told, and what the
+		// sub-agent wrote of the command (its description, its first
+		// line) is not given in gnosh's words. The id and the output file
+		// say the rest.
+		end.Command = "a command a sub-agent of this session started; the sub-agent has ended"
+	}
 	_ = a.Tell(agent.Note{
 		Text:   l.texts.BackgroundEnded(end),
 		Source: "task-notification",
@@ -45,6 +58,22 @@ func (l *live) backgroundEnded(e shelltool.Ended) {
 		Wake:   true,
 	})
 }
+
+// runningSub returns the agent of the sub-agent with this session id while
+// it runs, or nil.
+func (l *live) runningSub(id string) *agent.Agent {
+	l.subMu.Lock()
+	defer l.subMu.Unlock()
+	for s := range l.subs {
+		if s.id == id && s.agent != nil {
+			return s.agent
+		}
+	}
+	return nil
+}
+
+// monitorPace is the least time between two notes of one Monitor.
+const monitorPace = 15 * time.Second
 
 // monitorLines passes on what the command of a Monitor call printed, in a
 // note that wakes an idle session, as the end of a background command
@@ -55,6 +84,11 @@ func (l *live) backgroundEnded(e shelltool.Ended) {
 // notes. The last lines of a command that ended are always taken, so that
 // they come before the news of its end.
 //
+// One Monitor passes lines on at most once in monitorPace, its first and
+// its last at once: a command that printed every few seconds woke the
+// model for each line, for up to half an hour (the hosts review of
+// 2026-11-19); its lines now go together.
+//
 // It is called on a goroutine of the shell manager's and must not block.
 func (l *live) monitorLines(w shelltool.Watched) bool {
 	a := l.agent
@@ -63,6 +97,15 @@ func (l *live) monitorLines(w shelltool.Watched) bool {
 	}
 	if !w.Last && a.State().Queued > 0 {
 		return false
+	}
+	now := l.p.now()
+	if at, ok := l.monitorSent.Load(w.ID); ok && !w.Last && now.Sub(at.(time.Time)) < monitorPace {
+		return false
+	}
+	if w.Last {
+		l.monitorSent.Delete(w.ID)
+	} else {
+		l.monitorSent.Store(w.ID, now)
 	}
 	what := firstOf(w.Description, "a command")
 	lines := countWords(len(w.Lines)+w.Left, "line", "lines")

@@ -53,7 +53,13 @@ func (s *session) choosePermissions(line string) bool {
 		opts = append(opts, menu.Option{Label: r.List + "  " + oneLine(r.Rule), Description: about})
 	}
 	opts = append(opts, menu.Option{Label: "Done"})
-	title := "Permissions (mode " + mode + "). Type a rule into one of the first rows to add it, or pick a rule to take it out."
+	// (The mode in the status line's words: "manual mode", not
+	// "default".)
+	shown, ok := modeNames[mode]
+	if !ok {
+		shown = oneLine(mode) + " mode"
+	}
+	title := "Permissions (" + shown + "). Type a rule into one of the first rows to add it, or pick a rule to take it out."
 	pick := &question{q: agent.Question{Kind: "permissions", Title: title}}
 	pick.ui = menu.NewSelect(menu.SelectOptions{Title: title, Options: opts, CancelHint: "done", Theme: s.th.Menu, Metrics: s.m})
 	pick.local = func(res menu.Result) {

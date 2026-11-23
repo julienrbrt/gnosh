@@ -8,9 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gnosh-ai/gnosh/internal/agent"
+	"github.com/gnosh-ai/gnosh/internal/core"
 	"github.com/gnosh-ai/gnosh/internal/gnodocs"
 	"github.com/gnosh-ai/gnosh/internal/hooks"
 	"github.com/gnosh-ai/gnosh/internal/instructions"
@@ -29,13 +32,50 @@ func (l *live) loadInstructions(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if l.askOutsideImports(set) {
+		if again, err := l.readInstructions(ctx); err == nil {
+			set = again
+		}
+	}
 	l.instr = set
-	for _, w := range set.Warnings() {
+	ws := set.Warnings()
+	if allow, answered := l.outsideImports(); answered && !allow {
+		// The person said no to them: not told of each again.
+		left := map[string]bool{}
+		for _, p := range set.Unapproved() {
+			left[p] = true
+		}
+		ws = slices.DeleteFunc(ws, func(w instructions.Warning) bool {
+			return w.Kind == instructions.WarnImportRefused && left[w.Path]
+		})
+	}
+	for i, w := range ws {
+		if i == warningsShown && len(ws) > warningsShown+1 {
+			// A folder with thousands of troubled files flooded the
+			// screen (the instruction-files review of 2026-11-20).
+			l.notice(agent.LevelWarning, "instructions", fmt.Sprintf("…and %d more warnings about instruction files, left unshown.", len(ws)-warningsShown))
+			break
+		}
 		l.notice(agent.LevelWarning, "instructions", w.Text)
 	}
-	l.instructionsLoaded(set.Files(), "")
+	// Long files given at the start take room from every request, and a
+	// model follows a long text less well: said, as Claude Code says it.
+	if n := utf8.RuneCountInString(l.startInstructions()); n > largeInstructions {
+		l.notice(agent.LevelWarning, "instructions", fmt.Sprintf(
+			"The instruction files given to the model at the start come to %s characters, over %s: they take room from every request, and a model follows a long text less well. /memory lists them.",
+			thousands(n), thousands(largeInstructions)))
+	}
+	l.instructionsLoaded(set.Files(), "", "")
 	return nil
 }
+
+// largeInstructions is the length, in characters, past which the
+// instruction files given at the start are said to be long.
+const largeInstructions = 40_000
+
+// warningsShown is how many warnings about the instruction files read at
+// the start are shown, one by one, before the count of the rest.
+const warningsShown = 10
 
 // readInstructions reads the instruction files as the config says to. A
 // sub-agent has a reading of its own: which of the files that load along
@@ -48,7 +88,9 @@ func (l *live) readInstructions(ctx context.Context) (*instructions.Set, error) 
 		Home:         l.cfg.Paths.Home,
 		ProjectNames: c.ProjectNames,
 		LocalNames:   c.LocalNames,
+		DotDirs:      c.DotDirs,
 		Trusted:      true,
+		Trees:        filepath.Join(l.cfg.Paths.DataDir, worktreesDir),
 		MaxDepth:     c.ImportDepth,
 		MaxBytes:     c.MaxFileBytes,
 		LateMaxChars: c.NestedMaxChars,
@@ -58,6 +100,18 @@ func (l *live) readInstructions(ctx context.Context) (*instructions.Set, error) 
 	}
 	for _, e := range c.Extra {
 		o.ProjectFiles = append(o.ProjectFiles, e.V)
+	}
+	for _, e := range c.Exclude {
+		o.Exclude = append(o.Exclude, e.V)
+	}
+	if allow, _ := l.outsideImports(); allow {
+		// The person let this project's files bring in files from
+		// outside it (importsok.go): those the read block would let the
+		// file tools read, as a file the model wrote could name any
+		// (the blocks review of 2026-11-20).
+		o.ApproveImport = func(from, target string) bool {
+			return l.engine == nil || !l.engine.ReadDenied(target)
+		}
 	}
 	if c.Off {
 		// Safe mode: no instruction file is read at all.
@@ -71,9 +125,11 @@ func (l *live) readInstructions(ctx context.Context) (*instructions.Set, error) 
 }
 
 // instructionsLoaded fires the InstructionsLoaded hooks for files that
-// were just loaded. Nothing those hooks say is read, and they are not
-// waited for.
-func (l *live) instructionsLoaded(files []instructions.File, trigger string) {
+// were just loaded, for the reason each was, or for reason when it is
+// given ("compact": given again after a summary, as Claude Code's are).
+// A rule loaded for the files it names carries its patterns, as globs.
+// Nothing those hooks say is read, and they are not waited for.
+func (l *live) instructionsLoaded(files []instructions.File, trigger, reason string) {
 	if l.hooks == nil || !l.hooks.has(hooks.InstructionsLoaded) {
 		return
 	}
@@ -82,9 +138,12 @@ func (l *live) instructionsLoaded(files []instructions.File, trigger string) {
 			Event:           hooks.InstructionsLoaded,
 			FilePath:        f.Path,
 			MemoryType:      string(f.Scope),
-			LoadReason:      string(f.Reason),
+			LoadReason:      firstOf(reason, string(f.Reason)),
 			TriggerFilePath: trigger,
 			ParentFilePath:  f.Parent,
+		}
+		if f.Reason == instructions.ReasonRuleMatch && len(f.Globs) > 0 && reason == "" {
+			in.Extra = map[string]any{"globs": f.Globs}
 		}
 		l.background(func(ctx context.Context) { _, _ = l.hooks.run(ctx, in) })
 	}
@@ -115,6 +174,16 @@ func (l *live) lateInstructionsFor(ctx context.Context, instr *instructions.Set,
 	if path == "" {
 		return nil
 	}
+	return l.lateInstructionsAt(ctx, instr, path)
+}
+
+// lateInstructionsAt is lateInstructionsFor for the file at path, however
+// the model came to look at it: with a file tool, or a shell command that
+// counts as a read (shellread.go).
+func (l *live) lateInstructionsAt(ctx context.Context, instr *instructions.Set, path string) []agent.Part {
+	if instr == nil {
+		return nil
+	}
 	files, warnings := instr.ForPath(ctx, path)
 	for _, w := range warnings {
 		l.notice(agent.LevelWarning, "instructions", w.Text)
@@ -122,12 +191,60 @@ func (l *live) lateInstructionsFor(ctx context.Context, instr *instructions.Set,
 	if len(files) == 0 {
 		return nil
 	}
-	l.instructionsLoaded(files, path)
+	l.instructionsLoaded(files, path, "")
 	text := instructions.RenderFiles(files)
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
 	return []agent.Part{{Source: "instructions", Text: prompt.Wrap(text)}}
+}
+
+// forgetGone tells instr which of the files given along the way left the
+// conversation with the part a cut took from it: those whose header is no
+// longer in what the model reads, to be given again when the model next
+// works where they apply. Each cut forgot them all, and those still in
+// view were given a second time (the instruction-files review of
+// 2026-11-20).
+func forgetGone(log *sessionLog, instr *instructions.Set) {
+	if instr == nil {
+		return
+	}
+	var late []instructions.File
+	for _, f := range instr.Files() {
+		if f.Late {
+			late = append(late, f)
+		}
+	}
+	if len(late) == 0 {
+		return
+	}
+	v, err := log.View(context.Background())
+	if err != nil {
+		instr.Forget()
+		return
+	}
+	var b strings.Builder
+	var add func([]core.Block)
+	add = func(blocks []core.Block) {
+		for _, blk := range blocks {
+			b.WriteString(blk.Text)
+			b.WriteByte('\n')
+			add(blk.Content)
+		}
+	}
+	for _, m := range v.Messages {
+		add(m.Blocks)
+	}
+	seen := b.String()
+	var gone []string
+	for _, f := range late {
+		if !strings.Contains(seen, instructions.Shown(f)) {
+			gone = append(gone, f.Path)
+		}
+	}
+	if len(gone) > 0 {
+		instr.Forget(gone...)
+	}
 }
 
 // touchedPath is the file a call of a file tool worked on: the path its
@@ -148,7 +265,10 @@ func touchedPath(done agent.ToolDone) string {
 // environment is the block that goes ahead of a session's first prompt:
 // what differs from session to session, which is why none of it is in the
 // system prompt.
-func (l *live) environment() string {
+func (l *live) environment() string { return l.texts.Environment(l.envNow()) }
+
+// envNow is where the session runs, as it stands now.
+func (l *live) envNow() prompt.Environment {
 	e := prompt.Environment{
 		Now:      l.p.now(),
 		Cwd:      l.cfg.Paths.Cwd,
@@ -166,8 +286,10 @@ func (l *live) environment() string {
 	for _, h := range l.currentHosts() {
 		e.Hosts = append(e.Hosts, prompt.Host{Name: h.Name, Machine: h.SSH, Description: h.Description})
 	}
-	e.Git = l.gitState()
-	return l.texts.Environment(e)
+	if l.cfg.Options.IncludeGitInstructions.V {
+		e.Git = l.gitState()
+	}
+	return e
 }
 
 // hostName is the machine's name, or "" when it has none to give.
@@ -193,7 +315,7 @@ func (l *live) gitState() prompt.Git {
 			g.Branch = ref
 		}
 	}
-	if !l.st.trusted && len(l.st.gitPrograms) > 0 {
+	if l.gitRunsPrograms() {
 		g.State = prompt.GitUnread
 		g.Why = "this repository's own git settings name programs that git would run, and the folder is not trusted"
 	}
@@ -294,8 +416,11 @@ func (l *live) systemPrompt() ([]string, error) {
 	if l.cfg.Options.MemoryText.V == "full" {
 		in.Memory = prompt.MemoryFull
 	}
-	// The output style chosen (outputstyle.go).
+	// The output style chosen (outputstyle.go), and the language replies
+	// are in.
 	in.Style = l.currentStyle()
+	in.Language = l.cfg.Options.Language.V
+	in.AttributionCommit, in.AttributionPR = l.cfg.Attribution.Commit, l.cfg.Attribution.PR
 	for _, c := range l.contribs {
 		if c.c.System != nil {
 			c.c.System(&in)

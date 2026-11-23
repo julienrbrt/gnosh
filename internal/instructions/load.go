@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"path"
 	"strings"
+
+	"github.com/gnosh-ai/gnosh/internal/text"
 )
 
 // loading is one pass of reading files into a Set: the start of the session,
@@ -21,6 +23,8 @@ type loading struct {
 	// scanned holds the real paths of the rules directories this pass has
 	// read, so that a link that leads back into one is not followed round.
 	scanned map[string]bool
+	// rules counts the rule files this pass has taken (rulesMost).
+	rules int
 }
 
 // begin starts a pass. The Set must be locked.
@@ -52,15 +56,61 @@ type want struct {
 	// under is a directory outside the project root that was approved as a
 	// whole: what really lies inside it needs no further asking.
 	under string
+	// fence is the directory, link-free, that a project's file may bring
+	// files in from without asking (fenceAt); "" means the project root.
+	fence string
 }
 
 // outside reports whether the file or directory at real, a link-free path,
-// lies somewhere that w may not read from without asking.
+// lies somewhere that w may not read from without asking. Where the person
+// keeps keys is such a place for a project's file wherever its fence is.
 func (w want) outside(s *Set, real string) bool {
-	if w.free || within(real, s.realRoot) {
+	if w.free {
+		return false
+	}
+	if s.secretPath(real) {
+		return true
+	}
+	fence := w.fence
+	if fence == "" {
+		fence = s.realRoot
+	}
+	if within(real, fence) {
 		return false
 	}
 	return w.under == "" || !within(real, w.under)
+}
+
+// fenceAt is the directory, with its links followed, that a project's file
+// found in dir may bring files in from without asking: the top of the
+// repository it lies in below the project root, a repository cloned or
+// vendored there being a project of its own; otherwise the project root;
+// otherwise, where the root is the home directory, a directory that holds
+// it or the top of the disk, dir itself. A session started in one of those
+// made every key the person has, and every other project's files, a
+// nested CLAUDE.md's to import (the instruction-files review of
+// 2026-11-20).
+func (l *loading) fenceAt(dir string) string {
+	s := l.s
+	real, err := l.k.realDir(dir)
+	if err != nil {
+		real = dir
+	}
+	for d := real; d != s.realRoot && within(d, s.realRoot) && !s.wide(d); d = path.Dir(d) {
+		if l.repoTop(d) {
+			return d
+		}
+	}
+	if !s.wide(s.realRoot) {
+		return s.realRoot
+	}
+	return real
+}
+
+// repoTop reports whether d, a link-free directory, is the top of a git
+// work tree.
+func (l *loading) repoTop(d string) bool {
+	return l.k.probe(path.Join(d, ".git")).err == nil
 }
 
 // fetched is a file that was found, allowed and read.
@@ -126,12 +176,16 @@ func (l *loading) dir(dir string, late bool, trigger string) {
 	s := l.s
 	above := l.above(dir)
 	t := want{scope: ScopeProject, kind: KindMain, reason: ReasonStart, base: dir, above: above, free: above}
+	if !above {
+		t.fence = l.fenceAt(dir)
+	}
 	if late {
 		t.reason, t.late, t.trigger = ReasonNested, true, trigger
 	}
+	dots := l.dots(dir)
 	for _, name := range s.o.ProjectNames {
 		l.named(t, path.Join(dir, name))
-		for _, dot := range s.o.DotDirs {
+		for _, dot := range dots {
 			l.named(t, path.Join(dir, dot, name))
 		}
 	}
@@ -140,12 +194,12 @@ func (l *loading) dir(dir string, late bool, trigger string) {
 		ft.kind = KindFallback
 		for _, name := range s.o.FallbackNames {
 			l.named(ft, path.Join(dir, name))
-			for _, dot := range s.o.DotDirs {
+			for _, dot := range dots {
 				l.named(ft, path.Join(dir, dot, name))
 			}
 		}
 	}
-	for _, dot := range s.o.DotDirs {
+	for _, dot := range dots {
 		l.rulesDir(path.Join(dir, dot, s.o.RulesDir), t)
 	}
 	lt := t
@@ -153,6 +207,20 @@ func (l *loading) dir(dir string, late bool, trigger string) {
 	for _, name := range s.o.LocalNames {
 		l.named(lt, path.Join(dir, name))
 	}
+}
+
+// dots are the dot directories read in dir: none in the home directory,
+// whose ~/.claude holds Claude Code's own files for the person, which gnosh
+// does not read (the person's own are gnosh's, CFG-20 and DECISIONS 245),
+// and which a walk up from a project below the home directory read as the
+// project's (the instruction-files review of 2026-11-20).
+func (l *loading) dots(dir string) []string {
+	if s := l.s; s.realHome != "" {
+		if real, err := l.k.realDir(dir); err == nil && real == s.realHome {
+			return nil
+		}
+	}
+	return l.s.o.DotDirs
 }
 
 // above reports whether dir lies above the project root, going by where its
@@ -186,7 +254,7 @@ func (l *loading) hasMain(dir string) bool {
 		if l.present(dir, path.Join(dir, name), above) {
 			return true
 		}
-		for _, dot := range s.o.DotDirs {
+		for _, dot := range l.dots(dir) {
 			if l.present(dir, path.Join(dir, dot, name), above) {
 				return true
 			}
@@ -290,6 +358,11 @@ func (l *loading) rulesDir(dir string, t want) {
 		case child.info.IsDir():
 			l.rulesDir(p, t)
 		case strings.HasSuffix(e.Name(), ".md"):
+			if l.rules >= rulesMost {
+				l.warn(WarnTooMany, dir, "", fmt.Sprintf("More than %d rule files were found, so those after the first %d, %s among them, were not read.", rulesMost, rulesMost, plain(osPath(p))))
+				return
+			}
+			l.rules++
 			l.rule(p, t)
 		}
 	}
@@ -364,7 +437,7 @@ func (l *loading) fetch(w want) (fetched, bool) {
 		switch {
 		case !errors.Is(pr.err, fs.ErrNotExist):
 			l.warn(WarnUnreadable, w.path, w.parent, fmt.Sprintf("%s could not be read: %s.", shown, reason(pr.err)))
-		case w.kind == KindImport && !bareWord(w.written):
+		case w.kind == KindImport && meantAsPath(w.written):
 			l.warn(WarnImportMissing, w.path, w.parent, fmt.Sprintf("%s imports @%s, but %s is not there.", plain(osPath(w.parent)), plain(w.written), shown))
 		case w.kind != KindImport && pr.linfo != nil:
 			// Something is there under the name: a link to nothing.
@@ -389,14 +462,18 @@ func (l *loading) fetch(w want) (fetched, bool) {
 	}
 	if w.outside(s, pr.real) && !l.approve(w, pr.real) {
 		from := w.path
-		text := fmt.Sprintf("%s leads, through a link, to %s, which is outside the project; that was not approved, so it was not loaded.", shown, plain(osPath(pr.real)))
+		where := "which is outside the project; that was not approved"
+		if s.secretPath(pr.real) {
+			where = "where keys and passwords are kept, which a project's file never brings in"
+		}
+		text := fmt.Sprintf("%s leads, through a link, to %s, %s, so it was not loaded.", shown, plain(osPath(pr.real)), where)
 		if w.kind == KindImport {
 			from = w.parent
 			target := plain(osPath(pr.real))
 			if w.path != pr.real {
 				target = fmt.Sprintf("%s (which leads, through a link, to %s)", shown, target)
 			}
-			text = fmt.Sprintf("%s imports %s, which is outside the project; that was not approved, so it was not loaded.", plain(osPath(w.parent)), target)
+			text = fmt.Sprintf("%s imports %s, %s, so it was not loaded.", plain(osPath(w.parent)), target, where)
 		}
 		l.warn(WarnImportRefused, pr.real, from, text)
 		return fetched{}, false
@@ -418,7 +495,7 @@ func (l *loading) fetch(w want) (fetched, bool) {
 		l.warn(WarnUnreadable, w.path, w.parent, fmt.Sprintf("%s could not be read: %s.", shown, reason(err)))
 		return fetched{}, false
 	}
-	text, binary, repaired := cleanText(data)
+	body, binary, repaired := cleanText(data)
 	if binary {
 		l.warn(WarnNotText, w.path, w.parent, fmt.Sprintf("%s is not text (it holds a zero byte), so it was not loaded.", shown))
 		return fetched{}, false
@@ -426,13 +503,29 @@ func (l *loading) fetch(w want) (fetched, bool) {
 	if repaired {
 		l.warn(WarnInvalidUTF8, w.path, w.parent, fmt.Sprintf("%s is not valid UTF-8; it was loaded with the bad bytes replaced.", shown))
 	}
-	return fetched{real: pr.real, info: info, text: text}, true
+	// What a terminal draws as nothing is taken out, as from a typed
+	// prompt: words in tag characters, or put in another order by the
+	// controls of the drawing order, are read by the model as instructions
+	// nobody reading the file saw (the instruction-files review of
+	// 2026-11-20).
+	if clean, found := text.CleanInvisible(body); found.Removed > 0 {
+		body = clean
+		if found.Hiding {
+			l.warn(WarnInvisible, w.path, w.parent, fmt.Sprintf("%s holds characters that are drawn as nothing and can hide words or change their order; they were taken out of what the model is given.", shown))
+		}
+	}
+	return fetched{real: pr.real, info: info, text: body}, true
 }
 
 // approve asks whether w may bring in the file at real, which lies outside
 // the project root. Each target is asked about once.
 func (l *loading) approve(w want, real string) bool {
 	s := l.s
+	if s.secretPath(real) {
+		// Where keys are kept is never a project file's to bring in, an
+		// approval of the project's outside files notwithstanding.
+		return false
+	}
 	if ok, asked := s.approved[real]; asked {
 		return ok
 	}
@@ -445,6 +538,9 @@ func (l *loading) approve(w want, real string) bool {
 		ok = s.o.ApproveImport(osPath(from), osPath(real))
 	}
 	s.approved[real] = ok
+	if !ok {
+		s.unapproved = append(s.unapproved, real)
+	}
 	return ok
 }
 
@@ -508,6 +604,10 @@ func (l *loading) imports(w want, real, unit, text string) {
 	if len(refs) == 0 {
 		return
 	}
+	if len(refs) > importsMost {
+		l.warn(WarnTooMany, w.path, w.parent, fmt.Sprintf("%s imports %d files, so only its first %d imports were followed.", plain(osPath(w.path)), len(refs), importsMost))
+		refs = refs[:importsMost]
+	}
 	// A relative import is relative to the file it is written in. For a
 	// file reached through a link that is where the link leads, since that
 	// is where the file's neighbours are.
@@ -532,6 +632,7 @@ func (l *loading) imports(w want, real, unit, text string) {
 			depth:   w.depth + 1,
 			unit:    unit,
 			free:    w.scope == ScopeUser,
+			fence:   w.fence,
 		}
 		switch {
 		case written == "~" || strings.HasPrefix(written, "~/"):
@@ -587,12 +688,24 @@ func (s *Set) excluded(p string) bool {
 	return false
 }
 
-// bareWord reports whether an import is written as a single word with no
-// slash, dot or tilde, like "@alice" or "@Override". Such a word is followed
-// when a file of that name is there and is otherwise taken for ordinary
-// text.
-func bareWord(written string) bool {
-	return !strings.ContainsAny(written, "/.~")
+// meantAsPath reports whether an import that names nothing there was
+// surely meant for a file, and so is worth a warning: one written from a
+// folder ("./", "../", "~/", "/") or with an instruction file's ending.
+// Any other ("@alice", "@Override", "@types/node", "@pytest.fixture") is
+// followed when a file of that name is there and is otherwise taken for
+// ordinary text: a package or a decorator in a file's prose was warned
+// about at every start (the instruction-files review of 2026-11-20).
+func meantAsPath(written string) bool {
+	for _, lead := range []string{"./", "../", "~/", "/"} {
+		if strings.HasPrefix(written, lead) {
+			return true
+		}
+	}
+	switch strings.ToLower(path.Ext(written)) {
+	case ".md", ".markdown", ".txt":
+		return true
+	}
+	return false
 }
 
 // reason says why a file-system call failed, without the path, which the

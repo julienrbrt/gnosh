@@ -8,14 +8,17 @@ import (
 	"time"
 
 	"github.com/gnosh-ai/gnosh/internal/agent"
+	"github.com/gnosh-ai/gnosh/internal/config"
 	"github.com/gnosh-ai/gnosh/internal/prompt"
 )
 
-// This file is /review and /security-review, as Claude Code has them: the
-// model reviews the changes on this branch, from where it left the default
-// branch, committed or not, for bugs or for ways in, and changes no file.
-// gnosh works out the range; the model runs the diff and reads what is
-// around it.
+// This file is /review (also /code-review), /security-review and
+// /simplify, as Claude Code has them: the model reviews the changes on this
+// branch, from where it left the default branch, committed or not, for
+// bugs or for ways in, and changes no file, or with /review --fix fixes
+// the bugs it is sure of; /simplify makes the changes simpler, the code
+// doing what it did. gnosh works out the range; the model runs the diff and
+// reads what is around it.
 
 // reviewRange says what a review covers: the git diff command that shows
 // the changes, and in words, what they are.
@@ -62,7 +65,8 @@ func (l *live) reviewBase(ctx context.Context, dir string) (reviewRange, error) 
 	return reviewRange{diff: "git diff HEAD", what: "not committed yet (there is no default branch to compare with)"}, nil
 }
 
-// slashReview is /review: the changes on this branch, reviewed for bugs.
+// slashReview is /review: the changes on this branch, reviewed for bugs;
+// with --fix, the bugs it is sure of fixed.
 func (l *live) slashReview(ctx context.Context, c *SlashContext) error {
 	return l.review(ctx, c, "review", reviewTask)
 }
@@ -73,35 +77,157 @@ func (l *live) slashSecurityReview(ctx context.Context, c *SlashContext) error {
 	return l.review(ctx, c, "security-review", securityReviewTask)
 }
 
+// slashSimplify is /simplify: the changes on this branch made simpler, the
+// code doing what it did.
+func (l *live) slashSimplify(ctx context.Context, c *SlashContext) error {
+	return l.review(ctx, c, "simplify", simplifyTask)
+}
+
+// reviewLevels are the words for how thorough a review is that Claude
+// Code's /code-review takes first, and what each asks of the model; medium
+// asks nothing more.
+var reviewLevels = map[string]string{
+	"low":    "Report only what you are most sure of.",
+	"medium": "",
+	"high":   "Be thorough: read every changed function and what calls it, and report what you are less sure of too, saying how sure you are.",
+	"xhigh":  "Be thorough: read every changed function and what calls it, and report what you are less sure of too, saying how sure you are.",
+	"max":    "Be as thorough as you can: read every changed function, what calls it and what it calls, and report what you are less sure of too, saying how sure you are.",
+}
+
 // review sends the model a review of the branch's changes to make. task
-// takes the range in words and its diff command.
+// takes the range in words and its diff command. What the person typed
+// after the command is, for /review, an optional level word, --fix and
+// --max-findings, and for any of them, what to look at in particular.
 func (l *live) review(ctx context.Context, c *SlashContext, name, task string) error {
 	if !l.st.trusted {
 		return fmt.Errorf("/%s runs git, and this folder is not trusted: a repository's own settings can name programs git runs. gnosh trust trusts it", name)
+	}
+	var level, findings string
+	fix, chose := false, false
+	var focus []string
+	words := strings.Fields(c.Args)
+	for i := 0; i < len(words); i++ {
+		w := words[i]
+		_, isLevel := reviewLevels[w]
+		v, eq := strings.CutPrefix(w, "--max-findings=")
+		switch {
+		case name == "review" && w == "--fix":
+			fix = true
+		case name == "review" && i == 0 && isLevel:
+			level = w
+		case name == "review" && (eq || w == "--max-findings"):
+			if !eq && i+1 < len(words) {
+				i++
+				v = words[i]
+			}
+			if v == "" || v != "default" && !config.ValidReviewMaxFindings(v) {
+				return fmt.Errorf("--max-findings takes a number from 1 to 1000, all, or default (as many as the level asks), not %q", oneLine(v, 20))
+			}
+			findings, chose = strings.TrimPrefix(v, "default"), true
+		default:
+			focus = append(focus, w)
+		}
 	}
 	r, err := l.reviewBase(ctx, l.cwd())
 	if err != nil {
 		return err
 	}
+	if chose {
+		l.keepReviewFindings(c, findings)
+	} else {
+		findings = l.reviewFindings()
+	}
 	text := fmt.Sprintf(task, r.what, "`"+r.diff+"`")
+	if fix {
+		text = strings.TrimSuffix(text, reviewNoChange) + reviewFix
+	}
+	if more := reviewLevels[level]; more != "" {
+		text += "\n\n" + more
+	}
+	switch {
+	case findings == "all":
+		text += "\n\nReport every finding, however small or unsure, the most important first."
+	case findings != "":
+		text += "\n\nReport at most " + findings + " findings, the most important first."
+	case level == "low":
+		text += "\n\nReport at most three findings."
+	}
 	if name == "security-review" && hasGnoCode(l.cfg.Paths.ProjectRoot, l.cfg.Paths.Cwd) {
 		if g := l.gnoGuides(); len(g) == 2 {
 			text += fmt.Sprintf("\n\nThis project holds Gno code: read the Gno guides first and hold the Gno changes against them rule by rule: %s (interrealm) and %s (security).", g[0], g[1])
 		}
 	}
-	if focus := strings.TrimSpace(c.Args); focus != "" {
-		text += "\n\nThe user asks you to look at this in particular: " + focus
+	if len(focus) > 0 {
+		text += "\n\nThe user asks you to look at this in particular: " + strings.Join(focus, " ")
 	}
-	c.Say("The model reviews the changes %s.", r.what)
+	doing := "reviewing the changes"
+	switch {
+	case name == "simplify":
+		doing = "making the changes simpler"
+		c.Say("The model looks for what to make simpler in the changes %s, and makes it so.", r.what)
+	case fix:
+		doing = "reviewing the changes and fixing the bugs it is sure of"
+		c.Say("The model reviews the changes %s, and fixes the bugs it is sure of.", r.what)
+	default:
+		c.Say("The model reviews the changes %s.", r.what)
+	}
 	return c.Send(agent.Prompt{Hidden: true, Source: name, Text: prompt.Wrap(text),
-		Notice: "/" + name + ": the model is reviewing the changes."})
+		Notice: "/" + name + ": the model is " + doing + "."})
 }
+
+// keepReviewFindings keeps a --max-findings choice ("" for default) for
+// the rest of the session and, in a session somebody attends, for later
+// ones, as Claude Code keeps it until --max-findings default.
+func (l *live) keepReviewFindings(c *SlashContext, v string) {
+	l.reviewCap.Store(&v)
+	switch v {
+	case "":
+		c.Say("/code-review reports as many findings as its level asks again.")
+	case "all":
+		c.Say("/code-review reports every finding from now on (--max-findings default goes back).")
+	default:
+		c.Say("/code-review reports at most %s findings from now on (--max-findings default goes back).", v)
+	}
+	l.saveState(c, func(st *config.State) error {
+		st.ReviewMaxFindings = v
+		return nil
+	})
+}
+
+// reviewFindings is the --max-findings choice in force: the session's
+// own, else the one kept from an earlier session; "" for none.
+func (l *live) reviewFindings() string {
+	if v := l.reviewCap.Load(); v != nil {
+		return *v
+	}
+	st, _ := config.ReadState(config.OS{}, l.cfg.Paths.StateFile)
+	return st.ReviewMaxFindings
+}
+
+// reviewNoChange is how the review tasks end: no file is to change.
+// reviewFix takes its place for /review --fix.
+const (
+	reviewNoChange = " Change no file."
+	reviewFix      = " Then fix each bug you are sure of, one at a time, with the smallest change that does it, and run the project's tests after. Leave the ones you are not sure of as they are, and say at the end which you fixed and which you left."
+)
 
 // reviewTask is what /review asks of the model: the range in words, then
 // the command that shows it.
-const reviewTask = `The user typed /review. Review the changes %s for bugs. %s shows them. Read the changed files around each change, and the code that calls into them, before you judge a change.
+const reviewTask = `The user typed /review. Review the changes %s for bugs, and for what goes against the project's instruction files (GNOSH.md, CLAUDE.md, AGENTS.md). %s shows them. Read the changed files around each change, and the code that calls into them, before you judge a change.
 
-Look for what will go wrong when this code runs: a wrong result; a case that is not handled (empty, nil, zero, the last one, an error); a crash, a leak or a race; a promise to a caller that is broken; a test that does not test what it says. For each, give the file and line, how sure you are, and how it fails: the input, and what comes out instead of what should. Leave out style, naming and taste unless they hide a bug. If you find nothing, say so plainly. Change no file.`
+Look for what will go wrong when this code runs: a wrong result; a case that is not handled (empty, nil, zero, the last one, an error); a crash, a leak or a race; a promise to a caller that is broken; a test that does not test what it says. For each, give the file and line, how sure you are, how it fails (the input, and what comes out instead of what should), and the fix you suggest. Mark each one Important (these changes bring it), Pre-existing (it was there before, in code the changes touch or lean on) or Nit (small, but it will bite someone). Leave out style, naming and taste unless they hide a bug. If you find nothing, say "Code review found no issues." Change no file.`
+
+// simplifyTask is what /simplify asks of the model: the range in words,
+// then the command that shows it. It does not hunt for bugs; /review does.
+const simplifyTask = `The user typed /simplify. Make the changes %s simpler, the code doing what it did. %s shows them. Read the changed files around each change, and the code near it, before you change anything.
+
+Look for four things:
+- reuse: code the changes add that does what a function, type or helper already in the repository does: use the one that is there;
+- simplicity: more code, branches, layers, options or special cases than the job needs; state kept that could be worked out; code repeated or no longer used;
+- efficiency: work done twice, in a loop or for nothing: a file read, a command run, a request sent, a list searched or sorted again; memory held longer than it is needed;
+- level: a change made in the wrong place: a fix in a caller that belongs in what it calls, a special case in general code, a detail leaking out of the part that owns it.
+
+This is not a search for bugs (/review is): if you see one, say so, and leave it. Leave names and style alone unless they make the code harder to follow. Make the changes one at a time, each small enough to check, and run the project's tests (or build it) after them. At the end, say in a few lines what you changed and why, and what you saw and left as it is.`
 
 // securityReviewTask is what /security-review asks of the model: the range
 // in words, then the command that shows it.

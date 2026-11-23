@@ -338,6 +338,9 @@ func TestBashReadOnly(t *testing.T) {
 		// A cd to where the line already is goes nowhere: git runs where it
 		// would have.
 		"cd /proj && git log", "cd . && git status", "cd /proj/ && git diff",
+		// So does a git -C that names that folder (box 1's /security-review:
+		// git -C /its/own/folder diff <base> --stat).
+		"git -C /proj diff --stat", "git -C . status", "git -C /proj/ log --oneline -3",
 		"ls | head -3", "cat a | grep foo | wc -l", "ls && pwd; echo done", "ls || true",
 		"ls 2>/dev/null", "ls > /dev/null 2>&1", "cat < a", "cat <<EOF\nplain text\nEOF",
 		"timeout 5 ls", "nice ls", "time ls -la", "command -v go", "sort a", "sort -u -k2 a",
@@ -388,6 +391,11 @@ func TestBashReadOnly(t *testing.T) {
 		"git worktree add x", "git worktree remove x", "git worktree prune", "git worktree list x",
 		"git worktree", "git stash list --output=x", "git stash list -p", "git stash pop", "git stash drop",
 		"cd src && git status", "cd /proj/src && git log", "cd .. && git log",
+		"git -C /proj/src status", "git -C src log", "git -C .. status", "git -C ~ status", "git -C /proj diff --output=x",
+		"cd src && git -C /proj/src log",
+		// (A review: -C goes through a link before its .., so lnk/.. may
+		// be another repository; a pattern names what it matches.)
+		"git -C src/.. log -p", "git -C /proj/src/.. status", "timeout 5 git -C src/.. diff", "git -C /pro? status", "git -C /{proj,x} status",
 		// Reads that leave the working directories.
 		"cat /etc/passwd", "cat ~/.ssh/id_ed25519", "cat ../other/x", "ls /", "ls ~", "head /etc/hosts",
 		"grep foo /etc/passwd", "grep -rn foo /", "find / -name x", "find ~ -name x", "wc -l ../x",
@@ -440,6 +448,34 @@ func TestBashReadOnlyWithFileSystem(t *testing.T) {
 	} {
 		if d := bash(e, cmd); d.Behavior != want {
 			t.Errorf("%q: got %s (%s), want %s", cmd, d.Behavior, d.Reason, want)
+		}
+	}
+}
+
+// A pattern copied into a folder lands under the names of what it
+// matches, which are not in the folder yet: each is held to the Edit
+// rules, in every mode (oracle seed 176: "cp * x build/" with
+// permissions skipped wrote build/a.txt past a deny rule on *.txt).
+func TestPatternCopiedIntoAFolder(t *testing.T) {
+	fs := fakeFS{files: []string{"/proj/a.txt", "/proj/b.go", "/proj/src/c.txt", "/proj/src/d.go", "/proj/build/old.go"}}
+	for _, mode := range []Mode{ModeBypass, ModeAcceptEdits, ModeDefault} {
+		o := testOptions(mode, rules{deny: []string{"Edit(*.txt)"}})
+		o.Resolve, o.Glob = fs.resolve, fs.glob
+		e := mustEngine(t, o)
+		for cmd, denied := range map[string]bool{
+			"cp * build/":           true,
+			"cp * x build/":         true,
+			"cp ${HOME:+* x} build": true,
+			"mv src/* build":        true,
+			"cp -t build src/*":     true,
+			"ln -s src/* build/":    true,
+			"cp *.go build/":        false,
+			"cp src/*.go build/":    false,
+		} {
+			d := bash(e, cmd)
+			if denied && d.Behavior != Deny || !denied && d.Behavior == Deny {
+				t.Errorf("%s: %q: got %s (%s), want denied %v", mode, cmd, d.Behavior, d.Reason, denied)
+			}
 		}
 	}
 }
@@ -614,5 +650,11 @@ func TestMonitorUsesBashRules(t *testing.T) {
 	}
 	if d := mon("make watch"); d.Behavior != Ask {
 		t.Errorf("Monitor asks otherwise: %+v", d)
+	}
+	// Its command runs in the background, which Bash's rules about that
+	// argument cover (the hosts review of 2026-11-19).
+	e = engine(t, ModeDefault, rules{allow: []string{"Bash(npm run *)"}, deny: []string{"Bash(run_in_background:true)"}})
+	if d := mon("npm run dev"); d.Behavior != Deny {
+		t.Errorf("Monitor under a deny of Bash(run_in_background:true): %+v", d)
 	}
 }

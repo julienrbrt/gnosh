@@ -81,8 +81,17 @@ func TestReaches(t *testing.T) {
 		// Every line is looked at (box 1, 16 November: ssh under an
 		// assignment and a comment ran).
 		{"echo one\nssh render ls", "ssh"},
-		{"D=104.248.69.97 # the vlm droplet\nssh -o BatchMode=yes root@$D 'bash -s' <<'EOF'\nset -e\nEOF", "ssh"},
+		{"D=203.0.113.9 # the render droplet\nssh -o BatchMode=yes root@$D 'bash -s' <<'EOF'\nset -e\nEOF", "ssh"},
 		{"cat > d.sh <<'EOF'\nls\nEOF\nscp d.sh render:", "scp"},
+		// A << inside quotes opens no here-document, and a line inside
+		// quotes, or one a backslash goes on into, is no command.
+		{"echo '<<X'\nssh render ls", "ssh"},
+		{"echo \"a\nssh render ls\"", ""},
+		{"echo a \\\nssh render ls", ""},
+		// A line goes on into the next: the two are one command.
+		{"cd /srv && \\\nssh render ls", "ssh"},
+		{"ls # a comment \\\nssh render ls", "ssh"},
+		{"echo \"$(grep -c \"can't\" app.log) failures\"\nssh render ls", "ssh"},
 	}
 	for _, tt := range tests {
 		if got := reaches(tt.command); got != tt.want {
@@ -438,4 +447,112 @@ func FuzzRules(f *testing.F) {
 			t.Errorf("pieces(%q) hold %d bytes, more than the line", line, total)
 		}
 	})
+}
+
+// No command may hand gnokey a password on its standard input, the model's
+// or the person's, in either spelling, behind a pipe or split by quotes:
+// only gnosh's gnokey tool signs, at its masked prompt (TOOL-41). Queries
+// and unsigned transactions are left alone.
+func TestGnokeyPasswordFlagIsRefused(t *testing.T) {
+	t.Parallel()
+	m := newManager(t, Options{OnEnd: func(Ended) {}})
+	env := newEnv(t)
+	tool := toolNamed(t, m, BashName).(core.Describer)
+	for _, command := range []string{
+		"echo hunter2 | gnokey maketx call -func Inc -broadcast -insecure-password-stdin k",
+		"gnokey sign -tx-path t.tx --insecure-password-stdin=true k < pw.txt",
+		"printf '%s\\n' \"$PW\" | gnokey maketx send -broadcast '-insecure-password-std'in k",
+		"cd pkg &&\ngnokey maketx addpkg -broadcast -insecure-password-stdin k <<<\"$P\"",
+		// What a shell fills in with nothing or takes out (the gno review
+		// of 2026-11-19).
+		"gnokey maketx send -broadcast -insecure-pass$()word-stdin k",
+		"gnokey maketx send -broadcast -insecure-password-std${X}in k",
+		"gnokey maketx send -broadcast -insecure-password-std$X\\in k",
+		"gnokey maketx send -broadcast -Insecure-Password-`true`Stdin k",
+	} {
+		_, err := tool.Describe(core.ToolCall{Input: mustJSON(t, args{argCommand: command})}, env)
+		if err == nil || !strings.Contains(err.Error(), "only the gnokey tool opens") {
+			t.Errorf("%q: %v", command, err)
+		}
+		if _, err := m.PersonsBash().(core.Describer).Describe(core.ToolCall{Input: mustJSON(t, args{argCommand: command})}, env); err == nil || !strings.Contains(err.Error(), "Sign in a terminal of your own") {
+			t.Errorf("the person's %q: %v", command, err)
+		}
+	}
+	for _, command := range []string{"gnokey query auth/accounts/g1abc -remote 127.0.0.1:26657", "gnokey maketx call -func Inc k > call.tx", "gnokey list"} {
+		if _, err := tool.Describe(core.ToolCall{Input: mustJSON(t, args{argCommand: command})}, env); err != nil {
+			t.Errorf("%q was refused: %v", command, err)
+		}
+	}
+}
+
+// A gnokey that asked for a password at a terminal, run as a command,
+// fails with a note that says signing goes through the gnokey tool, or to
+// the user (TOOL-41).
+func TestGnokeyWithoutATerminalIsExplained(t *testing.T) {
+	t.Parallel()
+	m := newManager(t, Options{})
+	env := newEnv(t)
+	dir := t.TempDir()
+	script := filepath.Join(dir, "gnokey")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho 'Enter password.'\necho 'inappropriate ioctl for device' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res := bash(t, m, env, script+" maketx call -func Inc k")
+	if !hasNote(res, "signing goes through the gnokey tool, which asks the user for the password at a masked prompt") || !hasNote(res, "give the user the exact command to run in their own terminal, and stop") {
+		t.Errorf("gnokey without a terminal:\n%s", core.TextOf(res.Content))
+	}
+}
+
+// The note under a sandboxed command that failed: what of the sandbox
+// stopped it, but not a stop the settings say not to report for that
+// command (ignoreViolations); no word of writes where the sandbox leaves
+// the files open; a certificate that could not be checked where macOS's
+// trust service is out of reach.
+func TestSandboxHintAndIgnoredReports(t *testing.T) {
+	failed := &ending{reason: endExited, code: 1}
+	sb := &Sandbox{Writes: "the session's folders", Unsandboxed: true,
+		Ignored: []Ignored{{Command: "*", What: "/etc/hosts"}, {Command: "npm install", What: "registry.npmjs.org"}}}
+	m := &Manager{opt: Options{Sandbox: sb}}
+	hint := func(command, body string) string {
+		return m.sandboxHint(bashArgs{command: command, sandboxed: true}, failed, body)
+	}
+	if got := hint("touch /etc/x", "touch: /etc/x: Read-only file system\n"); !strings.Contains(got, "write only in the session's folders") {
+		t.Errorf("a write stopped: %q", got)
+	}
+	if got := hint("probe", "probe: /etc/hosts: Operation not permitted\n"); got != "" {
+		t.Errorf("a stop the settings do not report, for every command: %q", got)
+	}
+	if got := hint("probe", "probe: /etc/hosts: Operation not permitted\nprobe: /etc/other: Operation not permitted\n"); !strings.Contains(got, "write only in") {
+		t.Errorf("another stop beside it is reported: %q", got)
+	}
+	if got := hint("npm install", "npm error: Could not resolve host: registry.npmjs.org\n"); got != "" {
+		t.Errorf("a stop not reported for npm install: %q", got)
+	}
+	if got := hint("curl https://registry.npmjs.org", "curl: (6) Could not resolve host: registry.npmjs.org\n"); !strings.Contains(got, "reach no network") {
+		t.Errorf("the same stop for another command: %q", got)
+	}
+	// (On macOS a refused read says what a refused write says.)
+	sb.HidesReads = true
+	if got := hint("cat ~/.aws/credentials", "cat: /Users/u/.aws/credentials: Operation not permitted\n"); !strings.Contains(got, "and read nothing the settings keep from it") {
+		t.Errorf("a refused read or write on macOS: %q", got)
+	}
+	if got := hint("touch /etc/x", "touch: /etc/x: Read-only file system\n"); strings.Contains(got, "read nothing") {
+		t.Errorf("a write only: %q", got)
+	}
+	sb.HidesReads = false
+	if got := hint("ssh-add -l", "Error connecting to agent: Address family not supported by protocol\n"); !strings.Contains(got, "open no Unix socket") {
+		t.Errorf("a Unix socket refused: %q", got)
+	}
+	sb.Writes = ""
+	if got := hint("touch /etc/x", "touch: /etc/x: Read-only file system\n"); got != "" {
+		t.Errorf("a write, with the files left open: %q", got)
+	}
+	tls := "Get \"https://api.github.com/\": tls: failed to verify certificate: x509: OSStatus -26276\n"
+	if got := hint("gh api /zen", tls); got != "" {
+		t.Errorf("a certificate, with the trust service in reach: %q", got)
+	}
+	sb.NoTrust = true
+	if got := hint("gh api /zen", tls); !strings.Contains(got, "check no certificate with macOS's trust service") {
+		t.Errorf("a certificate, with the trust service out of reach: %q", got)
+	}
 }

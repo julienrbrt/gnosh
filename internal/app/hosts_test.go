@@ -169,7 +169,7 @@ func TestHostCallsAndPermissions(t *testing.T) {
 		if !strings.HasPrefix(got, "<host>render (root@203.0.113.7)</host>\n[not run: render (root@203.0.113.7) refused the connection") {
 			t.Errorf("the model read %q", got)
 		}
-		has(t, "what the model read", got, "Nothing was run on render", "ssh on this machine said: ssh: connect to host 203.0.113.7 port 22: Connection refused")
+		has(t, "what the model read", got, "Nothing was run on render", "ssh on this machine, or the login on render, said: ssh: connect to host 203.0.113.7 port 22: Connection refused")
 		// The person's line says what failed, without the line that is
 		// there for the model.
 		has(t, "stderr", r.err, "Bash on render: touch made.txt (failed: [not run: render (root@203.0.113.7) refused the connection")

@@ -111,19 +111,6 @@ func (r *rpc) abciQuery(ctx context.Context, height int64, path string, data []b
 	return res.Response.ResponseBase, res.Response.Value, nil
 }
 
-// blockTxs returns the raw transactions of the block at height.
-func (r *rpc) blockTxs(ctx context.Context, height int64) ([][]byte, error) {
-	var res struct {
-		Block struct {
-			Data struct {
-				Txs [][]byte `json:"txs"`
-			} `json:"data"`
-		} `json:"block"`
-	}
-	err := r.call(ctx, "block", map[string]any{"height": strconv.FormatInt(height, 10)}, &res)
-	return res.Block.Data.Txs, err
-}
-
 type txResult struct {
 	ResponseBase responseBase `json:"ResponseBase"`
 	GasUsed      string       `json:"GasUsed"`

@@ -94,6 +94,12 @@ type simpleCmd struct {
 	// neg is set when the pipeline the command is part of stands under a
 	// !: what comes after && then runs when the pipeline failed.
 	neg bool
+	// cond is set for a command of a group in braces that may not run at
+	// all while the commands after the group still do, or that runs in a
+	// shell of its own: the group stands after an || or in a pipe. A cd
+	// in it is then no sure move, wherever it stands in the group ("true
+	// || { pwd; cd d; } && c" runs c where the line was).
+	cond bool
 	// timeCut is set for a command that starts with bash's keyword time
 	// when a redirection stands among the words the keyword takes for its
 	// own (-p, --, a second time): it is how many words stood before the
@@ -122,6 +128,9 @@ type simpleCmd struct {
 	// aliased are the aliases this command was read through (useAlias):
 	// a name is taken for its alias once.
 	aliased []string
+	// flagCd marks a cd read from a program's own flag (env -C, git -C):
+	// the program goes to that folder, and the shell never is in it.
+	flagCd bool
 }
 
 // script is everything read from one command line.
@@ -574,6 +583,7 @@ func (p *parser) pipeline() {
 		p.fail("a shell keyword after time")
 		return
 	}
+	from := len(p.sc.cmds)
 	p.command()
 	for !p.failed {
 		p.blanks()
@@ -581,6 +591,12 @@ func (p *parser) pipeline() {
 		if !strings.HasPrefix(rest, "|") || strings.HasPrefix(rest, "||") {
 			return
 		}
+		// What stands before a | runs in a shell of its own: a cd there,
+		// in a group as well, moves nothing.
+		for _, c := range p.sc.cmds[from:] {
+			c.cond = true
+		}
+		from = len(p.sc.cmds)
 		p.pos++
 		if strings.HasPrefix(rest, "|&") {
 			p.pos++
@@ -756,7 +772,20 @@ func (p *parser) command() {
 		// and so is not read that way: such a group asks.
 		p.pos++
 		p.sc.group = true
+		// The group's first command stands where the group stands: after
+		// an || it may not run at all, and a cd in it is no sure move
+		// ("a || { cd d; } && c" runs c where the line was when a went
+		// well; oracle seed 117).
+		sep, first := p.sep, len(p.sc.cmds)
 		p.body("}")
+		if len(p.sc.cmds) > first && p.sc.cmds[first].sep == sepStart {
+			p.sc.cmds[first].sep = sep
+		}
+		if sep == sepOr || sep == sepPipe {
+			for _, c := range p.sc.cmds[first:] {
+				c.cond = true
+			}
+		}
 		p.expect("}")
 		mark := len(p.sc.cmds)
 		p.trailingRedirs()
@@ -1357,6 +1386,35 @@ func timeWords(ws []word) bool {
 // simpleCmd.timeCut).
 func cutsTime(c *simpleCmd) bool {
 	return c.timeCut > 0 && c.timeCut < len(c.words) && timeWord(c.words[c.timeCut])
+}
+
+// bashTimeStart returns where the program that bash's keyword time runs
+// stands among ws, which begin with the keyword: after each time bash takes
+// one -p and then one -- as its own (parse.y's timespec), and a ! or
+// another time may follow; the next word is the program, a dash word
+// included. "time -p -p cat x" runs a program named -p, where a plain
+// sh's /usr/bin/time takes both -p for its own and runs cat.
+func bashTimeStart(ws []word) int {
+	plain := func(i int, s string) bool {
+		return i < len(ws) && ws[i].static() && !ws[i].quoted && ws[i].joined() == s
+	}
+	i := 0
+	for {
+		switch {
+		case plain(i, "time"):
+			i++
+			if plain(i, "-p") {
+				i++
+			}
+			if plain(i, "--") {
+				i++
+			}
+		case plain(i, "!"):
+			i++
+		default:
+			return i
+		}
+	}
 }
 
 // redir reads the redirection at p.pos into cmd.

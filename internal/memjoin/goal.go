@@ -435,12 +435,17 @@ func (j *join) judgeClosed(ctx context.Context, client *gnovm.Client, except str
 		if ctx.Err() != nil {
 			return agent.Verdict{}, false
 		}
-		j.mu.Lock()
-		if j.review.judged == nil {
-			j.review.judged = map[string]int64{}
+		if err == nil {
+			// Only a verdict counts as judged: a check that could not run
+			// is made again as the next turn ends, not taken for done (the
+			// side-request review of 2026-11-19).
+			j.mu.Lock()
+			if j.review.judged == nil {
+				j.review.judged = map[string]int64{}
+			}
+			j.review.judged[g.Name] = g.Seq
+			j.mu.Unlock()
 		}
-		j.review.judged[g.Name] = g.Seq
-		j.mu.Unlock()
 		switch {
 		case err != nil:
 			told = append(told, fmt.Sprintf("`%s` %q was closed as done, and the check of it could not run (%v), so it stands unchecked.", g.Name, g.Title, err))
@@ -523,12 +528,13 @@ func (j *join) judge(ctx context.Context, condition, show string) (goalVerdict, 
 		return goalVerdict{}, errors.New("there is no model to ask")
 	}
 	events := layout(j.ts.Entries(), j.id)
+	zero := 0.0
 	req := j.texts.GoalJudge(prompt.GoalJudgeInput{
 		Condition:    condition,
 		Mem:          show,
 		Conversation: tail(written(events, clipLevels[0]), maxShown),
 	})
-	res, err := a.Side(ctx, agent.SideRequest{Purpose: "goal-judge", System: req.System, Prompt: req.Prompt, MaxTokens: 300})
+	res, err := a.Side(ctx, agent.SideRequest{Purpose: "goal-judge", System: req.System, Prompt: req.Prompt, MaxTokens: 300, Temperature: &zero})
 	if err != nil {
 		return goalVerdict{}, err
 	}

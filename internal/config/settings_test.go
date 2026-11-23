@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"slices"
 	"strings"
@@ -46,7 +48,7 @@ const pastedSettings = `{
     ],
     "Stop": [
       { "hooks": [ { "type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/check.sh" },
-                   { "type": "command", "command": "./second.sh" } ] }
+                   { "type": "command", "command": "./second.sh", "onFailure": "block" } ] }
     ]
   },
   "env": { "NODE_ENV": "test", "EMPTY": "" },
@@ -134,8 +136,8 @@ func TestSettingsRefusals(t *testing.T) {
 		{"a mode gnosh does not have", `{"permissions": {"defaultMode": "yolo"}}`, 1, []string{`"yolo"`, "not a permission mode", "default, plan, acceptEdits, dontAsk, bypassPermissions"}},
 		{"a mode that is not a string", `{"permissions": {"defaultMode": true}}`, 1, []string{`"permissions.defaultMode" is one of`}},
 		{"a switch with another value", `{"permissions": {"disableBypassPermissionsMode": true}}`, 1, []string{`takes the one value "disable"`}},
-		{"a guard Claude Code has and gnosh has not built", `{"permissions": {"blockReadsOutsideWorkingDirectories": true}}`, 1, []string{`"permissions.blockReadsOutsideWorkingDirectories" is a setting Claude Code has and gnosh has not built`, "would not hold anything back"}},
-		{"the other one", `{"permissions": {"blockWritesOutsideWorkingDirectories": true}}`, 1, []string{"a setting Claude Code has and gnosh has not built"}},
+		{"a block that is not a truth value", `{"permissions": {"blockReadsOutsideWorkingDirectories": "yes"}}`, 1, []string{`"permissions.blockReadsOutsideWorkingDirectories" is true or false`, "a string"}},
+		{"the other one", `{"permissions": {"blockWritesOutsideWorkingDirectories": 1}}`, 1, []string{`"permissions.blockWritesOutsideWorkingDirectories" is true or false`}},
 		{"directories that are not a list", `{"permissions": {"additionalDirectories": "/x"}}`, 1, []string{"is a list of directories"}},
 
 		{"an event gnosh does not fire", "{\"hooks\": {\n \"pre_tool_use\": []}}", 2, []string{`"pre_tool_use"`, "Did you mean PreToolUse?"}},
@@ -153,9 +155,12 @@ func TestSettingsRefusals(t *testing.T) {
 		{"an http hook with a command", `{"hooks": {"Stop": [{"hooks": [{"type": "http", "url": "https://example.com", "command": "x"}]}]}}`, 1, []string{`this http hook has a "command"`}},
 		{"a command hook with headers", `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x", "headers": {"A": "b"}}]}]}}`, 1, []string{`this command hook has a "url", "headers"`}},
 		{"an http hook whose url is not http", `{"hooks": {"Stop": [{"hooks": [{"type": "http", "url": "ftp://x"}]}]}}`, 1, []string{"the address of the http hook cannot be used"}},
-		{"a hook of another type", `{"hooks": {"Stop": [{"hooks": [{"type": "prompt", "prompt": "ok?"}]}]}}`, 1, []string{`"type": "prompt"`, `"command", "http" and "mcp_tool" only`}},
+		{"a hook of another type", `{"hooks": {"Stop": [{"hooks": [{"type": "script", "prompt": "ok?"}]}]}}`, 1, []string{`"type": "script"`, `"command", "http", "mcp_tool", "prompt" and "agent" only`}},
+		{"an agent hook with continueOnBlock", `{"hooks": {"Stop": [{"hooks": [{"type": "agent", "prompt": "ok?", "continueOnBlock": true}]}]}}`, 1, []string{`an agent hook takes no "continueOnBlock"`}},
 		{"an mcp_tool hook with no tool", `{"hooks": {"Stop": [{"hooks": [{"type": "mcp_tool", "server": "s"}]}]}}`, 1, []string{`this mcp_tool hook names no "server" or no "tool"`}},
-		{"a prompt hook", `{"hooks": {"Stop": [{"hooks": [{"type": "prompt", "prompt": "ok?"}]}]}}`, 1, []string{`"type": "prompt"`}},
+		{"a prompt hook with no prompt", `{"hooks": {"Stop": [{"hooks": [{"type": "prompt"}]}]}}`, 1, []string{`this prompt hook has no "prompt"`}},
+		{"a command hook with a prompt hook's field", `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x", "continueOnBlock": true}]}]}}`, 1, []string{`only a prompt hook`}},
+		{"an agent hook with no prompt", `{"hooks": {"Stop": [{"hooks": [{"type": "agent"}]}]}}`, 1, []string{`this agent hook has no "prompt"`}},
 		{"a hook whose if is not a string", `{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "x", "if": 1}]}]}}`, 1, []string{`a hook's "if" is one permission rule`}},
 		{"a hook whose if is empty", `{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "x", "if": ""}]}]}}`, 1, []string{`a hook's "if" is one permission rule`}},
 		{"a hook whose args are not a list", `{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "x", "args": "-n"}]}]}}`, 1, []string{`a hook's "args" is a list of strings`, "a string"}},
@@ -163,7 +168,7 @@ func TestSettingsRefusals(t *testing.T) {
 		{"a background hook that is not true or false", `{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "x", "async": "yes"}]}]}}`, 1, []string{`a hook's "async" is true or false`, "a string"}},
 		{"a hook that wakes the model, written as a number", `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x", "asyncRewake": 1}]}]}}`, 1, []string{`a hook's "asyncRewake" is true or false`}},
 		{"a powershell hook", `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x", "shell": "powershell"}]}]}}`, 1, []string{`this hook sets "shell"`, `"bash"`}},
-		{"a hook with another failure rule", `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x", "onFailure": "block"}]}]}}`, 1, []string{`this hook sets "onFailure"`, `"continue"`}},
+		{"a hook with another failure rule", `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x", "onFailure": "retry"}]}]}}`, 1, []string{`this hook sets "onFailure"`, `"continue" or "block"`}},
 		{"a hook field gnosh does not know", `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x", "retries": 3}]}]}}`, 1, []string{`"retries"`, "not a field of a hook handler"}},
 		{"a timeout that is not a number", `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x", "timeout": "10"}]}]}}`, 1, []string{`"timeout" is a number of seconds above zero`}},
 	}
@@ -392,6 +397,88 @@ func TestSettingsModesThatAreNotHonoured(t *testing.T) {
 	}
 }
 
+// Claude Code's blocks outside the working directories: a true in any
+// file holds, the project's too (it only takes away), and false is the same
+// as not set, so a repository cannot lift the person's. The additional
+// directories only a project's file adds are told apart, since the blocks
+// do not count them.
+func TestSettingsBlocksOutsideWorkingDirectories(t *testing.T) {
+	fsys := newFS().put(userJSON, `{"permissions": {"blockReadsOutsideWorkingDirectories": true, "additionalDirectories": ["/srv/mine"]}}`).
+		put(projJSON, `{"permissions": {"blockReadsOutsideWorkingDirectories": false, "blockWritesOutsideWorkingDirectories": true, "additionalDirectories": ["/srv/theirs"]}}`)
+	cfg := mustLoad(t, inputs(fsys))
+	p := cfg.Permissions
+	if !p.BlockReads.V || p.BlockReads.Origin.File != userJSON || !p.BlockWrites.V || p.BlockWrites.Origin.File != projJSON {
+		t.Errorf("blocks: reads %+v, writes %+v", p.BlockReads, p.BlockWrites)
+	}
+	if len(p.ProjectDirs) != 1 || p.ProjectDirs[0] != "/srv/theirs" || len(p.Dirs) != 2 {
+		t.Errorf("dirs %+v, the project's %v", p.Dirs, p.ProjectDirs)
+	}
+	cfg = mustLoad(t, inputs(newFS().put(userJSON, `{"permissions": {"blockReadsOutsideWorkingDirectories": false}}`)))
+	if cfg.Permissions.BlockReads.Set || cfg.Permissions.BlockWrites.Set {
+		t.Errorf("false sets nothing: %+v", cfg.Permissions)
+	}
+	// A folder the project names and the person adds too (--add-dir, read
+	// after the project's file) is the person's.
+	both := newFS().put(projJSON, `{"permissions": {"additionalDirectories": ["/srv/theirs"]}}`)
+	both.mkdir("/srv/theirs")
+	in := inputs(both)
+	in.Flags.AddDirs = []string{"/srv/theirs"}
+	cfg = mustLoad(t, in)
+	if len(cfg.Permissions.ProjectDirs) != 0 || len(cfg.Permissions.Dirs) != 1 {
+		t.Errorf("a folder both named: dirs %+v, the project's %v", cfg.Permissions.Dirs, cfg.Permissions.ProjectDirs)
+	}
+}
+
+// allowedHttpHookUrls and httpHookAllowedEnvVars merge across files; a
+// project's waits for trust (it would switch off the person's own http
+// hooks, a guard among them); not given is nil, and an empty list is in
+// force.
+func TestSettingsHTTPHookLimits(t *testing.T) {
+	values := func(items []ListItem) []string {
+		if items == nil {
+			return nil
+		}
+		out := []string{}
+		for _, it := range items {
+			out = append(out, it.V)
+		}
+		return out
+	}
+	fsys := newFS().put(userJSON, `{"allowedHttpHookUrls": ["https://hooks.example.com/*"], "httpHookAllowedEnvVars": ["TOKEN"]}`).
+		put(projJSON, `{"allowedHttpHookUrls": ["http://localhost:*", "https://hooks.example.com/*"], "httpHookAllowedEnvVars": []}`)
+	for _, trusted := range []bool{true, false} {
+		in := inputs(fsys)
+		in.Trusted = trusted
+		cfg := mustLoad(t, in)
+		want := "https://hooks.example.com/* http://localhost:*"
+		if !trusted {
+			want = "https://hooks.example.com/*"
+		}
+		if got := values(cfg.HTTPHookURLs); strings.Join(got, " ") != want {
+			t.Errorf("trusted %v: urls %q", trusted, got)
+		}
+		if got := values(cfg.HTTPHookEnvVars); strings.Join(got, " ") != "TOKEN" || cfg.HTTPHookEnvVars[0].Origin.File != userJSON {
+			t.Errorf("trusted %v: env vars %q", trusted, got)
+		}
+	}
+	cfg := mustLoad(t, inputs(newFS().put(projJSON, `{"allowedHttpHookUrls": []}`)))
+	if cfg.HTTPHookURLs == nil || len(cfg.HTTPHookURLs) != 0 || cfg.HTTPHookEnvVars != nil {
+		t.Errorf("an empty list is in force, and one not given is nil: %#v, %#v", cfg.HTTPHookURLs, cfg.HTTPHookEnvVars)
+	}
+	// In a folder not yet trusted, a project's empty list switches off no
+	// hook of the person's.
+	in := inputs(newFS().put(projJSON, `{"allowedHttpHookUrls": [], "httpHookAllowedEnvVars": []}`))
+	in.Trusted = false
+	if cfg := mustLoad(t, in); cfg.HTTPHookURLs != nil || cfg.HTTPHookEnvVars != nil {
+		t.Errorf("an untrusted project's lists are in force: %#v, %#v", cfg.HTTPHookURLs, cfg.HTTPHookEnvVars)
+	}
+	for _, bad := range []string{`{"allowedHttpHookUrls": "https://x/*"}`, `{"allowedHttpHookUrls": [1]}`, `{"httpHookAllowedEnvVars": [""]}`} {
+		if _, problems := load(t, withConfig(bad)); len(problems) == 0 || !strings.Contains(showProblems(problems), "is a list of the") {
+			t.Errorf("%s: %s", bad, showProblems(problems))
+		}
+	}
+}
+
 // The hooks in force come back out in Claude Code's shape, for a hook
 // runner that reads that shape.
 func TestHooksJSON(t *testing.T) {
@@ -490,4 +577,214 @@ func TestSettingsHTTPHook(t *testing.T) {
 	if strings.Contains(cfg.String(), "abc123def") {
 		t.Errorf("a header's value is shown:\n%s", cfg.String())
 	}
+}
+
+// The sandbox settings: Claude Code's paths (~/x, ./x from the file's
+// project or from the person's config folder); what only takes a power
+// away is in force from a repository's file before trust, what gives one
+// waits for it; a repository cannot turn the person's sandbox off; the
+// person's later file can; keys gnosh has not built say so.
+func TestSettingsSandbox(t *testing.T) {
+	values := func(items []ListItem) string {
+		var out []string
+		for _, it := range items {
+			out = append(out, it.V)
+		}
+		return strings.Join(out, " ")
+	}
+	fsys := newFS().put(userJSON, `{"sandbox": {"enabled": true, "autoAllowBashIfSandboxed": true, "excludedCommands": ["docker *"],
+		"filesystem": {"allowWrite": ["~/.kube", "./out", "//srv/build/**"], "denyRead": ["~/.aws/credentials"]}}}`).
+		put(projJSON, `{"sandbox": {"enabled": false, "autoAllowBashIfSandboxed": true, "excludedCommands": ["rm *"], "allowUnsandboxedCommands": false,
+		"filesystem": {"allowWrite": ["/etc"], "denyWrite": ["./secret"], "denyRead": [".env"]}}}`)
+	for _, trusted := range []bool{false, true} {
+		in := inputs(fsys)
+		in.Trusted = trusted
+		cfg, problems := load(t, in)
+		if cfg == nil {
+			t.Fatalf("refused: %s", showProblems(problems))
+		}
+		sb := cfg.Sandbox
+		if !sb.Enabled || !sb.AutoAllow || sb.AllowUnsandboxed || sb.FailIfUnavailable {
+			t.Errorf("trusted %v: %+v", trusted, sb)
+		}
+		wantExcl, wantWrite := "docker *", "/home/dev/.kube /home/dev/.config/gnosh/out /srv/build"
+		if trusted {
+			wantExcl, wantWrite = "docker * rm *", wantWrite+" /etc"
+		}
+		if values(sb.Excluded) != wantExcl || values(sb.AllowWrite) != wantWrite {
+			t.Errorf("trusted %v: excluded %q, allowWrite %q", trusted, values(sb.Excluded), values(sb.AllowWrite))
+		}
+		if values(sb.DenyWrite) != "/work/proj/secret" || values(sb.DenyRead) != "/home/dev/.aws/credentials /work/proj/.env" {
+			t.Errorf("trusted %v: denyWrite %q, denyRead %q", trusted, values(sb.DenyWrite), values(sb.DenyRead))
+		}
+		wantProblem(t, problems, Warning, projJSON, 0, "does not turn the sandbox off")
+	}
+
+	// A repository turns it on for itself before trust, and cannot turn
+	// on running without asking; the person's later file turns it off.
+	in := inputs(newFS().put(projJSON, `{"sandbox": {"enabled": true, "autoAllowBashIfSandboxed": true}}`))
+	in.Trusted = false
+	if sb := mustLoad(t, in).Sandbox; !sb.Enabled || sb.AutoAllow || !sb.AllowUnsandboxed {
+		t.Errorf("a repository's own: %+v", sb)
+	}
+	// The person's own local file (the one their gnosh wrote, by its note)
+	// turns it off; one the repository shipped cannot.
+	off := `{"sandbox": {"enabled": false}}`
+	fsOff := newFS().put(userJSON, `{"sandbox": {"enabled": true}}`).put(localJSON, off)
+	for _, trusted := range []bool{true, false} {
+		in := inputs(fsOff)
+		in.Trusted = trusted
+		if sb := mustLoad(t, in).Sandbox; !sb.Enabled {
+			t.Errorf("trusted %v: a local file the repository shipped turned the person's sandbox off: %+v", trusted, sb)
+		}
+	}
+	sum := sha256.Sum256([]byte(off))
+	fsOff.put(localWriteNote(mustLoad(t, inputs(fsOff)).Paths.StateDir, localJSON), hex.EncodeToString(sum[:])+"\n")
+	if sb := mustLoad(t, inputs(fsOff)).Sandbox; sb.Enabled {
+		t.Errorf("the person's own later file did not turn it off: %+v", sb)
+	}
+	in = inputs(newFS().put(userJSON, `{"sandbox": {"autoAllowBashIfSandboxed": true}}`).put(projJSON, `{"sandbox": {"enabled": true}}`))
+	in.Trusted = false
+	if sb := mustLoad(t, in).Sandbox; !sb.Enabled || sb.AutoAllow {
+		t.Errorf("the person's auto-allow went with a repository's sandbox: %+v", sb)
+	}
+	if sb := mustLoad(t, inputs(newFS())).Sandbox; sb.Enabled || !sb.AllowUnsandboxed {
+		t.Errorf("nothing said: %+v", sb)
+	}
+	// The network's lists: a repository's allowed hosts wait for trust,
+	// its denied ones do not.
+	net := newFS().put(userJSON, `{"sandbox": {"network": {"allowedDomains": ["github.com", "*.npmjs.org"], "strictAllowlist": true}}}`).
+		put(projJSON, `{"sandbox": {"network": {"allowedDomains": ["evil.example"], "deniedDomains": ["bad.npmjs.org"]}}}`)
+	in = inputs(net)
+	in.Trusted = false
+	if sb := mustLoad(t, in).Sandbox; values(sb.AllowedDomains) != "github.com *.npmjs.org" || values(sb.DeniedDomains) != "bad.npmjs.org" {
+		t.Errorf("untrusted: allowed %q, denied %q", values(sb.AllowedDomains), values(sb.DeniedDomains))
+	}
+	if sb := mustLoad(t, inputs(net)).Sandbox; values(sb.AllowedDomains) != "github.com *.npmjs.org evil.example" {
+		t.Errorf("trusted: allowed %q", values(sb.AllowedDomains))
+	}
+
+	// Credentials: files hidden as denyRead hides them, variables taken
+	// away; "mask" hidden as "deny", with a warning; a project's count
+	// before trust.
+	cred := inputs(newFS().put(userJSON, `{"sandbox": {"credentials": {"files": [{"path": "~/.aws/credentials", "mode": "deny"}], "envVars": [{"name": "GITHUB_TOKEN", "mode": "mask", "injectHosts": ["api.github.com"]}]}}}`).
+		put(projJSON, `{"sandbox": {"credentials": {"envVars": [{"name": "NPM_TOKEN", "mode": "deny"}]}}}`))
+	cred.Trusted = false
+	cfg2, credProblems := load(t, cred)
+	if cfg2 == nil {
+		t.Fatalf("credentials refused: %s", showProblems(credProblems))
+	}
+	if values(cfg2.Sandbox.HiddenFiles) != "/home/dev/.aws/credentials" || values(cfg2.Sandbox.HiddenVars) != "GITHUB_TOKEN NPM_TOKEN" {
+		t.Errorf("hidden files %q, vars %q", values(cfg2.Sandbox.HiddenFiles), values(cfg2.Sandbox.HiddenVars))
+	}
+	wantProblem(t, credProblems, Warning, userJSON, 0, "\"mask\" is not built", "GITHUB_TOKEN is hidden")
+	for bad, says := range map[string]string{
+		`{"sandbox": {"credentials": {"sigv4": {}}}}`:                                 "\"sandbox.credentials.sigv4\" is a setting Claude Code has and gnosh has not built",
+		`{"sandbox": {"credentials": {"envVars": [{"name": "1X", "mode": "deny"}]}}}`: "is not a variable's name",
+		`{"sandbox": {"credentials": {"files": [{"path": "/x", "mode": "hide"}]}}}`:   "is \"deny\" or \"mask\"",
+		`{"sandbox": {"ignoreViolations": {"npm": "/etc/hosts"}}}`:                    "is a list of what not to report",
+		`{"sandbox": {"network": {"httpProxyPort": 8080}}}`:                           "\"sandbox.network.httpProxyPort\" is a setting Claude Code has and gnosh has not built",
+		`{"sandbox": {"network": {"allowMachLookup": ["com.*.x"]}}}`:                  "has a * other than at its end",
+		`{"sandbox": {"allowAppleEvents": "yes"}}`:                                    `"sandbox.allowAppleEvents" is true or false`,
+		`{"sandbox": {"filesystem": {"allowManagedReadPathsOnly": true}}}`:            "managed settings, which gnosh does not have",
+		`{"sandbox": {"network": {"allowedDomains": "x.com"}}}`:                       "is a list of hosts",
+		`{"sandbox": {"enabled": "yes"}}`:                                             `"sandbox.enabled" is true or false`,
+		`{"sandbox": {"bogus": 1}}`:                                                   "not a key gnosh reads under \"sandbox\"",
+		`{"sandbox": {"filesystem": {"allowWrite": "/x"}}}`:                           "is a list of paths",
+		`{"sandbox": true}`: "\"sandbox\" is an object",
+	} {
+		if _, problems := load(t, withConfig(bad)); !strings.Contains(showProblems(problems), says) {
+			t.Errorf("%s: %s", bad, showProblems(problems))
+		}
+	}
+}
+
+// The sandbox's loosenings: each key Claude Code has, from the person's
+// own files; a repository's loosening waits for the trust, its false
+// keeps one off before it, and the keys Claude Code takes from the
+// person's settings alone (allowAppleEvents, allowNestedUserNamespaces,
+// filesystem.disabled, bwrapPath) are left out of a repository's file,
+// with a warning. ignoreViolations waits for the trust too; socatPath,
+// ripgrep and tlsTerminate are left out with a word of why.
+func TestSettingsSandboxLoosenings(t *testing.T) {
+	values := func(items []ListItem) string {
+		var out []string
+		for _, it := range items {
+			out = append(out, it.V)
+		}
+		return strings.Join(out, " ")
+	}
+	loose := func(sb Sandbox) string {
+		var on []string
+		for _, key := range Loosenings {
+			if sb.Loose(key) {
+				on = append(on, key)
+			}
+		}
+		return strings.Join(on, " ")
+	}
+	fsys := newFS().put(userJSON, `{"sandbox": {"enabled": true, "allowAppleEvents": true, "allowNestedUserNamespaces": true,
+		"enableWeakerNestedSandbox": true, "bwrapPath": "/opt/bwrap", "filesystem": {"disabled": true}, "socatPath": "/opt/socat",
+		"ripgrep": {"command": "/usr/bin/rg"},
+		"network": {"allowLocalBinding": true, "allowUnixSockets": ["~/.ssh/agent.sock"], "allowMachLookup": ["com.apple.CoreSimulator.*"], "tlsTerminate": {}},
+		"ignoreViolations": {"*": ["/etc/hosts"], "npm": ["/proc"]}}}`).
+		put(projJSON, `{"sandbox": {"enableWeakerNetworkIsolation": true, "allowAppleEvents": false, "bwrapPath": "/work/proj/fake-bwrap",
+		"filesystem": {"disabled": false},
+		"network": {"allowAllUnixSockets": true, "allowLocalBinding": false, "allowUnixSockets": ["/var/run/docker.sock"]},
+		"ignoreViolations": {"*": ["/x"]}}}`)
+	for _, trusted := range []bool{false, true} {
+		in := inputs(fsys)
+		in.Trusted = trusted
+		cfg, problems := load(t, in)
+		if cfg == nil {
+			t.Fatalf("refused: %s", showProblems(problems))
+		}
+		sb := cfg.Sandbox
+		want := "enableWeakerNestedSandbox allowAppleEvents allowNestedUserNamespaces filesystem.disabled"
+		wantSockets, wantIgnored := "/home/dev/.ssh/agent.sock", 2
+		if trusted {
+			want = "enableWeakerNestedSandbox enableWeakerNetworkIsolation allowAppleEvents allowNestedUserNamespaces filesystem.disabled network.allowAllUnixSockets"
+			wantSockets, wantIgnored = wantSockets+" /var/run/docker.sock", 3
+		}
+		if got := loose(sb); got != want {
+			t.Errorf("trusted %v: loosened %q, want %q", trusted, got, want)
+		}
+		if values(sb.UnixSockets) != wantSockets || values(sb.MachLookup) != "com.apple.CoreSimulator.*" || len(sb.IgnoreViolations) != wantIgnored {
+			t.Errorf("trusted %v: sockets %q, mach %q, ignored %+v", trusted, values(sb.UnixSockets), values(sb.MachLookup), sb.IgnoreViolations)
+		}
+		if sb.Bwrap != "/opt/bwrap" {
+			t.Errorf("trusted %v: bwrap %q", trusted, sb.Bwrap)
+		}
+		if iv := sb.IgnoreViolations[0]; iv.Command != "*" || iv.What != "/etc/hosts" {
+			t.Errorf("the first ignored: %+v", iv)
+		}
+		wantProblem(t, problems, Warning, projJSON, 0, "\"sandbox.allowAppleEvents\" in a project's file is not taken")
+		wantProblem(t, problems, Warning, projJSON, 0, "\"sandbox.filesystem.disabled\" in a project's file is not taken")
+		wantProblem(t, problems, Warning, projJSON, 0, "\"sandbox.bwrapPath\" in a project's file is not taken")
+		wantProblem(t, problems, Warning, userJSON, 0, "\"sandbox.socatPath\" is left out")
+		wantProblem(t, problems, Warning, userJSON, 0, "\"sandbox.ripgrep\" is left out")
+		wantProblem(t, problems, Warning, userJSON, 0, "\"sandbox.network.tlsTerminate\" is left out")
+		held := slices.ContainsFunc(cfg.Held, func(h Held) bool { return h.Kind == KindSandboxWider })
+		if held == trusted {
+			t.Errorf("trusted %v: the repository's loosenings held %v", trusted, held)
+		}
+	}
+	// A whole path only, as Claude Code takes it.
+	if _, problems := load(t, withConfig(`{"sandbox": {"bwrapPath": "bwrap"}}`)); !strings.Contains(showProblems(problems), "not a whole path") {
+		t.Errorf("a relative bwrapPath: %s", showProblems(problems))
+	}
+	// A pattern is kept where the sandbox finds what it matches (denyRead,
+	// credentials.files), and left out, with a warning, where it writes or
+	// reads; PATH is not hidden (the sandbox review).
+	cfg, problems := load(t, withConfig(`{"sandbox": {"filesystem": {"denyRead": ["~/**/.env"], "allowWrite": ["~/build-*"]},
+		"credentials": {"files": [{"path": "~/.ssh/id_*", "mode": "deny"}], "envVars": [{"name": "PATH", "mode": "deny"}, {"name": "NPM_TOKEN", "mode": "deny"}]}}}`))
+	if cfg == nil {
+		t.Fatalf("refused: %s", showProblems(problems))
+	}
+	sb := cfg.Sandbox
+	if values(sb.DenyRead) != "/home/dev/**/.env" || values(sb.HiddenFiles) != "/home/dev/.ssh/id_*" || len(sb.AllowWrite) != 0 || values(sb.HiddenVars) != "NPM_TOKEN" {
+		t.Errorf("denyRead %q, hidden %q, allowWrite %q, vars %q", values(sb.DenyRead), values(sb.HiddenFiles), values(sb.AllowWrite), values(sb.HiddenVars))
+	}
+	wantProblem(t, problems, Warning, userJSON, 0, "is a pattern, and only a path")
+	wantProblem(t, problems, Warning, userJSON, 0, "PATH is not hidden from sandboxed commands")
 }

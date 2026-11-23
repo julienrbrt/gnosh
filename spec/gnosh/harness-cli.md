@@ -138,8 +138,10 @@ own. A name gnosh does not know is a startup error (CFG-40).
 | `gnosh models` | Lists the models each usable provider offers, and the providers that were left out with the reason. Never loads a model (CFG-61). | (none) | P1 |
 | `gnosh session list\|show <id>\|last\|delete <id>\|rename <id> <title>` (aliases `sessions`, `s`; `ls`; `rm`), each with `--json` | Sessions from the command line. Starts no provider (CFG-70). | (none) | P1 |
 | `gnosh mem [show [name...] \| find <words> \| log [n]]` | The project's `mem` from a terminal, without a model. What `mem` refuses exits 1. The other spec set. | (none) | P1 |
-| `gnosh prompt show\|path\|export\|tools\|context` | What the model is sent, and where to change it (CLI-12). | `/context` | P1 |
-| `gnosh logs [-f] [-t N]` | The project's log: the last N lines (1000 unless said), or follow it. | (none) | P1 |
+| `gnosh prompt show [name]\|path\|export [name...] [--force]` | What the model is sent, and where to change it (CLI-12). `tools` and `context` are `/context all`. | `/context` | P1 |
+| `gnosh agents [--json] [--all] [--cwd dir]` | The sessions in the background (`--bg`, `/background`, `/fork`) of every folder, or of one and the folders in it: the working ones, then those done in the last week (`--all`: every one kept). `--json` lists the working ones, and with `--all` the rest. | `claude agents` | P1 |
+| `gnosh logs [-f] [-t N] [session]` | The project's log: the last N lines (1000 unless said), or follow it; with a session, what that run in the background printed. | `claude logs` | P1 |
+| `gnosh stop <session>` (also `kill`) | Stops a session in the background. | `claude stop` | P1 |
 | `gnosh dirs` | Which config and data directories are in use. | (none) | P1 |
 | `gnosh --version` | The build: a time and a commit. A session started before a new build was installed must report **its own** build, not the file now on disk. | `--version` | P0 |
 

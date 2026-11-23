@@ -420,9 +420,16 @@ unnoticed.)
 As CC does (`spec/cc/`), with gnosh's own file added:
 
 - In the working directory **and every directory above it**, outermost first
-  and closest last: `AGENTS.md`, `GNOSH.md`, `CLAUDE.md`, `CLAUDE.local.md`.
-- The user's global files: `~/.config/gnosh/GNOSH.md` and
-  `~/.config/AGENTS.md`, and anything added with `option global-context-path`.
+  and closest last: `AGENTS.md`, `GNOSH.md`, `CLAUDE.md`, each also in the
+  directory's `.gnosh/` and `.claude/` (`.claude/CLAUDE.md`), then the rules
+  in `.gnosh/rules/` and `.claude/rules/` (a rule with `paths:` waits for a
+  file it names, as Claude Code's does), then `CLAUDE.local.md`
+  (DECISIONS 245).
+- The user's global files: `~/.config/gnosh/GNOSH.md`, the rules in
+  `~/.config/gnosh/rules/`, and `~/.config/AGENTS.md`, and anything added with
+  `option global-context-path`. (`~/.claude/CLAUDE.md` is not read.)
+- At the start, files that come to more than 40,000 characters are said to be
+  long (DECISIONS 261), as Claude Code warns.
 - A subdirectory's own files, **the first time the agent reads, writes or
   edits a file there** (P1). They arrive with that tool's result. One longer
   than 40,000 characters comes cut, with a note to read the rest.

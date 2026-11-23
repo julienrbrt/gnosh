@@ -11,6 +11,7 @@ package gnovm
 
 import (
 	"context"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -80,6 +81,37 @@ func TestFmtRefusesAHugeWidth(t *testing.T) {
 	require.Contains(t, res.Err.Error(), "fmt: a width or precision over 65536")
 	res = runErr(t, h, "", `fmt.Sprintf("%*d", 1<<30, 1)`)
 	require.Contains(t, res.Err.Error(), "is over 65536")
+}
+
+// What one call takes in and pads is capped before Go's fmt builds its
+// text, which it builds whole before the output is cut: operands sharing
+// one string, or one width written many times, took gigabytes (the gno
+// review of 2026-11-19). (Not parallel: it reads what the process
+// allocated.)
+func TestFmtBoundsWhatACallBuilds(t *testing.T) {
+	h := newTestHost(t, t.TempDir())
+	// What the calls are handed is made first: the run that makes it
+	// prepares strings, which costs far more than the calls.
+	run(t, h, "", `s := strings.Repeat("x", 1<<20)
+a := make([]any, 200)
+for i := range a {
+	a[i] = s
+}
+b := make([]byte, 1<<20)
+var sink string
+sink = fmt.Sprint(0)`)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	run(t, h, "", `sink = fmt.Sprint(a...)
+sink = fmt.Sprintf("%v", b)`)
+	runtime.ReadMemStats(&after)
+	if took := after.TotalAlloc - before.TotalAlloc; took > 48<<20 {
+		t.Errorf("the calls allocated %d MB", took>>20)
+	}
+	res := runErr(t, h, "", `fmt.Sprintf(strings.Repeat("%[1]65536d", 100), 1)`)
+	require.Contains(t, res.Err.Error(), "the widths and precisions of the format add up to over")
+	require.Equal(t, `"    1|ab"`, run(t, h, "", `fmt.Sprintf("%5d|%.2s", 1, "abc")`).Value)
 }
 
 func TestFmtChargesPerElement(t *testing.T) {

@@ -1,0 +1,43 @@
+gnosh agents
+
+  The sessions that run in the background, and those that ran: a view of them
+  on a terminal. The sessions gnosh --bg, /background and /fork started, from
+  every folder (with --cwd, from that folder and the folders in it): the
+  working ones first, then those done in the last week. On a terminal it is a
+  view to work in, as Claude Code's agent view: Space peeks at a run, Enter
+  watches a working one or opens one that is over, Ctrl+X stops one, a prompt
+  typed at the bottom starts one, and ? lists the keys; -y, --permission-mode,
+  --model and --effort go to the runs it starts. Elsewhere, and with --json,
+  it prints the list, each run named by the start of its ID, which gnosh logs,
+  gnosh stop and gnosh -r take.
+
+  Not built yet in this build of gnosh: typing it stops with a message that
+  says so.
+
+Usage
+  gnosh agents [flags]
+
+Flags
+  --json
+      Print JSON instead of text: the working sessions, and with --all the
+      others too. (Not built yet.)
+  --all
+      Also list every session that is done, not only those of the last week.
+      (Not built yet.)
+  --cwd <dir>
+      Work in this folder instead of the current one.
+  -y, --yolo, --dangerously-skip-permissions
+      Skip every permission question; the same as --permission-mode
+      bypassPermissions. A print run refuses whatever would have asked, unless
+      it is given this, a permission mode or allow rules.
+  --permission-mode <mode>
+      Start in this permission mode: default (also written manual), plan,
+      acceptEdits, dontAsk or bypassPermissions. (Not built yet.)
+  -m, --model <model>
+      Use this model for this run only, written as model or provider/model.
+      Nothing is saved.
+  --reasoning-effort, --effort <level>
+      How hard the model thinks in this run. The levels depend on the model.
+      (Not built yet.)
+  -h, --help
+      Show help: gnosh's, or after a command's name that command's.

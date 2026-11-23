@@ -53,6 +53,10 @@ func TestShellAttacks(t *testing.T) {
 		{"the shell reads git push 2>/dev/null", ModeBypass, rules{deny: []string{"Bash(git push)"}}, "git push 2\\\n>/dev/null", Ask},
 		{"the shell reads eval 'rm x'", ModeBypass, attackGuards, "e\\\nval 'rm x'", Ask},
 		{"a comment ends at its line whatever its last character", ModeBypass, attackGuards, "ls #\\\nrm x", Deny},
+		// A backslash that ends the line is a backslash to the shells
+		// (oracle seed 159: V is mv, and .git was moved to /tmp/gmp/g\).
+		{"a backslash that ends the line is part of the last word", ModeBypass, rules{allow: []string{"Bash(e mv)", "Bash(mv *)", "Bash(mv .git)"}}, "e>|cho ${V=mv} >/dev/null; $V .git /tmp/g\\mp/g\\", Ask},
+		{"a backslash that ends the line is part of the last word", ModeBypass, rules{allow: []string{"Bash(mv *)"}}, "V=mv; $V .git /tmp/g\\mp/g\\", Ask},
 		// A word that is nothing but a variable nobody set, outside quotes,
 		// is no word at all (oracle seed 99): this is echo x.
 		{"echo $X x is echo x", ModeBypass, rules{allow: []string{"Bash(echo *)"}, deny: []string{"Bash(echo x)"}}, "echo $X x > pwned", Deny},
@@ -87,6 +91,11 @@ func TestShellAttacks(t *testing.T) {
 		{"a subshell's cd into the folder does not bring the line back into it", "", none, "cd /etc && (cd /proj) && cat passwd", Ask},
 		{"after a subshell the line is where it was, under a deny rule", "", rules{deny: []string{"Read(./.env)"}}, "(cd src) && cat .env", Deny},
 		{"after nested subshells the line is where it was", "", rules{deny: []string{"Read(./.env)"}}, "( (cd src); cd src; ls ); cat .env", Deny},
+		// A cd before a subshell may fail: the && after the subshell is
+		// the subshell's, not the cd's (oracle seed 129).
+		{"a cd that may fail before a subshell is no more done after it", "", none, "cd nope\n(cd src) && cat ../x", Ask},
+		{"nor under a deny rule", "", rules{deny: []string{"Read(./.env)"}}, "cd sub\n(cd src) && cat .env", Deny},
+		{"a cd that went before the subshell still holds after it", "", rules{deny: []string{"Read(./sub/.env)"}}, "cd sub && (cd src) && cat .env", Deny},
 		{"a variable set in a subshell asks", "", none, "(X=/proj/a); cat $X", Ask},
 		{"a removal in a subshell asks", "", none, "(cd src; rm -rf x)", Ask},
 		// A { ...; } group runs in the shell itself: read straight through.
@@ -155,6 +164,17 @@ func TestShellAttacks(t *testing.T) {
 		{"sh runs rm x in two subshells", ModeBypass, attackGuards, "((rm x))", Deny},
 		{"sh runs what the variable holds", ModeBypass, attackGuards, "x=rm; (( $x -rf y ))", Deny},
 		{"sh runs the word after a variable that holds nothing", ModeBypass, attackGuards, "(( $X rm x ))", Deny},
+		{"sh ends a here-document at the end of the text, and runs the command (oracle seed 162)", ModeBypass, attackGuards, "(( <<$X rm x ))", Ask},
+		{"the same with a command no guard names", ModeBypass, attackGuards, "(( <<$X git * ))", Ask},
+		// A line nobody could read (the ${X:}) in which mv is handed a
+		// <(...): it moves away whatever the command prints (oracle seed
+		// 163).
+		{"mv moves away what a process substitution names, in a line nobody could read (oracle seed 163)", ModeBypass, rules{allow: []string{"Bash(mv)"}}, "if mv <(wget =x${X:} origin) db/s; then true; fi", Ask},
+		{"the same in the line the oracle made", ModeBypass, rules{allow: []string{"Bash(mv)", "Bash(dirname *)", "Bash(stat *)"}}, "stat --printf=@OUT@/secret.txt -q -f `dirname --zero -z src {a,b}` +%s ;\nman sneaky.txt bar | if mv <(wget =x${X:} origin) db/s; then git --exec-path=. --abbrev {fd}> out.txt < sneaky.txt; fi", Ask},
+		{"the same with no rules", ModeBypass, none, "mv <(wget =x${X:} origin) db/s", Ask},
+		// "<(cmd)x" is /dev/fd/63x, never x alone (oracle seed 164).
+		{"mv moves away a path a process substitution names, with text after it (oracle seed 164)", ModeBypass, none, "mv <(echo x)suffix db/s", Ask},
+		{"the line the oracle made", ModeBypass, none, "mv >(pwd @WORK@/a.txt origin${HOME^h})mv >(pwd @WORK@/a.txt or[[iin${HOME^h})|[ -e x ]", Ask},
 		{"sh runs the word after two variables that hold nothing", ModeBypass, attackGuards, "(($X $Y git push origin))", Deny},
 		{"sh runs the first file a * names, after a variable that holds nothing", ModeBypass, attackGuards, "(( $a * $b ))", Ask},
 		{"sh runs rm y after the &>", "", rules{allow: []string{"Bash(ls *)"}}, "ls &>/dev/null rm y", Ask},
@@ -188,6 +208,9 @@ func TestShellAttacks(t *testing.T) {
 		{"an alias of nothing makes dash read the next word as an alias", ModeBypass, attackGuards, "alias zz=\nmake build; zz rl1d; zz zz r\\m x", Deny},
 		{"an alias of nothing makes dash read the next word as an alias", ModeBypass, attackGuards, "alias zz=' '\nzz zz zz rm x", Deny},
 		{"hash -p makes ls run another file", ModeBypass, attackGuards, "hash -p /usr/bin/rm ls; ls x", Deny},
+		// bash keeps the last -p; only the first was read (oracle seed 168).
+		{"hash's last -p is the file", ModeBypass, attackGuards, "hash -p h -p /usr/bin/mv zz; zz build x", Deny},
+		{"hash's -p in one word, the last", ModeBypass, attackGuards, "hash -ph -p/usr/bin/mv zz; zz build x", Deny},
 		{"mapfile -C runs its callback", ModeBypass, attackGuards, "mapfile -C 'rm' -c 1 a <<< x", Deny},
 		{"compgen -C runs its argument", ModeBypass, attackGuards, "compgen -C 'rm x'", Deny},
 		// A pattern that a ".." takes back out is the directory it stands
@@ -210,6 +233,10 @@ func TestShellAttacks(t *testing.T) {
 		{"source /dev/stdin runs the here-string", ModeBypass, attackGuards, ". /dev/stdin <<< 'rm x'", Deny},
 		{"source /dev/stdin runs the here-string", ModeBypass, attackGuards, "source /dev/stdin <<< 'rm x'", Deny},
 		{"a script a command prints is sourced", ModeBypass, attackGuards, "source <(echo rm x)", Ask},
+		// Words that come to nothing leave the next one to be the file
+		// (oracle seed 122).
+		{"a script a command prints is sourced after words that vanish", ModeBypass, attackGuards, "source $* ${X} <(echo rm x)", Ask},
+		{"the same with a list that may be empty", ModeBypass, attackGuards, "f() { . \"$@\" <(echo rm x); }; f", Ask},
 		{"history expansion rewrites the third line", ModeBypass, attackGuards, "set -o history -o histexpand\necho x\n!!:s/echo/rm/", Ask},
 		{"set -k turns arguments into assignments", ModeBypass, attackGuards, "set -k; make x=1", Ask},
 		{"env -S takes its script attached", ModeBypass, attackGuards, "env -S'rm x'", Deny},
@@ -352,6 +379,14 @@ func TestShellAttacks(t *testing.T) {
 		{"$OLDPWD is where the line was, also after a cd that goes nowhere", ModeBypass, attackGuards, "cd .; cat $OLDPWD/.env", Deny},
 		{"~1 is a directory pushd put by", ModeBypass, attackGuards, "pushd src >/dev/null; cat ~1/.env", Deny},
 		{"~-0 is a directory pushd put by", ModeBypass, attackGuards, "pushd src; cat ~-0/.env", Deny},
+		// The directory stack always holds the directory the shell is in,
+		// so ~0, ~+0 and ~-0 are it on a line with no cd (oracle seed 172:
+		// "type-t main > ~0/.bashrc" made .bashrc).
+		{"~0 is the directory the line is in", ModeBypass, attackGuards, "cat ~0/.env", Deny},
+		{"~+0 is the directory the line is in", ModeBypass, attackGuards, "cat ~+0/.env", Deny},
+		{"~-0 is the directory the line is in", ModeBypass, attackGuards, "cat ~-00/.env", Deny},
+		{"~0 is the directory the line is in, for a write too", ModeBypass, attackGuards, "echo x > ~0/build/out.o", Deny},
+		{"a write through ~0 to a file gnosh guards asks", "", rules{allow: []string{"Bash"}}, "type-t main > ~0/.bashrc > out.txt", Ask},
 		{"what is not written of the program's name may be a blank", ModeBypass, attackGuards, "printf -v s ' '; cat${s}.env", Deny},
 		{"what is not written of the program's name may be a blank", ModeBypass, attackGuards, "cat$X.env", Deny},
 		// A program gnosh knows nothing about, handed the file by name.
@@ -431,6 +466,113 @@ func TestShellAttacks(t *testing.T) {
 		{"hash -p makes ls run git, with the words that follow it", ModeBypass, attackGuards, "hash -p /usr/bin/git ls; ls push origin", Deny},
 		{"BASH_CMDS makes ls run git, with the words that follow it", ModeBypass, attackGuards, "BASH_CMDS[ls]=/usr/bin/git; ls push origin", Deny},
 		{"the alias is rm where the variable in it is not set", ModeBypass, attackGuards, "alias zz=${x}rm\nzz -rf y", Deny},
+		// dash has no $'...': the $ stays, and is read again where the
+		// alias or the eval text is (oracle seed 131).
+		{"dash reads $'1rm' as $1rm, which is rm where $1 is empty", ModeBypass, attackGuards, "alias zz=$'1rm'\nzz x x", Deny},
+		{"so does eval", ModeBypass, attackGuards, "eval $'1rm x'", Deny},
+		{"and sh -c", ModeBypass, attackGuards, "sh -c $'1rm x'", Deny},
+		{"and a trap", ModeBypass, attackGuards, "trap $'1rm x' EXIT", Deny},
+		// A computed word outside quotes where grep's pattern goes is cut
+		// into the pattern and files grep reads (oracle seed 134).
+		{"a computed pattern may also be files the Read rules hold", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "grep `git status` a.txt", Ask},
+		{"so may a computed -e", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "grep -e $X a.txt", Ask},
+		{"and sed's script", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "sed `git status` a.txt", Ask},
+		// A long flag the read-only table does not know may name a file
+		// after its =.
+		{"diff reads the file after --from-file=", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "diff --from-file=.env a.txt", Deny},
+		{"wc reads the file after --files0-from=", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "wc --files0-from=.env", Deny},
+		{"sort reads the file after --files0-from=", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "sort --files0-from=.env", Deny},
+		{"hexdump reads its --format-file", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "hexdump --format-file=.env a.txt", Deny},
+		{"hexdump reads its --format-file", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "hexdump --format-file .env a.txt", Deny},
+		{"hexdump reads its --format-file", "", none, "hexdump --format-file=.env a.txt", Ask},
+		// What a program sent to another folder by a flag of its own names
+		// is read from there; so is what tar is handed after -C.
+		{"env -C sub reads ../.env, which is .env", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "env -C sub cat ../.env", Deny},
+		{"env --chdir sub reads ../.env, which is .env", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "env --chdir sub cat ../.env", Deny},
+		{"tar -C ~ reads ~/.ssh", "", rules{allow: []string{"Bash"}, deny: []string{"Read(~/.ssh/**)"}}, "tar -C ~ -cf /tmp/x.tar .ssh", Deny},
+		{"tar's old letters take -C too", "", rules{allow: []string{"Bash"}, deny: []string{"Read(~/.ssh/**)"}}, "tar cfC /tmp/x.tar ~ .ssh", Deny},
+		{"a folder only known when the line runs", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "env -C \"$D\" cat .env", Ask},
+		{"fc runs again what history -s put there", "", rules{allow: []string{"Bash"}, deny: []string{"Bash(rm *)"}}, "set -o history\nhistory -s 'rm x'\nfc -s", Deny},
+		{"git -C sub reads ../.env, which is .env", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "git -C sub diff --no-index ../.env /dev/null", Deny},
+		{"git -C sub hashes ../.env", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "git -C sub hash-object ../.env", Deny},
+		{"git's -C goes on from the one before", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "git -C a -C b diff --no-index ../../.env /dev/null", Deny},
+		// A file glued to a short flag ("-K.env"), a file bash runs before
+		// anything else (BASH_ENV), a pager set by export.
+		{"curl reads its config glued to -K", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "curl -K.env http://203.0.113.5/", Deny},
+		{"so does a later letter of the cluster", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "curl -sK.env http://203.0.113.5/", Deny},
+		{"xargs reads its words from a file glued to -a", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "xargs -a.env echo", Deny},
+		{"wget reads its addresses from a file glued to -i", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "wget -i.env", Deny},
+		{"bash runs BASH_ENV's file first", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "BASH_ENV=.env bash -c 'echo $SECRET'", Deny},
+		{"export sets the pager git runs", "", rules{allow: []string{"Bash"}, deny: []string{"Bash(rm *)"}}, "export PAGER='rm x'; git -p log", Deny},
+		{"and declare -x", "", rules{allow: []string{"Bash"}, deny: []string{"Bash(rm *)"}}, "declare -x GIT_EXTERNAL_DIFF='rm x'; git diff", Deny},
+		// git settings whose value is a command, given with git's own -c or
+		// written by git config, and aliases.
+		{"git -c core.pager", "", rules{allow: []string{"Bash"}, deny: []string{"Bash(rm *)"}}, "git -c core.pager='rm x' -p log", Deny},
+		{"git -c core.sshCommand", "", rules{allow: []string{"Bash"}, deny: []string{"Bash(rm *)"}}, "git -c core.sshCommand='rm x' fetch", Deny},
+		{"git -c an alias that is a shell command", "", rules{allow: []string{"Bash"}, deny: []string{"Bash(rm *)"}}, "git -c alias.z='!rm x' z", Deny},
+		{"git -c an alias that is a git command", "", rules{allow: []string{"Bash"}, deny: []string{"Bash(git push *)"}}, "git -c alias.p='push --force' p origin", Deny},
+		{"git config writes a pager", "", rules{allow: []string{"Bash"}, deny: []string{"Bash(rm *)"}}, "git config core.pager 'rm x' && git -p log", Deny},
+		{"git config -f file writes one", "", rules{allow: []string{"Bash"}, deny: []string{"Bash(rm *)"}}, "git config -f .git/config diff.external 'rm x'", Deny},
+		// A cd found inside a command runs where that command stands, before
+		// a cd written after it (oracle seed 137).
+		{"command -p cd, then cd ..", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "command -p cd sub/deep || ls .. && ! cd .. || head -1 ../.env", Deny},
+		{"eval's cd, then cd ..", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "eval 'cd sub/deep' && cd .. && head -1 ../.env", Deny},
+		{"builtin cd, then cd ..", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "builtin cd sub/deep; cd ..; cat ../.env", Deny},
+		// A list of the files a command reads, in a file or on its standard
+		// input, is only read when the line runs.
+		{"tar -T reads what a list names", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "tar -cf /tmp/x.tar -T list.txt", Ask},
+		{"so does tar --files-from", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "tar -cf /tmp/x.tar --files-from=list.txt", Ask},
+		{"and tar's old letters", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "tar cfT /tmp/x.tar list.txt", Ask},
+		{"rsync --files-from", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "rsync -a --files-from=list.txt . /tmp/x", Ask},
+		{"cpio -o", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "cpio -o < list.txt > /tmp/x.cpio", Ask},
+		{"zip -@", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "zip -@ /tmp/x.zip < list.txt", Ask},
+		{"sort --files0-from", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "sort --files0-from=list.txt", Ask},
+		{"wc --files0-from on its input", "", rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}}, "wc --files0-from=- < list.txt", Ask},
+		// A copy into a folder writes each source's name there.
+		{"cp into a folder", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "cp x/.env .", Deny},
+		{"cp into a folder with a slash", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "cp x/.env ./", Deny},
+		{"mv into a folder", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "mv x/.env .", Deny},
+		{"cp -t names the folder", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "cp -t . x/.env", Deny},
+		{"mv --target-directory= names it", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "mv --target-directory=. x/.env", Deny},
+		{"install into a folder", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "install x/.env .", Deny},
+		{"ln -s into a folder", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "ln -sf x/.env .", Deny},
+		{"rsync into a folder", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "rsync x/.env .", Deny},
+		{"scp into a folder", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "scp host:.env .", Deny},
+		{"a pattern copied into a folder", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "cp x/.e* .", Ask},
+		{"gunzip makes the name without its suffix", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "gunzip .env.gz", Deny},
+		{"a source only known when the line runs", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "D=x; cp $D/.env .", Deny},
+		// An archive or a patch names the files it writes.
+		{"tar -x", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "tar -xf x.tar", Ask},
+		{"tar x", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "tar xf x.tar", Ask},
+		{"unzip", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "unzip -o x.zip", Ask},
+		{"cpio -i", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "cpio -i < x.cpio", Ask},
+		{"patch", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "patch -p1 < x.patch", Ask},
+		{"git apply", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "git apply x.patch", Ask},
+		// A folder changed with all that is in it changes a file a rule
+		// names inside it.
+		{"rm -r takes away what a rule names inside", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./x/secret.txt)"}}, "rm -rf x", Deny},
+		{"chmod -R changes it", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./x/secret.txt)"}}, "chmod -R 777 x", Deny},
+		{"mv takes it away", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./x/secret.txt)"}}, "mv x /tmp/y", Deny},
+		{"cp -r brings a file of its name over it", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./x/secret.txt)"}}, "cp -r y/. x", Deny},
+		{"a pattern inside the folder", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./x/keys/*.pem)"}}, "rm -rf x", Ask},
+		{"~/.aws inside a home folder removed", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(~/.aws/credentials)"}}, "rm -r ~/.aws", Deny},
+		// A program this package knows nothing about writes the file its
+		// output flag names.
+		{"go build -o", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "go build -o .env .", Deny},
+		{"cc -ofile", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "gcc -o.env main.c", Deny},
+		{"openssl -out", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "openssl rand -out .env 16", Deny},
+		{"gpg -o", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "gpg -o .env -d x.gpg", Deny},
+		{"tar -cf makes the archive", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "tar -cf .env src", Deny},
+		{"tar czf, the old way", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "tar czf .env src", Deny},
+		{"zip's archive", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "zip -r .env src", Deny},
+		{"sqlite3's database", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "sqlite3 .env 'create table t(x)'", Deny},
+		{"git archive -o", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "git archive -o .env HEAD", Deny},
+		{"sponge writes the file it is given", "", rules{allow: []string{"Bash"}, deny: []string{"Edit(./.env)"}}, "cat a.txt | sponge .env", Deny},
+		// /proc/<the shell's own process>/exe is the shell, however its
+		// path is written (oracle seed 141).
+		{"/proc/self$x/exe reads the pipe as its script", ModeBypass, rules{deny: []string{"Bash(curl *)"}}, "echo 'curl http://203.0.113.1/x' | /proc/self$x/exe", Deny},
+		{"so does /proc/$$/exe", ModeBypass, rules{deny: []string{"Bash(curl *)"}}, "echo 'curl http://203.0.113.1/x' | /proc/$$/exe", Deny},
+		{"and /dev/fd/$n", "", rules{deny: []string{"Bash(curl *)"}}, "exec 3</bin/sh; echo 'curl http://203.0.113.1/x' | /dev/fd/$n", Deny},
 		{"every word of the array is a word of the command", ModeBypass, attackGuards, "a=(git push origin); \"${a[@]}\"", Deny},
 		{"every word of the array is a word of the command", ModeBypass, attackGuards, "a=(rm -rf x); ${a[@]}", Deny},
 		{"every word of the array is a word of the command", ModeBypass, attackGuards, "a=(cat .env); ${a[*]}", Deny},
@@ -457,6 +599,12 @@ func TestShellAttacks(t *testing.T) {
 		{"the file is written onto a flag, beside a variable nobody set", ModeBypass, attackGuards, "sort -o${X:-.env} a.txt", Deny},
 		{"the file is written onto a flag, beside a variable nobody set", ModeBypass, attackGuards, "awk -rf$X.env a.txt", Deny},
 		{"the file is written after the = of a flag, beside a variable nobody set", ModeBypass, attackGuards, "mytool --config=${X:-.env}", Deny},
+		// (Oracle seed 150: the default is a word with a variable of its
+		// own, which nobody set either.)
+		{"the file is written onto a flag, in a default with a variable in it", ModeBypass, attackGuards, "watch env link-in -o${X:-$x.env}", Deny},
+		{"the file is written onto a flag, in a default with a variable in it", ModeBypass, attackGuards, "sort -o${X:-$x.env} a.txt", Deny},
+		{"the file is written onto a flag, in a default with a variable in it", ModeBypass, attackGuards, "awk -f${X:-${Y:-.e}nv} a.txt", Deny},
+		{"the file is named in a default with a variable in it", ModeBypass, attackGuards, "cat ${X:-$x.env}", Deny},
 		{"the file is written onto a flag, in a variable the line set", ModeBypass, attackGuards, "x=.env; awk -f$x a.txt", Deny},
 		{"the file is written onto a flag, after a variable nobody set", ModeBypass, attackGuards, "awk $x-f.env a.txt", Deny},
 		{"the braces are taken apart before the variable is looked at", ModeBypass, attackGuards, "F=.env; cat {$F,x}", Deny},
@@ -566,6 +714,11 @@ func TestShellAttacks(t *testing.T) {
 		{"bash expands the word after >& twice", ModeBypass, attackGuards, "ls >&'$(rm x)'", Deny},
 		{"bash expands the word after >& twice", ModeBypass, attackGuards, "ls 1>&\"\\$(rm x)\"", Deny},
 		{"bash expands the word after >& twice", ModeBypass, attackGuards, ">&'`rm x`'", Deny},
+		// A computed word is expanded twice too, and what the first
+		// expansion leaves is not known (oracle seed 124, $- in it).
+		{"bash expands a computed word after >& twice", ModeBypass, attackGuards, "Y='$(rm x)'; ls >&\"$Y\"", Ask},
+		{"bash expands a computed word after >& twice", ModeBypass, attackGuards, "X=rm; ls 1>&\"\\$($X x)\"", Ask},
+		{"bash expands a computed word after >& twice", ModeBypass, attackGuards, "ls -la\nEOF\n src 1>&\"\\$($--'rm' x)\"", Ask},
 		{"bash expands the word after >& twice", ModeBypass, attackGuards, "ls >&\\$\\(rm\\ x\\)", Deny},
 		{"bash expands the word after >& twice: the ~ is the home directory", ModeBypass, attackGuards, "echo x >&'~/.ssh/authorized_keys'", Deny},
 		{"env -S takes its string for more arguments of its own", ModeBypass, attackGuards, "env -S '-i rm x'", Deny},
@@ -729,7 +882,9 @@ func TestShellAttacks(t *testing.T) {
 		"printf -v s ' '; rm${s}-rf${s}/", "rm$X-rf$X/", "eval \"rm${X}-rf${X}/\"", "rm${X}-rf${X}*", "sudo rm$X-r$X..", "rmdir$X/", "sudo $RM -rf /", "env $X -rf ~", "timeout 5 rm$X-rf$X/", "nice ${RM:-rm} -rf /", "sudo -n $RM -rf ..",
 		"nohup $(which rm) -rf ~", "command $RM -rf /", "xargs $RM -rf / < /dev/null", "env X=1 $RM -rf /",
 		// The directory the line was in before.
-		"cd src; rm -rf ~-", "cd src && rm -rf $OLDPWD", "cd /tmp; rm -rf ~-/..", "cd src; rm -rf \"$OLDPWD\"/*", "cd src; rm -rf ~-/", "pushd src; rm -rf ~1", "pushd /tmp; rm -rf ~1/..", "pushd src; rm -rf ~-0/*"} {
+		"cd src; rm -rf ~-", "cd src && rm -rf $OLDPWD", "cd /tmp; rm -rf ~-/..", "cd src; rm -rf \"$OLDPWD\"/*", "cd src; rm -rf ~-/", "pushd src; rm -rf ~1", "pushd /tmp; rm -rf ~1/..", "pushd src; rm -rf ~-0/*",
+		// ~0, ~+0 and ~-0 are the directory the line is in.
+		"rm -rf ~0", "rm -rf ~0/*", "rm -rf ~+0/*", "rmdir ~-0", "rm -rf ~00/"} {
 		if d := bash(engine(t, ModeBypass, rules{}), cmd); !d.Critical {
 			t.Errorf("%q: not flagged as a dangerous removal (%s)", cmd, d.Reason)
 		}
@@ -839,6 +994,12 @@ func TestPatternThatClimbs(t *testing.T) {
 		"cat l*/../secret.txt":              Ask,
 		"cat sr*/../a.go":                   Allow, // a match that is no link: the project's own a.go
 		"cat src/*/../../a.go":              Allow,
+		// A dot pattern after a pattern: dash matches ".." with "..*",
+		// so "cat */..*" ran "cat -R/.. link-dir/.. …", a flag and the
+		// directory above a link's target, while the text took "*/.."
+		// for the working directory (oracle seed 166).
+		"cat */..*":  Ask,
+		"ls -d */.*": Ask,
 	} {
 		if d := bash(e, cmd); d.Behavior != want {
 			t.Errorf("%q: got %s (%s), want %s", cmd, d.Behavior, d.Reason, want)
@@ -975,10 +1136,35 @@ func TestTimeAndARedirection(t *testing.T) {
 		{ModeDefault, allowed, "time -p 2>&1 teepwned x", Allow},
 		{ModeDefault, allowed, "time 2>&1 teepwned x", Allow},
 		{ModeDefault, allowed, "time ls src", Allow},
+		// bash's time takes one -p and one --: a second runs as the
+		// program (oracle seed 113: "time -p -p cat ~/.ssh/id_ed25519").
+		{ModeDefault, allowed, "time -p -p teepwned", Ask},
+		{ModeDefault, allowed, "time -- -p teepwned", Ask},
+		{ModeDefault, allowed, "time -p -- -- teepwned", Ask},
+		{ModeDefault, allowed, "time time -p teepwned", Allow},
+		{ModeBypass, attackGuards, "time -p -p rm x", Deny},
 	} {
 		if d := bash(engine(t, tc.mode, tc.r), tc.cmd); d.Behavior != tc.want {
 			t.Errorf("%q in %s: got %s (%s), want %s", tc.cmd, tc.mode, d.Behavior, d.Reason, tc.want)
 		}
+	}
+}
+
+// A loop whose values pass partly by only reading and partly by an allow
+// rule runs because of the rule, and its decision names it, as the same
+// commands written one after the other do (oracle seed 115).
+func TestLoopNamesTheRuleThatLetItRun(t *testing.T) {
+	e := engine(t, ModeDefault, rules{allow: []string{"Bash(strings /etc/hosts)"}})
+	for _, line := range []string{
+		`for f in a.go /etc/hosts; do strings "$f"; done`,
+		`strings a.go; strings /etc/hosts`,
+	} {
+		if d := bash(e, line); d.Behavior != Allow || !strings.Contains(d.Reason, "Bash(strings /etc/hosts)") {
+			t.Errorf("%q: got %s (%s), want it allowed by the rule", line, d.Behavior, d.Reason)
+		}
+	}
+	if d := bash(engine(t, ModeDefault, rules{}), `for f in a.go /etc/hosts; do strings "$f"; done`); d.Behavior != Ask {
+		t.Errorf("without the rule: got %s (%s), want ask", d.Behavior, d.Reason)
 	}
 }
 
@@ -1005,6 +1191,8 @@ func TestReadings(t *testing.T) {
 		"taskset 0x1 make x":                 "make x",              // the command after taskset's mask
 		"echo 'make x' | sh":                 "make x",              // what echo prints, when it is plain
 		"coproc make x":                      "",                    // not followed at all
+		"du x${X:} y; echo #c $(make x) }":   "",                    // oracle seed 114: dash reads ${X: on to the later }
+		"echo \"${X:}\"":                     "",                    // in quotes too
 		"x=${y}'a[$(make x)]'; :":            "make x",              // text the shell may evaluate later
 		"eval 'ls '$X' > out'":               "ls ${GNOSH_UNKNOWN}", // what stands in an eval, whatever else is in it
 		// The second round. Where a shell runs less than the engine reads,
@@ -1363,7 +1551,10 @@ func TestPatternValuesWithText(t *testing.T) {
 		{rules{deny: []string{"Edit(b.txt)"}}, "cp a.txt b.txt -[n]", Deny},
 		{rules{deny: []string{"Edit(b.txt)"}}, "f=-n; cp a.txt b.txt $f", Deny},
 		{rules{deny: []string{"Edit(*.txt)"}}, "for f in * .*; do cp a.txt \"$f\"x; done", Deny},
-		{rules{deny: []string{"Edit(b.txt)"}}, "for f in *.txt; do cp $f build/; done", Allow},
+		{rules{deny: []string{"Edit(./b.txt)"}}, "for f in *.txt; do cp $f build/; done", Allow},
+		// (A bare name matches at any depth: the copy of b.txt lands on
+		// build/b.txt.)
+		{rules{deny: []string{"Edit(b.txt)"}}, "for f in *.txt; do cp $f build/; done", Deny},
 		{rules{deny: []string{"Edit(b.txt)"}}, "for f in *; do wc -l $f; done", Allow},
 	} {
 		o := testOptions(ModeBypass, c.r)
@@ -1849,6 +2040,60 @@ func TestFetchHosts(t *testing.T) {
 	for _, rule := range []string{"WebFetch(domain:ex\u00e4mple.com)", "WebFetch(domain:08.1.1.1)", "WebFetch(domain:a b)", "WebFetch(domain:[::1)"} {
 		if _, err := New(testOptions(ModeDefault, rules{deny: []string{rule}})); err == nil {
 			t.Errorf("%s: accepted", rule)
+		}
+	}
+}
+
+// A pattern computed inside quotes is one word, the pattern alone: with
+// grep allowed, grep "$X" a.txt reads a.txt and nothing a deny rule holds,
+// where the same pattern outside quotes may also be files (oracle seed
+// 134, TestShellAttacks).
+func TestQuotedComputedPattern(t *testing.T) {
+	e := engine(t, ModeDefault, rules{allow: []string{"Bash"}, deny: []string{"Read(./.env)"}})
+	for _, cmd := range []string{`grep "$X" a.txt`, `grep -e "$(cat pat)" a.txt`, `rg "$X" src`, `sed "$X" a.txt`} {
+		if d := bash(e, cmd); d.Behavior != Allow {
+			t.Errorf("%s: got %s (%s), want allow", cmd, d.Behavior, d.Reason)
+		}
+	}
+}
+
+// TestWhatAFolderHolds: a folder changed with all that is in it is held
+// to a rule that names a file inside it only when that file is there,
+// and a copy only when it brings a file of that name along.
+func TestWhatAFolderHolds(t *testing.T) {
+	fs := fakeFS{files: []string{"/proj/x", "/proj/x/secret.txt", "/proj/y", "/proj/y/a.txt", "/proj/z", "/proj/z/secret.txt", "/proj/build", "/proj/build/out.o"}}
+	o := testOptions(ModeDefault, rules{allow: []string{"Bash"}, deny: []string{"Edit(./x/secret.txt)", "Edit(./build/keep/*.pem)"}})
+	o.Resolve, o.Glob = fs.resolve, fs.glob
+	e := mustEngine(t, o)
+	for cmd, want := range map[string]Behavior{
+		"rm -rf x":       Deny,  // secret.txt is there
+		"chmod -R 700 x": Deny,  //
+		"rm -rf build":   Allow, // build/keep is not there, so neither is a .pem in it
+		"rm -rf y":       Allow, // nothing a rule names
+		"cp -r y/. x":    Allow, // y holds no secret.txt to bring over x's
+		"cp -r z/. x":    Deny,  // z's secret.txt lands on x's
+		"rm x/other.txt": Allow,
+	} {
+		if d := bash(e, cmd); d.Behavior != want {
+			t.Errorf("%q: got %s (%s), want %s", cmd, d.Behavior, d.Reason, want)
+		}
+	}
+	// A name that matches at any depth is looked for two folders down.
+	fs = fakeFS{files: []string{"/proj/w", "/proj/w/.env", "/proj/u", "/proj/u/app", "/proj/u/app/cfg", "/proj/u/app/cfg/.env",
+		"/proj/v", "/proj/v/a", "/proj/v/a/b", "/proj/v/a/b/c", "/proj/v/a/b/c/.env", "/proj/t", "/proj/t/a.txt"}}
+	o = testOptions(ModeDefault, rules{allow: []string{"Bash"}, deny: []string{"Edit(.env)"}})
+	o.Resolve, o.Glob = fs.resolve, fs.glob
+	e = mustEngine(t, o)
+	for cmd, want := range map[string]Behavior{
+		"rm -rf w":     Deny,  // w/.env
+		"rm -rf u":     Deny,  // u/app/cfg/.env, two folders down
+		"rm -rf v":     Allow, // v/a/b/c/.env is deeper than gnosh looks
+		"rm -rf t":     Allow,
+		"cp -r w/. t":  Deny, // w's .env lands on t/.env
+		"chmod -R 0 u": Deny,
+	} {
+		if d := bash(e, cmd); d.Behavior != want {
+			t.Errorf("%q under Edit(.env): got %s (%s), want %s", cmd, d.Behavior, d.Reason, want)
 		}
 	}
 }

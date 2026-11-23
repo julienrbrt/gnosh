@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -35,6 +36,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/gnosh-ai/gnosh/internal/trust"
 )
 
 // Def is one kind of sub-agent.
@@ -92,16 +95,86 @@ type Def struct {
 	// level of its model, max, or auto.
 	Skills []string
 	Effort string
-	// Other lists the fields of the frontmatter that change what the
-	// sub-agent is or may do and that this package only notes:
-	// mcpServers, memory. A caller that cannot honour one must say so, and
-	// not run the agent as if the field were not there.
-	Other []string
+	// MCPServers are the MCP servers the agent is given (mcpServers), in
+	// the order written: each a server the session has, by its Name, or
+	// one of its own, Inline (an entry in the shape .mcp.json writes one,
+	// under Name), connected while the agent runs.
+	MCPServers []MCPServer
+	// Memory is where the agent keeps a memory of its own, a folder that
+	// outlasts its sessions (memory): "user", across every project;
+	// "project", in the project, shared with whoever works on it; "local",
+	// in the project, kept out of version control; or "" for none.
+	Memory string
+	// CompactWindow is the window of context, in tokens, at which the
+	// agent's sub-agents make room (autoCompactWindow), when it is lower
+	// than their session's: 100000 or more, or 0. CompactWindowUnused is
+	// a value written that is not that (Claude Code reads "200k" as 200,
+	// below the least, and runs the agent as if it were not there), as
+	// written, for /agents to say.
+	CompactWindow       int
+	CompactWindowUnused string
 
 	// Scope is "built-in", "user" or "project", and Source the file the
 	// definition was read from (empty for a built-in).
 	Scope  string
 	Source string
+}
+
+// MCPServer is one entry of an agent's mcpServers: a server of the
+// session's, by name, or one of the agent's own, Inline.
+type MCPServer struct {
+	Name   string
+	Inline json.RawMessage
+}
+
+// mcpServers reads an agent's mcpServers, as JSON: a list whose entries are
+// each a server's name, or an object holding one server under its name.
+// The reason says what is wrong, as the end of a sentence about the field.
+func mcpServers(raw json.RawMessage) ([]MCPServer, string) {
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, "is not a list of servers' names and servers"
+	}
+	var out []MCPServer
+	seen := map[string]bool{}
+	add := func(m MCPServer) string {
+		if seen[m.Name] {
+			return fmt.Sprintf("names the server %q twice", m.Name)
+		}
+		seen[m.Name] = true
+		out = append(out, m)
+		return ""
+	}
+	for _, item := range items {
+		var name string
+		if json.Unmarshal(item, &name) == nil {
+			if name = strings.TrimSpace(name); name == "" {
+				return nil, "has an entry with no name"
+			}
+			if strings.ContainsAny(name, ": \t") {
+				// (A server of its own written on one line, "- name: x".)
+				return nil, fmt.Sprintf("has the entry %q, which is not a server's name: a server of the agent's own is written as its name and, indented under it, its settings", name)
+			}
+			if why := add(MCPServer{Name: name}); why != "" {
+				return nil, why
+			}
+			continue
+		}
+		var one map[string]json.RawMessage
+		if json.Unmarshal(item, &one) != nil || len(one) != 1 {
+			return nil, "has an entry that is neither a server's name nor one server written under its name"
+		}
+		for name, server := range one {
+			var fields map[string]json.RawMessage
+			if strings.TrimSpace(name) == "" || json.Unmarshal(server, &fields) != nil || fields == nil {
+				return nil, fmt.Sprintf("has the server %q, which is not written as an object of its settings", name)
+			}
+			if why := add(MCPServer{Name: name, Inline: server}); why != "" {
+				return nil, why
+			}
+		}
+	}
+	return out, ""
 }
 
 // Skipped is a file that holds no usable definition, with the reason.
@@ -162,9 +235,9 @@ func (s *Set) WithoutBuiltin(names ...string) *Set {
 // or none when userDir is empty.
 func Load(userDir string, projectDirs []string) *Set {
 	if userDir == "" {
-		return LoadFrom(nil, projectDirs)
+		return LoadFrom(nil, projectDirs, nil)
 	}
-	return LoadFrom([]string{userDir}, projectDirs)
+	return LoadFrom([]string{userDir}, projectDirs, nil)
 }
 
 // LoadFrom puts the definitions together, the more specific over the more
@@ -176,8 +249,11 @@ func Load(userDir string, projectDirs []string) *Set {
 // folder is only a way to keep files apart, and the name in the file is
 // what counts. A directory that is not there holds nothing. Two files of
 // one directory tree with the same name: the first by path is the one
-// that is used, and the other is listed as skipped.
-func LoadFrom(userDirs, projectDirs []string) *Set {
+// that is used, and the other is listed as skipped. A project's file that
+// is not really inside one of the folders inside names, once the links on
+// the way to it are followed, is skipped too: what it holds would go to
+// the model unasked. With no folders given, every file is read.
+func LoadFrom(userDirs, projectDirs, inside []string) *Set {
 	s := &Set{}
 	have := map[string]bool{}
 	add := func(dir, scope string) {
@@ -200,6 +276,12 @@ func LoadFrom(userDirs, projectDirs []string) *Set {
 		sort.Strings(files)
 		inTree := map[string]string{}
 		for _, path := range files {
+			if scope == "project" && len(inside) > 0 {
+				if target, out := trust.LeadsOut(path, inside...); out && target != "" {
+					s.skipped = append(s.skipped, Skipped{path, "it leads out of the project, to " + target + ", and a project's kinds of sub-agent are read only from inside it"})
+					continue
+				}
+			}
 			data, err := readSmall(path)
 			if err != nil {
 				s.skipped = append(s.skipped, Skipped{path, err.Error()})
@@ -248,14 +330,26 @@ func readSmall(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("it could not be read (%v)", err)
 	}
+	if !info.Mode().IsRegular() {
+		// (A link a repository holds may lead to /dev/zero, a terminal
+		// or a pipe: reading one would never end.)
+		return "", fmt.Errorf("it is not a plain file")
+	}
 	if info.Size() > maxFile {
 		return "", fmt.Errorf("it is larger than %d bytes, which no agent definition is", maxFile)
 	}
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("it could not be read (%v)", err)
 	}
-	if !utf8.Valid(data) {
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxFile+1))
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("it could not be read (%v)", err)
+	case len(data) > maxFile:
+		return "", fmt.Errorf("it is larger than %d bytes, which no agent definition is", maxFile)
+	case !utf8.Valid(data):
 		return "", fmt.Errorf("it is not text")
 	}
 	return string(data), nil
@@ -301,6 +395,10 @@ func (s *Set) Names() []string {
 
 // Skipped returns the files that hold no usable definition.
 func (s *Set) Skipped() []Skipped { return slices.Clone(s.skipped) }
+
+// knownKeys are the settings of a definition gnosh reads.
+var knownKeys = []string{"name", "description", "tools", "disallowedTools", "model", "permissionMode", "maxTurns",
+	"omitClaudeMd", "background", "skills", "effort", "initialPrompt", "hooks", "isolation", "mcpServers", "memory", "autoCompactWindow"}
 
 // Parse reads one definition from the text of a file. reason is empty
 // when it could be read, and otherwise says why the file is skipped.
@@ -368,9 +466,37 @@ func Parse(text string) (d Def, reason string) {
 			}
 		case "isolation":
 			d.Isolation = f.scalar
-		case "mcpServers", "memory":
-			if f.scalar != "" || len(f.items) > 0 || f.nested {
-				d.Other = append(d.Other, f.key)
+		case "mcpServers":
+			raw, err := json.Marshal(f.list())
+			if f.nested {
+				raw, err = BlockJSON(f.block)
+			}
+			if err != nil {
+				return d, "its mcpServers cannot be read: " + err.Error()
+			}
+			servers, why := mcpServers(raw)
+			if why != "" {
+				return d, "its mcpServers " + why
+			}
+			d.MCPServers = servers
+		case "autoCompactWindow":
+			d.compactWindow(strings.TrimSpace(f.scalar))
+		case "memory":
+			if len(f.items) > 0 || f.nested {
+				return d, "its memory is not one word: user, project or local"
+			}
+			if why := memoryScope(f.scalar); why != "" {
+				return d, why
+			}
+			d.Memory = f.scalar
+		default:
+			// A setting gnosh knows, in another letter case
+			// ("disallowedtools"), would be passed over, and the agent run
+			// without what it takes away: the definition is not used.
+			// Keys gnosh does not know at all are passed over, as in
+			// Claude Code.
+			if i := slices.IndexFunc(knownKeys, func(k string) bool { return strings.EqualFold(k, f.key) }); i >= 0 {
+				return d, fmt.Sprintf("it has the setting %q, which gnosh reads only as %q (letter case counts), so it is not used rather than used without it", f.key, knownKeys[i])
 			}
 		}
 	}
@@ -406,8 +532,33 @@ func (d Def) problem() string {
 		return fmt.Sprintf("the name %q cannot be an agent's: a name does not start with a dash, holds no colon, and is at most 256 characters long", clip(d.Name, 80))
 	case d.Description == "":
 		return fmt.Sprintf("the agent %q has no description, which is what says when to use it", d.Name)
+	case d.Memory != "" && (strings.ContainsAny(d.Name, `/\`+"\x00") || d.Name == "." || d.Name == ".."):
+		return fmt.Sprintf("the agent %q keeps a memory, in a folder named as the agent is, and its name names no folder", clip(d.Name, 80))
 	}
 	return ""
+}
+
+// MinCompactWindow is the least autoCompactWindow taken, as Claude Code's.
+const MinCompactWindow = 100000
+
+// compactWindow takes an autoCompactWindow as written: a whole number of
+// tokens, MinCompactWindow or more, or else a value noted as not used.
+func (d *Def) compactWindow(s string) {
+	if n, err := strconv.Atoi(s); err == nil && n >= MinCompactWindow {
+		d.CompactWindow, d.CompactWindowUnused = n, ""
+	} else if s != "" && s != "null" {
+		d.CompactWindow, d.CompactWindowUnused = 0, clip(s, 40)
+	}
+}
+
+// memoryScope says what is wrong with a memory field's word, or "": it is
+// user, project or local (or nothing, for none).
+func memoryScope(s string) string {
+	switch s {
+	case "", "user", "project", "local":
+		return ""
+	}
+	return fmt.Sprintf("its memory is %q, and a memory is user, project or local", clip(s, 40))
 }
 
 func clip(s string, n int) string {
@@ -520,14 +671,19 @@ func frontmatter(lines []string) ([]field, error) {
 		}
 		key, value, ok := strings.Cut(line, ":")
 		key = strings.TrimSpace(key)
+		if len(key) >= 2 && (key[0] == '"' || key[0] == '\'') {
+			key = unquote(key) // a name in quotes, "description": ...
+		}
 		if !ok || key == "" || strings.ContainsAny(key, " \t\"'{}[]") {
 			return nil, fmt.Errorf("line %d is not a setting of the form \"name: value\"", i+2)
 		}
 		f := field{key: key}
 		value = strings.TrimSpace(value)
-		// The lines that belong to this key: the indented ones that follow.
+		// The lines that belong to this key: the indented ones that follow,
+		// and under a key with no value the entries of a list that begin
+		// at the start of the line, as YAML allows.
 		var under []string
-		for i+1 < len(lines) && (strings.TrimSpace(lines[i+1]) == "" || lines[i+1][0] == ' ' || lines[i+1][0] == '\t') {
+		for i+1 < len(lines) && (strings.TrimSpace(lines[i+1]) == "" || lines[i+1][0] == ' ' || lines[i+1][0] == '\t' || value == "" && dashEntry(lines[i+1])) {
 			i++
 			under = append(under, lines[i])
 		}
@@ -546,6 +702,13 @@ func frontmatter(lines []string) ([]field, error) {
 			}
 			f.scalar = strings.TrimSpace(strings.Join(parts, sep))
 		case strings.HasPrefix(value, "["):
+			if !strings.HasSuffix(value, "]") && len(under) > 0 {
+				// A list in brackets that goes on over the lines below.
+				for _, u := range under {
+					value += " " + strings.TrimSpace(u)
+				}
+				value = strings.TrimSpace(value)
+			}
 			if !strings.HasSuffix(value, "]") {
 				return nil, fmt.Errorf("the list of %q on line %d is not closed", key, i+2-len(under))
 			}
@@ -583,6 +746,12 @@ func frontmatter(lines []string) ([]field, error) {
 		out = append(out, f)
 	}
 	return out, nil
+}
+
+// dashEntry reports whether a line is an entry of a list: "- " and the
+// entry, or a "-" alone.
+func dashEntry(line string) bool {
+	return line == "-" || strings.HasPrefix(line, "- ")
 }
 
 // stripComment takes a trailing " # ..." off a plain value.

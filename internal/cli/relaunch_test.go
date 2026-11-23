@@ -34,6 +34,28 @@ func TestRelaunchArgs(t *testing.T) {
 		{`--debug=api,hooks --tools "" --session-id 6f1c2a9e-4b7d-4c1a-9e2f-3a5b6c7d8e9f`, Relaunch{Session: id},
 			[]string{"--debug=api,hooks", "--tools=", "--resume=" + id}},
 		{`--system-prompt "-be brief" -C hi`, Relaunch{Session: id}, []string{"--system-prompt=-be brief", "--resume=" + id}},
+		// Started in bypassPermissions by its name, then switched to
+		// asking: the new start can still go back, as after -y.
+		{`--permission-mode bypassPermissions`, Relaunch{Session: id, Mode: ModeDefault},
+			[]string{"--permission-mode=default", "--allow-dangerously-skip-permissions", "--resume=" + id}},
+		// A model picked as the session started, named by no flag, goes
+		// along; -m given twice is written once.
+		{`-c`, Relaunch{Session: id, Model: "qwen/b"}, []string{"--model=qwen/b", "--resume=" + id}},
+		{`-m qwen/a -m qwen/c`, Relaunch{Session: id, Model: "qwen/b"}, []string{"--model=qwen/b", "--resume=" + id}},
+		// /effort auto since --effort high: the flag goes.
+		{`--effort high -c`, Relaunch{Session: id, Effort: EffortDefault}, []string{"--resume=" + id}},
+		// Folders /add-dir added go along, after the command line's own.
+		{`--add-dir ../x -c`, Relaunch{Session: id, AddDirs: []string{"/srv/a", "/srv/b c"}},
+			[]string{"--add-dir=../x", "--add-dir=/srv/a", "--add-dir=/srv/b c", "--resume=" + id}},
+		// /cd: --cwd names the new folder; --trust-folder, about the old
+		// one, goes, or is given again when the new folder was trusted for
+		// the session only.
+		{`--cwd /work/app --trust-folder -c`, Relaunch{Session: id, Cwd: "/work/lib"}, []string{"--cwd=/work/lib", "--resume=" + id}},
+		{`--trust-folder -c`, Relaunch{Session: id, Cwd: "/home/u", TrustFolder: true}, []string{"--cwd=/home/u", "--trust-folder", "--resume=" + id}},
+		// EnterWorktree: a session started without --worktree gets it;
+		// ExitWorktree: one in a work tree goes back out.
+		{`-c`, Relaunch{Session: id, Tree: "calm-otter"}, []string{"--worktree=calm-otter", "--resume=" + id}},
+		{`--worktree=calm-otter -c`, Relaunch{Session: id, LeaveTree: true}, []string{"--resume=" + id}},
 	}
 	for _, c := range cases {
 		args := words(t, "gnosh "+c.line)
@@ -69,15 +91,36 @@ func TestRelaunchArgs(t *testing.T) {
 		if c.r.Model != "" {
 			before.Model = c.r.Model
 		}
-		if c.r.Effort != "" {
+		switch c.r.Effort {
+		case "":
+		case EffortDefault:
+			before.Effort = ""
+		default:
 			before.Effort = c.r.Effort
 		}
 		if c.r.Tree != "" {
-			before.WorktreeName = c.r.Tree
+			before.Worktree, before.WorktreeName = true, c.r.Tree
+		}
+		if c.r.LeaveTree {
+			before.Worktree, before.WorktreeName = false, ""
+		}
+		before.AddDirs = append(before.AddDirs, c.r.AddDirs...)
+		if c.r.Cwd != "" {
+			before.Cwd, before.TrustFolder = c.r.Cwd, c.r.TrustFolder
 		}
 		if !reflect.DeepEqual(before, after) {
 			t.Errorf("%s: the relaunch reads otherwise:\n got %+v\nwant %+v", c.line, after, before)
 		}
+	}
+
+	// A session that has written nothing has no file to resume: the new
+	// start makes it under its id. Such a session is one /clear began, so
+	// -n's name is not its own and is left out.
+	got, err := tab.RelaunchArgs(words(t, `gnosh -c -n "a name" --allowedTools Read`), Relaunch{Session: id, Fresh: true})
+	if want := []string{"--allowedTools=Read", "--session-id=" + id}; err != nil || !slices.Equal(got, want) {
+		t.Errorf("a fresh session relaunches as %q (%v), want %q", got, err, want)
+	} else if inv, err := tab.Parse(got, tty); err != nil || inv.Conversation != ConversationNew || inv.SessionID != id || inv.Name != "" {
+		t.Errorf("a fresh session's relaunch reads as %+v (%v)", inv, err)
 	}
 
 	// Only a session's line, and only with a session to resume.

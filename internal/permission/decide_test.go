@@ -40,7 +40,9 @@ func TestModes(t *testing.T) {
 		{"stop a task", func(e *Engine) Decision { return other(e, "TaskStop", "task_id", "1") }, [5]Behavior{Allow, Allow, Allow, Allow, Allow}},
 		{"question to the person", func(e *Engine) Decision { return other(e, "AskUserQuestion") }, [5]Behavior{Allow, Allow, Allow, Deny, Allow}},
 		{"enter plan mode", func(e *Engine) Decision { return other(e, "EnterPlanMode") }, [5]Behavior{Allow, Allow, Allow, Allow, Allow}},
-		{"present the plan", func(e *Engine) Decision { return other(e, "ExitPlanMode") }, [5]Behavior{Ask, Ask, Ask, Deny, Allow}},
+		// (Outside plan mode there is no plan to present: the plan review
+		// of 2026-11-19.)
+		{"present the plan", func(e *Engine) Decision { return other(e, "ExitPlanMode") }, [5]Behavior{Deny, Deny, Ask, Deny, Allow}},
 	}
 	for i, mode := range Modes {
 		o := testOptions(mode, rules{})
@@ -412,6 +414,19 @@ func TestSuggestions(t *testing.T) {
 		{"npm ci && npm test -- x", []string{"Bash(npm ci) + Bash(npm test -- x)", "Bash(npm ci) + Bash(npm test *)"}},
 		// A cd out of the working directories yields a Read rule.
 		{"cd /opt/data", []string{"Read(//opt/data/**)"}},
+		// But not for the root, a top-level folder, the home or a folder
+		// that holds the project: "cd .." from the project's root kept
+		// read access to every project beside it (the approvals review of
+		// 2026-11-19).
+		{"cd .. && ls", nil},
+		{"cd / && ls", nil},
+		{"cd /opt && ls", nil},
+		{"cd ~ && ls", nil},
+		// A program written in capitals is the program a Mac runs: no
+		// prefix rule for it where there would be none in lower case.
+		{"PYTHON3 -c 'print(1)'", []string{"Bash(PYTHON3 -c 'print(1)')"}},
+		{"GIT -c x=y log", []string{"Bash(GIT -c x=y log)"}},
+		{"FIND . -name x", []string{"Bash(FIND . -name x)"}},
 		// More than five parts, or a part no rule could cover: a one-time
 		// yes only.
 		{"a1; a2; a3; a4; a5; a6", nil},
@@ -451,6 +466,14 @@ func TestSuggestions(t *testing.T) {
 		}
 	}
 
+	// A * in a host would be a wildcard in the rule: no rule is offered.
+	if d := fetch(e, "https://*.com/x"); len(d.Suggestions) != 0 {
+		t.Errorf("a host with a *: %q", suggested(d))
+	}
+	if d := fetch(e, "https://docs.example.org/x"); strings.Join(suggested(d), " | ") != "WebFetch(domain:docs.example.org)" {
+		t.Errorf("a plain host: %q", suggested(d))
+	}
+
 	// File tools.
 	d := file(e, "Edit", "/proj/src/a*.go")
 	if got := suggested(d); strings.Join(got, " | ") != `Edit(//proj/src/a\*.go) | mode:acceptEdits` || d.Suggestions[0].Scope != GrantSession {
@@ -477,7 +500,7 @@ func TestSuggestions(t *testing.T) {
 	}
 	// Approving a plan may switch to acceptEdits; it keeps no rule, so
 	// each plan is asked about.
-	if got := suggested(other(e, "ExitPlanMode")); strings.Join(got, "|") != "mode:acceptEdits" {
+	if got := suggested(other(engine(t, ModePlan, rules{}), "ExitPlanMode")); strings.Join(got, "|") != "mode:acceptEdits" {
 		t.Errorf("the plan is approved each time: %q", got)
 	}
 	// Nothing is suggested for what an ask rule or a safety check asks
@@ -517,7 +540,9 @@ func TestHooks(t *testing.T) {
 		{"dontAsk, lets it run", ModeDontAsk, rules{}, mk("ls"), [4]Behavior{Allow, Allow, Deny, Deny}},
 		{"plan, an edit", ModePlan, rules{}, ed("/proj/a.go"), [4]Behavior{Deny, Deny, Deny, Deny}},
 		{"plan, a command that changes things", ModePlan, rules{}, mk("make"), [4]Behavior{Ask, Ask, Ask, Deny}},
-		{"plan, presenting the plan", ModePlan, rules{}, func(e *Engine) Decision { return other(e, "ExitPlanMode") }, [4]Behavior{Ask, Allow, Ask, Deny}},
+		// (A hook's allow does not approve a plan: the person does. The
+		// plan review of 2026-11-19.)
+		{"plan, presenting the plan", ModePlan, rules{}, func(e *Engine) Decision { return other(e, "ExitPlanMode") }, [4]Behavior{Ask, Ask, Ask, Deny}},
 		{"plan, a web fetch", ModePlan, rules{}, func(e *Engine) Decision { return fetch(e, "https://example.com") }, [4]Behavior{Ask, Allow, Ask, Deny}},
 	} {
 		d := tt.do(engine(t, tt.mode, tt.r))
@@ -688,4 +713,78 @@ func TestDecideAt(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// The approvals kept for the project are what its local file holds: one the
+// file no longer holds, taken out by hand, is no longer in force once the
+// file is read again (the approvals review of 2026-11-19).
+func TestKeepOnlyDropsWhatTheFileNoLongerHolds(t *testing.T) {
+	e := engine(t, ModeDefault, rules{})
+	for _, r := range []string{"Bash(make deploy)", "Bash(make test)"} {
+		if err := e.Grant(r, GrantLocal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := bash(e, "make deploy"); d.Behavior != Allow {
+		t.Fatalf("a kept approval: %s", d.Behavior)
+	}
+	e.KeepOnly(map[List][]string{ListAllow: {"Bash(make test)"}})
+	if d := bash(e, "make deploy"); d.Behavior != Ask {
+		t.Errorf("an approval the file no longer holds is still in force: %s", d.Behavior)
+	}
+	if d := bash(e, "make test"); d.Behavior != Allow {
+		t.Errorf("an approval the file still holds was dropped: %s", d.Behavior)
+	}
+}
+
+// A layer kept to one sub-agent (a forked skill's grant) is in force for
+// that sub-agent's calls alone; one kept to the session's own agent is in
+// force for its sub-agents too, which work for it; and RemoveAgentLayers
+// ends one agent's without touching another's.
+func TestLayerKeptToOneAgent(t *testing.T) {
+	e := engine(t, ModeDefault, rules{})
+	for _, ly := range []Layer{
+		{Scope: ScopeSkill, Name: "the sub-agent's skill", Agent: "sub-1", Allow: []string{"Bash(touch sub.txt)"}},
+		{Scope: ScopeSkill, Name: "the session's skill", Agent: MainAgent, Allow: []string{"Bash(touch main.txt)"}},
+		{Scope: ScopeSkill, Name: "everyone's", Allow: []string{"Bash(touch all.txt)"}},
+	} {
+		if err := e.AddLayer(ly); err != nil {
+			t.Fatal(err)
+		}
+	}
+	decide := func(agent, cmd string) Behavior {
+		return e.DecideFor(agent, "/proj", "Bash", core.ToolCall{Name: "Bash", Input: input("command", cmd)},
+			core.Action{Kind: core.ActionExecute, Command: cmd}).Behavior
+	}
+	want := func(agent, cmd string, b Behavior) {
+		t.Helper()
+		if got := decide(agent, cmd); got != b {
+			t.Errorf("%q for agent %q: %s, want %s", cmd, agent, got, b)
+		}
+	}
+	want("sub-1", "touch sub.txt", Allow)
+	want("sub-2", "touch sub.txt", Ask)
+	want("", "touch sub.txt", Ask)
+	want("", "touch main.txt", Allow)
+	want("sub-1", "touch main.txt", Allow)
+	want("sub-1", "touch all.txt", Allow)
+	want("", "touch all.txt", Allow)
+	if d := bash(e, "touch sub.txt"); d.Behavior != Ask {
+		t.Errorf("Decide, the session's own agent, under a sub-agent's grant: %s", d.Behavior)
+	}
+	if d := e.DecideAt("/proj", "Bash", core.ToolCall{Name: "Bash", Input: input("command", "touch main.txt")},
+		core.Action{Kind: core.ActionExecute, Command: "touch main.txt"}); d.Behavior != Allow {
+		t.Errorf("DecideAt is the session's own agent's: %s", d.Behavior)
+	}
+
+	// The person's next prompt ends the session's own agent's grants; the
+	// sub-agent's hold until it ends.
+	e.RemoveAgentLayers("", ScopeSkill)
+	want("", "touch main.txt", Ask)
+	want("sub-1", "touch main.txt", Ask)
+	want("sub-1", "touch sub.txt", Allow)
+	want("", "touch all.txt", Allow)
+	e.RemoveAgentLayers("sub-1", ScopeSkill)
+	want("sub-1", "touch sub.txt", Ask)
+	want("sub-1", "touch all.txt", Allow)
 }

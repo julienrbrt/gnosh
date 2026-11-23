@@ -1,1 +1,1 @@
-This todo is large: pop it with what you have, or split it into todos under it (you are in `{{id}}`, and about {{tokens}} tokens came in since you entered it).
+This todo is large: about {{tokens}} tokens came in since you entered `{{id}}`. If its work is one piece per file or item, put each piece under it as a todo of its own and take them in turn with mem.Next(): each one's work leaves your context when you pop it. Or pop this one with what you have.

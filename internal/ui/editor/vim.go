@@ -1309,13 +1309,20 @@ func (e *Editor) vimLines(op rune, l1, l2 int) {
 	}
 }
 
+// vimPutMax is about the most text one put adds: its count is cut so that
+// a long register put 9999 times does not take the machine's memory.
+const vimPutMax = 4 << 20
+
 // vimPut puts the register in, n times: after the cursor (p) or before it
-// (P), or below or above the line for whole lines.
+// (P), or below or above the line for whole lines. The count is cut to
+// what vimPutMax allows, and is at least one (the TUI review of
+// 2026-11-19: 9999p of a 1 MB line built 10 GB).
 func (e *Editor) vimPut(after bool, n int) {
 	g := &e.vim
 	if g.reg == "" && !g.regLines {
 		return
 	}
+	n = max(min(n, vimPutMax/(len(g.reg)+1)), 1)
 	text := strings.Repeat(g.reg+"\n", n)
 	text = text[:len(text)-1]
 	if g.regLines {

@@ -191,6 +191,8 @@ func TestErrorShapes(t *testing.T) {
 		{"a web page without a title", 500, nil, "<html><body>oops</body></html>", core.ErrServer, "internal server error", 0},
 		{"plain words", 500, nil, "upstream connect error or disconnect/reset before headers", core.ErrServer, "upstream connect error", 0},
 		{"a bare overloaded message", 500, nil, `{"error":{"message":"The engine is currently overloaded, please try again later"}}`, core.ErrOverloaded, "overloaded", 0},
+		{"a refused request that quotes the word", 400, nil, `{"type":"error","error":{"type":"invalid_request_error","message":"messages.3: tool 'resolve overloaded function' is not a valid name"}}`, core.ErrInvalidRequest, "overloaded function", 0},
+		{"a proxy's echo of the request", 502, nil, `{"error":{"message":"upstream failed"},"request":{"prompt":"why is my overloaded operator ambiguous?"}}`, core.ErrServer, "upstream failed", 0},
 		{"no body at all", 500, nil, ``, core.ErrServer, "internal server error", 0},
 		{"too many requests, no body", 429, map[string]string{"Retry-After": "2.5"}, ``, core.ErrRateLimit, "too many requests", 2500 * time.Millisecond},
 		{"body too large for a proxy", 413, nil, "<html><head><title>413 Request Entity Too Large</title></head></html>", core.ErrContextTooLong, "413", 0},
@@ -315,6 +317,7 @@ func TestRetryHint(t *testing.T) {
 		{"no hint here", 0},
 		{"", 0},
 		{"try again in 99999999999999999999h", time.Duration(1<<63 - 1)},
+		{"try again in " + strings.Repeat("1s", 1<<22), 4 * time.Second},
 	}
 	for _, tt := range tests {
 		if got := retryHint(tt.msg); got != tt.want {
@@ -386,4 +389,29 @@ func FuzzReadErrorBody(f *testing.F) {
 			t.Fatalf("the error keeps %d bytes of the body", len(e.Body))
 		}
 	})
+}
+
+// A refusal as too long carries the service's own numbers where it gives
+// them: llama.cpp's fields, and the counts in vLLM's, OpenAI's and
+// Anthropic's words.
+func TestTooLongNumbers(t *testing.T) {
+	p := &provider{name: "local"}
+	e := p.apiError(400, nil, []byte(`{"error": {"code": 400, "message": "the request exceeds the available context size, try increasing it", "type": "exceed_context_size_error", "n_prompt_tokens": 40000, "n_ctx": 32768}}`))
+	if e.Kind != core.ErrContextTooLong || e.Tokens != 40000 || e.Window != 32768 {
+		t.Errorf("llama.cpp: %+v", e)
+	}
+	for msg, want := range map[string][2]int{
+		"This model's maximum context length is 32768 tokens. However, you requested 40000 tokens (35000 in the messages, 5000 in the completion).":                                           {35000, 32768},
+		"This model's maximum context length is 32768 tokens. However, you requested 5000 output tokens and your prompt contains at least 30000 input tokens, for a total of at least 35000.": {30000, 32768},
+		"This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.":                                                                             {130000, 128000},
+		"prompt is too long: 210000 tokens > 200000 maximum": {210000, 200000},
+		"the request exceeds the available context size":     {0, 0},
+	} {
+		if tok, win := tooLongNumbers(msg); tok != want[0] || win != want[1] {
+			t.Errorf("%q: %d %d, want %v", msg, tok, win, want)
+		}
+	}
+	if e := p.apiError(400, nil, []byte(`{"error": {"message": "prompt is too long: 210000 tokens > 200000 maximum", "type": "invalid_request_error"}}`)); e.Tokens != 210000 || e.Window != 200000 {
+		t.Errorf("Anthropic's words: %+v", e)
+	}
 }

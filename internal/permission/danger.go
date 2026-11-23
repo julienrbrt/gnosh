@@ -109,6 +109,18 @@ func (e *Engine) removalDanger(v *bashView, c *simpleCmd, dirs []string, fromSub
 			return why
 		}
 	}
+	// A program's name with a variable in it is also read as it is when
+	// that variable is not set: "rmdir${X} . -n" is rmdir . -n, and
+	// "rm${X[1]} -rf ." rm -rf . (oracle seed 126).
+	if w0 := c.words[0]; !w0.static() {
+		if lit := w0.joined(); lit != "" && strings.TrimSpace(lit) == lit {
+			ac := *c
+			ac.words = append([]word{litOf(lit)}, c.words[1:]...)
+			if why := e.removalDanger(v, &ac, dirs, fromSubst); why != "" {
+				return why
+			}
+		}
+	}
 	full, ok := e.progName(c.words[0])
 	name := progKey(baseName(full))
 	if !ok || progIsPattern(c.words[0]) {
@@ -642,13 +654,17 @@ func (e *Engine) overwriteDanger(v *bashView, name string, c *simpleCmd, dirs []
 			}
 		}
 	} else {
-		_, targets = flagsAndOperands(c.words[1:], func(f string) bool {
-			switch f {
-			case "-s", "--size", "-r", "--reference", "-n", "--iterations", "--random-source":
-				return true
-			}
-			return false
-		})
+		// The flags that take a value are each program's own: truncate's
+		// -r names a reference file, and shred has no -r, so the word
+		// after "shred -rf" is its target (oracle seed 116).
+		valued := map[string]bool{"-s": true, "--size": true}
+		switch name {
+		case "truncate":
+			valued["-r"], valued["--reference"] = true, true
+		case "shred":
+			valued["-n"], valued["--iterations"], valued["--random-source"] = true, true, true
+		}
+		_, targets = flagsAndOperands(c.words[1:], func(f string) bool { return valued[f] })
 	}
 	if why := e.targetsDanger(v, v.place(c), name, targets, dirs, fromSubst, true); why != "" {
 		return why + " (what it holds would be destroyed)"
@@ -992,7 +1008,13 @@ func (e *Engine) targetDanger(w word, dirs []string, fromSubst map[string]bool, 
 	s := val.String()
 	switch {
 	case w.eqHead:
-		return ""
+		// zsh puts the path of a program in place of "=name"; bash and sh,
+		// which run the line, keep the word as it is written, and "=x/.."
+		// is the working directory when there is a directory "=x" (oracle
+		// seed 135). The word is judged as that text.
+		lit := w
+		lit.eqHead = false
+		return e.targetDanger(lit, dirs, fromSubst, recursive)
 	case w.tilde && w.static():
 		s = w.value(e.home)
 	case w.tilde && allLit(w) && s != "~+" && !strings.HasPrefix(s, "~+/") && func() bool { _, ok := dirTilde(w); return ok }():
@@ -1031,6 +1053,12 @@ func (e *Engine) targetDanger(w word, dirs []string, fromSubst map[string]bool, 
 		}
 		if recursive && w.onlySubst() {
 			return "the target is whatever a command prints"
+		}
+		if recursive && w.parts[0].kind == partSubst && w.parts[0].proc {
+			// "<(cmd)x" is /dev/fd/63x: a path named by a number, which is
+			// only known when the line runs. Taken for a word that may be
+			// nothing, it was judged as "x" (oracle seed 164).
+			return "the target is a path a process substitution names, which is only known when the line runs"
 		}
 		if stated && !w.tilde {
 			left := litOf(s)
@@ -1085,7 +1113,9 @@ func (e *Engine) targetDanger(w word, dirs []string, fromSubst map[string]bool, 
 			// directory right under the root, where X is empty; oracle
 			// seed 105.)
 			inName := lastUnknown >= strings.LastIndex(strings.TrimRight(s, "/"), "/")+1
-			if c := cleanPath(s); c == "" || path.Dir(c) == "/" && c != e.home && c != e.cwd && c != e.cur && !inName {
+			// (The root itself is no lone name under it: "$d/." is / where
+			// d is empty; oracle seed 116.)
+			if c := cleanPath(s); c == "" || c != "/" && path.Dir(c) == "/" && c != e.home && c != e.cwd && c != e.cur && !inName {
 				return ""
 			}
 			if why := e.targetDanger(litOf(s), dirs, fromSubst, recursive); why != "" {

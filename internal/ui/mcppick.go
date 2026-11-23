@@ -10,8 +10,9 @@ import (
 // /mcp with nothing after it is a picker of the session's MCP servers, as
 // Claude Code's /mcp opens its servers: each with how it stands; Enter on
 // one offers what can be done to it (reconnect it, disable it for the
-// session, or enable it again), which runs as /mcp reconnect, disable or
-// enable and its name. With no server configured, the command says how to
+// session, or enable it again; sign in to one that wants it, or sign out),
+// which runs as /mcp reconnect, disable, enable, login or logout and its
+// name. With no server configured, the command says how to
 // add one, as before.
 
 // mcpLister is a session whose controls list its MCP servers
@@ -24,7 +25,7 @@ type mcpLister interface {
 var mcpWords = map[string]bool{"/mcp": true}
 
 // statusWords say how a server stands, in a word or two.
-var statusWords = map[string]string{"connected": "connected", "failed": "not connected", "disabled": "disabled", "pending": "connecting"}
+var statusWords = map[string]string{"connected": "connected", "failed": "not connected", "needs-auth": "wants a sign-in", "disabled": "disabled", "pending": "connecting"}
 
 // chooseMCP opens the picker, where the session has servers to list.
 func (s *session) chooseMCP(line string) bool {
@@ -58,8 +59,14 @@ func (s *session) chooseMCP(line string) bool {
 func (s *session) mcpActions(sv app.MCPChoice) {
 	type action struct{ label, verb string }
 	actions := []action{{"Reconnect it", "reconnect"}, {"Disable it for this session", "disable"}}
-	if sv.Status == "disabled" {
+	switch {
+	case sv.Status == "disabled":
 		actions = []action{{"Enable it", "enable"}}
+	case sv.Status == "needs-auth":
+		actions = []action{{"Sign in", "login"}, {"Disable it for this session", "disable"}}
+	}
+	if sv.SignedIn {
+		actions = append(actions, action{"Sign out (forget the sign-in)", "logout"})
 	}
 	var opts []menu.Option
 	for _, a := range actions {

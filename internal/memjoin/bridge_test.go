@@ -240,3 +240,12 @@ func TestBridgePushWorkPop(t *testing.T) {
 	r.wantCode(t, 0)
 	has(t, "gnosh mem log", r.out, "fix the port")
 }
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}

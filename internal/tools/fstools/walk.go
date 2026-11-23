@@ -32,6 +32,10 @@ type walkJob struct {
 	// enter, when not nil, is asked before a directory is entered; rel is
 	// its path below root, with slashes.
 	enter func(rel string) bool
+	// over, when not nil, is asked of an entry that hidden or the ignore
+	// rules would pass over: true visits the file, or enters the
+	// directory, all the same (a name the search spells out).
+	over func(rel string, isDir bool) bool
 	// visit is called for every file found: regular files and symbolic
 	// links, nothing else. It is called from several goroutines at once.
 	visit func(f walkedFile)
@@ -220,20 +224,19 @@ func (w *walker) list(task walkTask, root bool) ([]walkTask, error) {
 		if name == ".git" {
 			continue
 		}
-		if !w.job.hidden && strings.HasPrefix(name, ".") {
-			continue
-		}
 		typ := e.Type()
 		isDir := typ.IsDir()
 		if !isDir && !typ.IsRegular() && typ&fs.ModeSymlink == 0 {
 			continue
 		}
-		if rules != nil && rules.Ignored(name, isDir) {
-			continue
-		}
 		rel := name
 		if task.rel != "" {
 			rel = task.rel + "/" + name
+		}
+		if (!w.job.hidden && strings.HasPrefix(name, ".")) || (rules != nil && rules.Ignored(name, isDir)) {
+			if w.job.over == nil || !w.job.over(rel, isDir) {
+				continue
+			}
 		}
 		path := filepath.Join(task.dir, name)
 		if isDir {

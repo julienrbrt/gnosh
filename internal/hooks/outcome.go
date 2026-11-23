@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -26,6 +27,8 @@ type Outcome struct {
 	//     next instruction.
 	//   - PostToolUse, PostToolUseFailure: the call has run. Reason goes
 	//     to the model as feedback, after the tool's output.
+	//   - PreModelSwitch: the model must not be switched. The person is
+	//     given Reason.
 	//
 	// On every other event Blocked is false whatever the hooks said: see
 	// Warnings.
@@ -43,6 +46,10 @@ type Outcome struct {
 	// Such a hook counts as a block wherever a block counts. It must
 	// never be shown as a check that passed.
 	CouldNotEvaluate bool
+	// CutShort says a hook did not finish on its own: it ran out of time,
+	// was killed, or printed more than is read. What it would have said
+	// is not known, whatever it was for.
+	CutShort bool
 
 	// PermissionDecision is the hooks' answer about a tool call.
 	//
@@ -54,12 +61,24 @@ type Outcome struct {
 	//
 	// PermissionRequest: Allow, Deny (the model is given Reason and goes
 	// on) or NoDecision (show the question).
+	//
+	// PreModelSwitch: Deny (Blocked is true), Ask (the person is asked
+	// whether to switch, with Reason; where nobody can answer, the switch
+	// is refused), or Allow and NoDecision (the switch is made).
 	PermissionDecision Decision
 
 	// UpdatedInput, when not nil, replaces the tool call's whole input
 	// (PreToolUse). The permission check then judges the new input. It is
 	// never set on a blocked call.
 	UpdatedInput json.RawMessage
+
+	// UpdatedOutput, when not nil, is what the model is to read in place of
+	// what the tool returned (PostToolUse's "updatedToolOutput", or
+	// "updatedMCPToolOutput"), as the hook wrote it: the caller turns it
+	// into the text the model reads. OutputClash says that two hooks gave
+	// different ones, so that neither can be trusted to stand in.
+	UpdatedOutput json.RawMessage
+	OutputClash   bool
 
 	// AdditionalContext is text the hooks want the model to read, each
 	// hook's in the order configured, a blank line between them. Where it
@@ -80,6 +99,27 @@ type Outcome struct {
 	// SystemMessages are warnings the hooks asked gnosh to show the user
 	// ("systemMessage"). They block nothing.
 	SystemMessages []string
+
+	// ElicitAction is the hooks' answer to an MCP server's request
+	// (Elicitation), or what they put in place of the person's answer
+	// (ElicitationResult): "accept", with ElicitContent, the values as a
+	// JSON object, or nil when the hooks gave none (the person's stand);
+	// "decline" (a hook declined or blocked, or could not
+	// evaluate, and Blocked is true; or two hooks answered with different
+	// values); "cancel"; or "", which leaves the form to the person
+	// (Elicitation) or lets their answer go as it is (ElicitationResult).
+	// A decline from one hook wins over the others' answers, and a cancel
+	// over an accept.
+	ElicitAction  string
+	ElicitContent json.RawMessage
+
+	// WatchPaths are the files to watch for FileChanged from now on, in
+	// place of the ones hooks named before ("watchPaths", from SessionStart,
+	// CwdChanged and FileChanged hooks): every hook's, in the order
+	// configured. WatchSet says a hook gave the list; an empty one clears
+	// it.
+	WatchPaths []string
+	WatchSet   bool
 
 	// Warnings are sentences of gnosh's own for the user about hooks that
 	// had something to say where nothing can be blocked: a hook that
@@ -125,6 +165,9 @@ const (
 	// ResultBackground: the hook was started in the background, and
 	// nothing waited for it ("async", "asyncRewake").
 	ResultBackground Result = "background"
+	// ResultAnswered: the hook answered an MCP server's request in the
+	// person's place, or put another answer in place of theirs.
+	ResultAnswered Result = "answered"
 )
 
 // Record is what one hook did on one occurrence of an event.
@@ -187,6 +230,7 @@ func (r Record) String() string {
 		ResultEndedTurn:        "ended the turn",
 		ResultCouldNotEvaluate: "could not evaluate",
 		ResultCancelled:        "was cancelled",
+		ResultAnswered:         "answered the MCP server",
 	}[r.Result]
 	if r.Result == ResultBackground {
 		return fmt.Sprintf("%s hook %s runs in the background", r.Event, who)
@@ -215,6 +259,9 @@ type verdict struct {
 	// failure says what went wrong when the hook could not evaluate; it
 	// is empty when the hook could.
 	failure string
+	// cutShort says the hook did not finish on its own: it ran out of
+	// time, was killed, or printed more than is read.
+	cutShort bool
 	// words is what the hook itself said about its answer: the reason it
 	// gave, or what it wrote to stderr.
 	words string
@@ -231,6 +278,15 @@ type verdict struct {
 	context string
 	warning string
 	input   json.RawMessage
+	// watch is the hook's watchPaths, and watchSet says it gave them.
+	watch    []string
+	watchSet bool
+	// output is the hook's replacement for the tool's output.
+	output json.RawMessage
+	// action and content are the hook's answer to an MCP server's request
+	// (accept, with the values, or cancel).
+	action  string
+	content json.RawMessage
 	// notes says what else there is to know.
 	notes []string
 }
@@ -285,17 +341,17 @@ func (r *Runner) judge(event Event, info eventInfo, h selected, p proc) verdict 
 		v.failure = "it could not be started (" + startError(p.startErr) + ")"
 		return v
 	case p.timedOut:
-		v.failure = "it did not finish within " + spell(p.limit) + " and was stopped"
+		v.failure, v.cutShort = "it did not finish within "+spell(p.limit)+" and was stopped", true
 	case p.signal != "":
-		v.failure = "it was killed by " + p.signal
+		v.failure, v.cutShort = "it was killed by "+p.signal, true
 	case p.unknown != "":
 		v.failure = "gnosh could not tell what it answered, because " + p.unknown
 	case p.exit < 0:
 		v.failure = "it ended without an exit status"
 	case p.lost > 0:
-		v.failure = "it printed more than the " + size(r.maxOutput) + " gnosh reads from a hook"
+		v.failure, v.cutShort = "it printed more than the "+size(r.maxOutput)+" gnosh reads from a hook", true
 	case p.leftOpen:
-		v.failure = "it ended but left a process running that still holds its output open, so what it printed may not be all it has to say. A hook must redirect the output of anything it leaves running"
+		v.failure, v.cutShort = "it ended but left a process running that still holds its output open, so what it printed may not be all it has to say. A hook must redirect the output of anything it leaves running", true
 	}
 	if v.failure != "" {
 		// What it printed is of no use as an answer.
@@ -320,7 +376,7 @@ func (r *Runner) judge(event Event, info eventInfo, h selected, p proc) verdict 
 		v.failure = "it exited with status 127: a command it needs was not found"
 		v.say(stderr)
 	case c > 128:
-		v.failure = fmt.Sprintf("it exited with status %d, which means a command in it was killed (signal %d)", c, c-128)
+		v.failure, v.cutShort = fmt.Sprintf("it exited with status %d, which means a command in it was killed (signal %d)", c, c-128), true
 		v.say(stderr)
 	case stderr != "":
 		v.failure = fmt.Sprintf("it exited with status %d and reported trouble", c)
@@ -359,6 +415,15 @@ func (r *Runner) judge(event Event, info eventInfo, h selected, p proc) verdict 
 	v.notes = append(v.notes, a.notes...)
 	v.warning = clip(a.warning, r.maxText)
 	v.context = clip(a.context, r.maxText)
+	if len(a.errs) == 0 {
+		v.watch, v.watchSet = a.watch, a.watchSet
+	}
+	if a.output != nil && event == PostToolUse {
+		// (Even from a hook that could not be read in full: a hook that
+		// meant to hide what a tool returned is not ignored for a slip
+		// elsewhere in its answer. The caller decides what to show.)
+		v.output = a.output
+	}
 	reason := clip(a.reason, r.maxText)
 	switch {
 	case !a.halt:
@@ -381,7 +446,26 @@ func (r *Runner) judge(event Event, info eventInfo, h selected, p proc) verdict 
 		v.say(reason)
 	}
 	if a.input != nil && event == PreToolUse {
-		v.input = a.input
+		if h.asBash {
+			// (As in Claude Code: the hook saw Monitor's command as a Bash
+			// call, and what it wrote is a Bash call's input.)
+			v.notes = append(v.notes, fmt.Sprintf("its changed input was not used: it is written for %s and ran here only as a guard of the command Monitor starts", quote(h.Matcher)))
+		} else {
+			v.input = a.input
+		}
+	}
+	if a.action != "" {
+		switch {
+		case v.refused || v.failure != "":
+			// A block stands, and a hook that could not evaluate answers
+			// nothing.
+		case p.exit != 0:
+			v.notes = append(v.notes, fmt.Sprintf("its answer was not used, because it exited with status %d: an answer counts only from a hook that exits 0", p.exit))
+		default:
+			// (An accept with no "content" stays without: on
+			// ElicitationResult it keeps the person's values.)
+			v.action, v.content = a.action, a.content
+		}
 	}
 	if a.approve {
 		switch {
@@ -450,6 +534,10 @@ func (r *Runner) combine(in *Input, info eventInfo, sel []selected, procs []proc
 		out                    Outcome
 		blocks, asks, approves []string
 		stops, contexts        []string
+		answerer, otherAnswer  string // (two Elicitation hooks' different values)
+		accepted               json.RawMessage
+		cancelled              bool
+		unanswered             bool // (a hook that answers could not check)
 	)
 	for i, v := range verdicts {
 		h, p := sel[i], procs[i]
@@ -481,8 +569,37 @@ func (r *Runner) combine(in *Input, info eventInfo, sel []selected, procs []proc
 			rec.Result = ResultWarning
 			out.SystemMessages = append(out.SystemMessages, v.warning)
 		}
+		if v.output != nil {
+			switch {
+			case out.UpdatedOutput == nil:
+				out.UpdatedOutput = v.output
+			case !bytes.Equal(out.UpdatedOutput, v.output):
+				out.OutputClash = true
+			}
+		}
+		if v.watchSet && v.failure == "" {
+			out.WatchSet = true
+			for _, p := range v.watch {
+				if !slices.Contains(out.WatchPaths, p) {
+					out.WatchPaths = append(out.WatchPaths, p)
+				}
+			}
+		}
 		if v.context != "" {
 			contexts = append(contexts, v.context)
+		}
+		switch v.action {
+		case "cancel":
+			rec.Result = ResultAnswered
+			cancelled = true
+		case "accept":
+			rec.Result = ResultAnswered
+			switch {
+			case answerer == "":
+				accepted, answerer = v.content, h.label()
+			case !bytes.Equal(accepted, v.content) && otherAnswer == "":
+				otherAnswer = h.label()
+			}
 		}
 		switch {
 		case v.approved:
@@ -500,6 +617,7 @@ func (r *Runner) combine(in *Input, info eventInfo, sel []selected, procs []proc
 		switch {
 		case v.failure != "":
 			out.CouldNotEvaluate = true
+			out.CutShort = out.CutShort || v.cutShort
 			rec.Result = ResultCouldNotEvaluate
 			rec.Reason = v.failure + "." + said
 			switch info.class {
@@ -511,6 +629,10 @@ func (r *Runner) combine(in *Input, info eventInfo, sel []selected, procs []proc
 					blocks = append(blocks, orElse(v.words, fmt.Sprintf("The %s hook %s refused this and gave no reason.", event, h.label())))
 					out.Warnings = append(out.Warnings, fmt.Sprintf("The %s hook %s refused the call in an answer gnosh could not read in full: %s. Its refusal holds.", event, h.label(), v.failure))
 				} else {
+					// A hook that could not check answers nothing, and
+					// another hook's approval does not stand for it: the
+					// question goes to the person.
+					unanswered = true
 					out.Warnings = append(out.Warnings, fmt.Sprintf("The %s hook %s did not answer the permission question: %s. The question goes to the user instead.%s", event, h.label(), v.failure, said))
 				}
 			case warns:
@@ -555,6 +677,20 @@ func (r *Runner) combine(in *Input, info eventInfo, sel []selected, procs []proc
 		out.Blocked = true
 		blocks = append(blocks, fmt.Sprintf("The PreToolUse hooks %s and %s each changed the call's input, in different ways. gnosh cannot apply both, and a call whose hooks do not agree on what to run is not run. Have one hook make the change.", changer, clash))
 	}
+	if otherAnswer != "" {
+		out.Blocked = true
+		blocks = append(blocks, fmt.Sprintf("The %s hooks %s and %s answered the MCP server with different values. gnosh cannot send both, so the request was declined. Have one hook answer.", event, answerer, otherAnswer))
+	}
+	if event == Elicitation || event == ElicitationResult {
+		switch {
+		case out.Blocked:
+			out.ElicitAction = "decline"
+		case cancelled:
+			out.ElicitAction = "cancel"
+		case answerer != "":
+			out.ElicitAction, out.ElicitContent = "accept", accepted
+		}
+	}
 	out.AdditionalContext = join(contexts)
 	out.StopReason = join(stops)
 
@@ -562,15 +698,16 @@ func (r *Runner) combine(in *Input, info eventInfo, sel []selected, procs []proc
 	switch {
 	case info.class == answers && refused:
 		out.PermissionDecision, out.Reason = Deny, join(blocks)
+	case info.class == answers && unanswered:
 	case info.class == answers && len(approves) > 0:
 		out.PermissionDecision, out.Reason = Allow, join(approves)
 	case info.class == answers:
 	case out.Blocked:
 		out.Reason = join(blocks)
-		if event == PreToolUse {
+		if event == PreToolUse || event == PreModelSwitch {
 			out.PermissionDecision = Deny
 		}
-	case event != PreToolUse:
+	case event != PreToolUse && event != PreModelSwitch:
 	case len(asks) > 0:
 		out.PermissionDecision, out.Reason = Ask, join(asks)
 		out.UpdatedInput = input

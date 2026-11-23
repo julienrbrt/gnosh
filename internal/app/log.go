@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/agent"
 	"github.com/gnosh-ai/gnosh/internal/core"
 	"github.com/gnosh-ai/gnosh/internal/prompt"
+	"github.com/gnosh-ai/gnosh/internal/tools/fstools"
 	"github.com/gnosh-ai/gnosh/internal/transcript"
 )
 
@@ -62,6 +64,12 @@ type sessionLog struct {
 	// pop a feature recorded, or a slide), so that what was given in it
 	// can be given again.
 	onCut func()
+	// onPrompt, when set, is told the session-file entry of each prompt
+	// as it goes out, before anything that prompt starts runs.
+	onPrompt func(entry string)
+	// cwd is the session's working directory now, against which the files
+	// a slide's rounds edited are named.
+	cwd func() string
 
 	// startedWith names the gnosh that begins the file, for its first
 	// entry; begun says the file has been looked at for one.
@@ -79,28 +87,28 @@ type sessionLog struct {
 	last string
 }
 
+// shownFile is a file a call named, as the model is told of it: relative
+// to the working directory where it lies under it.
+func (l *sessionLog) shownFile(path string) string {
+	cwd := ""
+	if l.cwd != nil {
+		cwd = l.cwd()
+	}
+	if cwd == "" || !filepath.IsAbs(path) {
+		return filepath.ToSlash(path)
+	}
+	if rel, err := filepath.Rel(cwd, filepath.Clean(path)); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return filepath.ToSlash(rel)
+	}
+	return filepath.Clean(path)
+}
+
 // lastPrompt is the session-file entry of the newest prompt, or "" before
 // the first.
 func (l *sessionLog) lastPrompt() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.last
-}
-
-// promptEntries lists the session-file entries of every prompt that is
-// still part of the conversation, the person's and gnosh's own, in order.
-func promptEntries(entries []transcript.Entry) []string {
-	var out []string
-	conv := transcript.Conversation(entries)
-	for i := range conv {
-		for _, e := range decode(&conv[i]) {
-			if e.Kind == agent.EntryPrompt {
-				out = append(out, conv[i].UUID)
-				break
-			}
-		}
-	}
-	return out
 }
 
 // loopExtra is the one key of an entry's Extra under which the loop's own
@@ -223,7 +231,12 @@ func (l *sessionLog) encode(e agent.Entry) []transcript.Entry {
 		f.ToolName, f.Display, f.ResultCwd, f.Meta = e.ToolName, e.Result.Display, e.Result.Cwd, e.Result.Meta
 		f.Input, f.Denied, f.Interrupted, f.DurationNS = e.Input, e.Denied, e.Interrupted, int64(e.Duration)
 	case agent.EntrySummary:
-		te = transcript.SummaryEntry(summaryText(e.Blocks), "")
+		// The summary is the model's writing about a conversation that
+		// held outside text (files, pages, tool output): it is kept with
+		// gnosh's own marks and chat-template tokens in it broken, as a
+		// tool's output is, since it goes back to the model on the user's
+		// side, after gnosh's line that says whose it is.
+		te = transcript.SummaryEntry(prompt.Untrusted(summaryText(e.Blocks)), e.Covers)
 		f.Blocks, f.Trigger, f.PreTokens = e.Blocks, e.Trigger, e.PreTokens
 	case agent.EntryNotice:
 		te = transcript.Entry{Type: typeNotice}
@@ -250,6 +263,50 @@ func (l *sessionLog) encode(e agent.Entry) []transcript.Entry {
 		out = append(out, u)
 	}
 	return out
+}
+
+// summaryLead is what stands before a summary when it becomes the first
+// message the model reads: gnosh's own line, in its marks, that the summary
+// is the model's, and not the person's words.
+func (l *sessionLog) summaryLead() string {
+	if l.texts == nil {
+		return ""
+	}
+	// (The line is in gnosh's marker already: marked again, the model was
+	// shown the inner marker broken by a zero-width space.)
+	return l.texts.SummaryIntro() + "\n\n"
+}
+
+// viewTraced is View with, for each message, the session-file entries it
+// came from.
+func (l *sessionLog) viewTraced() ([]core.Message, [][]string) {
+	l.mu.Lock()
+	last := l.last
+	l.mu.Unlock()
+	msgs, info := l.ts.View(transcript.ViewOptions{Prompt: last, SummaryLead: l.summaryLead(), PartLead: l.partLead(), Trace: true})
+	return msgs, info.Sources
+}
+
+// viewUpTo is the conversation as the model would be sent it, up to and
+// including the session-file entry uuid: the part a summary up to one of
+// the person's prompts stands for. It is nil when there is no such entry.
+func (l *sessionLog) viewUpTo(uuid string) []core.Message {
+	entries := l.ts.Entries()
+	at := slices.IndexFunc(entries, func(e transcript.Entry) bool { return e.UUID == uuid })
+	if uuid == "" || at < 0 {
+		return nil
+	}
+	msgs, _ := transcript.View(entries[:at+1], transcript.ViewOptions{SummaryLead: l.summaryLead(), PartLead: l.partLead()})
+	return msgs
+}
+
+// partLead is what stands before a summary of part of the conversation,
+// which the person asked for: gnosh's line that says so and whose it is.
+func (l *sessionLog) partLead() string {
+	if l.texts == nil {
+		return ""
+	}
+	return l.texts.SummaryPartIntro() + "\n\n"
 }
 
 // summaryText is the text a summary entry holds: the model's own summary.
@@ -305,7 +362,7 @@ func decode(te *transcript.Entry) []agent.Entry {
 		e.Result.Display, e.Result.Cwd, e.Result.Meta = f.Display, f.ResultCwd, f.Meta
 		e.Input, e.Denied, e.Interrupted, e.Duration = f.Input, f.Denied, f.Interrupted, time.Duration(f.DurationNS)
 	case agent.EntrySummary:
-		e.Blocks, e.Trigger, e.PreTokens = f.Blocks, f.Trigger, f.PreTokens
+		e.Blocks, e.Trigger, e.PreTokens, e.Covers = f.Blocks, f.Trigger, f.PreTokens, te.Covers
 		if len(e.Blocks) == 0 {
 			e.Blocks = []core.Block{core.Text(te.Summary)}
 		}
@@ -400,14 +457,21 @@ func (l *sessionLog) Append(ctx context.Context, entries ...agent.Entry) error {
 	if err != nil {
 		return err
 	}
+	var went []string
 	l.mu.Lock()
 	for i, e := range entries {
 		if e.Kind == agent.EntryPrompt && at[i] < len(written) {
 			l.prompts[e.ID] = written[at[i]].UUID
 			l.last = written[at[i]].UUID
+			went = append(went, l.last)
 		}
 	}
 	l.mu.Unlock()
+	if l.onPrompt != nil {
+		for _, entry := range went {
+			l.onPrompt(entry)
+		}
+	}
 	if cut && l.onCut != nil {
 		l.onCut()
 	}
@@ -455,7 +519,7 @@ func (l *sessionLog) View(ctx context.Context) (agent.View, error) {
 	l.mu.Lock()
 	last := l.last
 	l.mu.Unlock()
-	msgs, _ := l.ts.View(transcript.ViewOptions{Prompt: last})
+	msgs, _ := l.ts.View(transcript.ViewOptions{Prompt: last, SummaryLead: l.summaryLead(), PartLead: l.partLead()})
 	return agent.View{Messages: msgs}, nil
 }
 
@@ -488,10 +552,12 @@ func (l *sessionLog) MakeRoom(ctx context.Context, req agent.RoomRequest) (agent
 	keep := l.prompts[req.Protect]
 	l.mu.Unlock()
 	slides, cuts := transcript.Slide(l.ts.Entries(), req.Need, transcript.ViewOptions{
-		Session:  l.ts.ID(),
-		Prompt:   keep,
-		Estimate: req.EstimateMessage,
-		Trace:    true,
+		Session:     l.ts.ID(),
+		Prompt:      keep,
+		Estimate:    req.EstimateMessage,
+		Trace:       true,
+		SummaryLead: l.summaryLead(),
+		PartLead:    l.partLead(),
 	})
 	if len(slides) == 0 {
 		return agent.Room{}, nil
@@ -502,14 +568,21 @@ func (l *sessionLog) MakeRoom(ctx context.Context, req agent.RoomRequest) (agent
 	var room agent.Room
 	var told []prompt.Slide
 	var notices []string
+	names := fstools.Defaults()
 	for _, c := range cuts {
 		room.Freed += c.Tokens
+		// The files the rounds that went had edited, as the frame line
+		// names them (memjoin liveSlides).
+		var files []string
+		for _, p := range c.EditedPaths(names.EditName, names.WriteName) {
+			files = append(files, l.shownFile(p))
+		}
 		switch {
 		case c.Frame != "":
-			told = append(told, prompt.Slide{Frame: c.Frame})
+			told = append(told, prompt.Slide{Frame: c.Frame, Files: files})
 			notices = append(notices, fmt.Sprintf("slid `%s`: about %s tokens of its start out of the model's context, instead of compacting", c.Frame, tokenCount(c.Tokens)))
 		case c.Before != "":
-			told = append(told, prompt.Slide{Frame: c.Before, Before: true})
+			told = append(told, prompt.Slide{Frame: c.Before, Before: true, Files: files})
 			notices = append(notices, fmt.Sprintf("slid what came before `%s`: about %s tokens out of the model's context, instead of compacting", c.Before, tokenCount(c.Tokens)))
 		}
 	}

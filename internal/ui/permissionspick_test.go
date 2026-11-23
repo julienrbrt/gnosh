@@ -26,7 +26,7 @@ func TestPermissionsPicker(t *testing.T) {
 		return slices.Clone(g.c.commands)
 	}
 	g.keys(`"/permissions" <Enter>`)
-	g.liveHas("Permissions (mode default)", "Add an allow rule", "Add an ask rule", "Add a deny rule", "deny  Bash(rm *)", "allow  Read", "Done")
+	g.liveHas("Permissions (manual mode)", "Add an allow rule", "Add an ask rule", "Add a deny rule", "deny  Bash(rm *)", "allow  Read", "Done")
 	// The first row: a rule typed is added.
 	g.keys(`<Enter> "Bash(go test *)" <Enter>`)
 	// The fourth: the deny rule, taken out after a yes.

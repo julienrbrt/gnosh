@@ -87,6 +87,9 @@ func (st *state) apply(cfg *config, p *plan, line string) {
 		st.opened(lastBlock)
 		st.note("<p>")
 		*lf = leaf{kind: lPara}
+		if st.quoted() {
+			lf.para.fl.base = bQuote
+		}
 		lf.para.next(st, cfg)
 		lf.para.text(st, cfg, p.text)
 		st.taken = true

@@ -3,6 +3,7 @@
 package relay
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/gnosh-ai/gnosh/internal/clipboard"
 )
 
 // relay runs ssh with gnosh's input and error as they are and a pipe for
@@ -24,7 +27,10 @@ func relay(path string, o Options) (int, syscall.Signal) {
 	defer r.Close()
 	cmd := command(path, o)
 	cmd.Stdout = w
-	cp := newCopier(o.Copy)
+	// What the far machine copies goes on this one's clipboard as text
+	// that is safe to paste: it went as it came, escapes and all (the
+	// relay review of 2026-11-19).
+	cp := newCopier(func(ctx context.Context, text string) error { return o.Copy(ctx, clipboard.Plain(text)) })
 	shown := make(chan struct{})
 	go func() {
 		defer close(shown)

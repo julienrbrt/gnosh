@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/gnosh-ai/gnosh/internal/app/agentdef"
 	"github.com/gnosh-ai/gnosh/internal/core"
@@ -114,8 +116,8 @@ func (t *sendMessageTool) Run(ctx context.Context, call core.ToolCall, env *core
 	if err != nil {
 		return refuse("%v", err)
 	}
-	if len(l.backgroundAgents()) >= maxBackgroundAgents {
-		return refuse("%d sub-agents run in the background already, which is the most there may be at once", maxBackgroundAgents)
+	if n, most := l.runningAgents(), l.maxConcurrentAgents(); n >= most {
+		return refuse("%d sub-agents run already, which is the most there may be at once", most)
 	}
 	def, ok := l.agentDefs().Get(meta[metaAgentType])
 	switch {
@@ -146,11 +148,20 @@ func (t *sendMessageTool) Run(ctx context.Context, call core.ToolCall, env *core
 	if e := meta[metaEffort]; e != "" {
 		def.Effort = e
 	}
+	stopsAt := l.bgStopsNow()
 	s, err := l.newSub(l.ctx, l.agent, nil, def, call.ID, meta[metaModel], true, to)
 	if err != nil {
 		return refuse("%v", err)
 	}
-	out := l.startBackground(s, agentInput{Description: firstOf(strings.TrimSpace(in.Summary), "more to do"), Prompt: message})
+	if ctx.Err() != nil {
+		// The turn was stopped while it was being made ready again.
+		s.close()
+		return refuse("the turn was stopped while the sub-agent %s was being made ready, so it was not taken up", to)
+	}
+	if whileSubIsMade != nil {
+		whileSubIsMade(l)
+	}
+	out := l.startBackground(s, agentInput{Description: firstOf(strings.TrimSpace(in.Summary), "more to do"), Prompt: message}, stopsAt)
 	return out, nil
 }
 
@@ -183,3 +194,76 @@ func subagentMeta(ctx context.Context, dir, id string) (map[string]string, error
 }
 
 var _ core.Tool = (*sendMessageTool)(nil)
+
+// earlierAgent is a sub-agent of this session that has ended: its id, its
+// kind, how its last run ended and what it was given to do, and whether
+// SendMessage would give it more (more).
+type earlierAgent struct {
+	id, kind, ended, task string
+	at                    time.Time
+	more                  bool
+}
+
+// earlierShown is how many ended sub-agents /tasks lists, the newest
+// first.
+const earlierShown = 10
+
+// earlierAgents are the sub-agents of this session that have ended, as
+// Claude Code's /tasks lists them under "Earlier in this session": read
+// from their session files, the newest first. The ones still running are
+// left out.
+func (l *live) earlierAgents(ctx context.Context) []earlierAgent {
+	dir := l.subagentsDir()
+	running := map[string]bool{}
+	for _, b := range l.backgroundAgents() {
+		running[b.id] = true
+	}
+	// (Their files lie where the session store keeps sessions: under
+	// projects/, in a folder for the working directory each was made in.)
+	files, _ := filepath.Glob(filepath.Join(dir, "projects", "*", "*.jsonl"))
+	var out []earlierAgent
+	for _, path := range files {
+		id := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+		if running[id] || transcript.InUse(path) {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		store := &transcript.Store{Dir: dir}
+		ts, err := store.OpenReadOnly(ctx, id)
+		if err != nil {
+			continue
+		}
+		a := earlierAgent{id: id, at: info.ModTime()}
+		worktree := false
+		for _, e := range ts.Entries() {
+			switch {
+			case e.Type == transcript.TypeMeta && e.Key == metaAgentType:
+				a.kind = e.Value
+			case e.Type == transcript.TypeMeta && e.Key == metaEnded:
+				a.ended = e.Value
+			case e.Type == transcript.TypeMeta && e.Key == metaWorkTree:
+				worktree = e.Value != ""
+			case e.Type == transcript.TypeTitle && a.task == "":
+				a.task = e.Title
+			case e.Type == transcript.TypeUser && a.task == "":
+				a.task = e.Message.Text()
+			}
+		}
+		_ = ts.Close()
+		if a.kind != "" {
+			// As SendMessage judges it: a kind that takes more, from a run
+			// that ended so it can, and not in a work tree of its own.
+			def, ok := l.agentDefs().Get(a.kind)
+			a.more = ok && !worktree && takesMore(def, a.ended)
+			out = append(out, a)
+		}
+	}
+	slices.SortFunc(out, func(a, b earlierAgent) int { return b.at.Compare(a.at) })
+	if len(out) > earlierShown {
+		out = out[:earlierShown]
+	}
+	return out
+}

@@ -44,6 +44,9 @@ import (
 const (
 	guardShown = 400 * time.Millisecond
 	guardPause = 600 * time.Millisecond
+	// secretGap is how soon after a question closed a masked question
+	// takes back what was typed into the prompt box in between.
+	secretGap = 10 * time.Second
 )
 
 // asker is a question of the menu package, as the session holds one.
@@ -63,8 +66,10 @@ type question struct {
 	keys []string
 	// labels are what each option of a Select says, for the record.
 	labels []string
-	// form holds the questions of a Form, for the answer.
-	form []menu.Question
+	// form holds the questions of a Form, for the answer, and escCancels
+	// says Esc answers it as cancelled (app.QuestionForm.EscCancels).
+	form       []menu.Question
+	escCancels bool
 	// secret says the answer must be shown nowhere.
 	secret bool
 	// opened is when the question was first drawn, and quiet the moment
@@ -75,6 +80,10 @@ type question struct {
 	guarded bool
 	// deadline is when the asker takes the question back, or zero.
 	deadline time.Time
+	// idle is how long the model's questions (AskUserQuestion) may go
+	// without a key before the interface closes them by itself, with what
+	// was picked by then (the askUserQuestionTimeout option), or zero.
+	idle time.Duration
 	// width is the terminal width the question's body was laid out for.
 	width int
 	// notified says the Notification hooks were told that it waits.
@@ -88,9 +97,28 @@ type question struct {
 	local func(res menu.Result)
 }
 
+// awayCountdown is how long before the model's questions close by
+// themselves the screen counts down to it.
+const awayCountdown = 20 * time.Second
+
+// idleSince is when the question's time without a key began: when it was
+// put on the screen, or the last key after that.
+func (qs *question) idleSince(lastInput time.Time) time.Time {
+	if lastInput.After(qs.opened) {
+		return lastInput
+	}
+	return qs.opened
+}
+
 // deadliner is what the Data of a question with a time limit has.
 type deadliner interface {
 	Deadline() time.Time
+}
+
+// noStopper is what the Data of a permission question has whose bare "no"
+// stops something other than the turn (a sub-agent in the background).
+type noStopper interface {
+	NoStops() string
 }
 
 // menuGutter is how many cells a question keeps at the left of the rows of
@@ -118,13 +146,20 @@ func newQuestion(th *Theme, m text.Metrics, width int, q agent.Question, at int)
 		var out []string
 		if strings.TrimSpace(q.Text) != "" && q.Text != q.Title {
 			for _, l := range strings.Split(strings.TrimRight(q.Text, "\n"), "\n") {
-				out = append(out, safeLine(l))
+				// What a person is asked about is read as it is: a
+				// character drawn as nothing, or one that turns the
+				// order of the rest around, shows as its code point
+				// (the TUI review of 2026-11-19).
+				out = append(out, text.ShowInvisible(safeLine(l)))
 			}
 		}
 		// The change a person is asked to approve is shown to them: every
 		// hunk, drawn to the width the question has for its body, so that
 		// its numbers and signs stay in their columns.
 		if a := q.Action; a != nil && a.Preview != nil && a.Preview.Kind == "diff" {
+			if len(out) > 0 {
+				out = append(out, "")
+			}
 			out = append(out, diff.Render(*a.Preview, diff.RenderOptions{
 				Width: max(width-menuGutter(th, m), 8), Profile: th.Profile, Theme: &th.Diff, Metrics: m, MaxLines: 1000,
 			})...)
@@ -138,7 +173,9 @@ func newQuestion(th *Theme, m text.Metrics, width int, q agent.Question, at int)
 		qs.ui = menu.NewSecret(menu.SecretOptions{Title: title, Body: body(), Theme: th.Menu, Metrics: m})
 	case q.Kind == "question" && formOf(q.Data) != nil:
 		qs.form = formOf(q.Data)
-		qs.ui = menu.NewForm(menu.FormOptions{Questions: qs.form, Theme: th.Menu, Metrics: m})
+		data, _ := q.Data.(app.QuestionForm)
+		qs.escCancels = data.EscCancels
+		qs.ui = menu.NewForm(menu.FormOptions{Questions: qs.form, Lead: data.Lead, Theme: th.Menu, Metrics: m})
 	case len(q.Choices) == 0:
 		qs.ui = menu.NewInput(menu.InputOptions{Title: title, Body: body(), Theme: th.Menu, Metrics: m})
 	default:
@@ -150,8 +187,12 @@ func newQuestion(th *Theme, m text.Metrics, width int, q agent.Question, at int)
 				// come with it. Each gets a row of its own, and Tab on
 				// the first opens a note as well.
 				no = len(opts)
+				stops := "the turn"
+				if d, ok := q.Data.(noStopper); ok && d.NoStops() != "" {
+					stops = d.NoStops()
+				}
 				opts = append(opts,
-					menu.Option{Label: "No", Description: "the call does not run, and the turn stops", Text: menu.TextOptional,
+					menu.Option{Label: "No", Description: "the call does not run, and " + stops + " stops", Text: menu.TextOptional,
 						Placeholder: "or say what to do instead, and the model carries on"},
 					menu.Option{Label: "No, and tell the model what to do instead", Text: menu.TextRequired,
 						Placeholder: "the model reads this and carries on"})
@@ -183,8 +224,13 @@ func newQuestion(th *Theme, m text.Metrics, width int, q agent.Question, at int)
 		if q.Kind == "permission" {
 			hint = "no"
 		}
+		// On a question about letting something happen, the cursor keys
+		// stop at the ends rather than going round from no to yes, and a
+		// number past the last answer goes to no, as in Claude Code.
+		safety := q.Kind == "permission" || q.Kind == "trust"
 		qs.ui = menu.NewSelect(menu.SelectOptions{
 			Title: title, Body: body(), Options: opts, Selected: selected, CancelHint: hint,
+			NoWrap: safety, RefuseRow: map[bool]int{true: no + 1}[safety && no >= 0],
 			Theme: th.Menu, Metrics: m,
 		})
 	}
@@ -193,22 +239,27 @@ func newQuestion(th *Theme, m text.Metrics, width int, q agent.Question, at int)
 
 // rebuild lays the question out again for a new width, where its body
 // was drawn for the old one: a change shown as a diff, whose columns are
-// laid out for one width. The cursor stays on its option. A question on
-// which a text field is open is left as it is, so that nothing typed is
-// lost; its body is then wrapped by the question itself.
+// laid out for one width. The cursor stays on its option, and what was
+// typed under an option stays with it: a "No" with a note lost the note
+// and stopped the turn (the TUI review of 2026-11-19). A question on which
+// a text field is open is left as it is; its body is then wrapped by the
+// question itself.
 func (qs *question) rebuild(th *Theme, m text.Metrics, width int) {
 	sel, ok := qs.ui.(*menu.Select)
 	if !ok || sel.Typing() || qs.width == width || qs.q.Action == nil || qs.q.Action.Preview == nil {
 		return
 	}
 	fresh := newQuestion(th, m, width, qs.q, sel.Selected())
+	if fs, ok := fresh.ui.(*menu.Select); ok {
+		fs.TakeTexts(sel)
+	}
 	qs.ui, qs.width = fresh.ui, width
 }
 
 // How a question ended on the screen.
 const (
 	endAnswered = iota // an answer was chosen or typed
-	endRefused         // Esc on a question that takes no for an answer
+	endRefused         // Esc on a question that takes no (or cancel) for an answer
 	endLeft            // Esc on any other question: nothing was answered
 )
 
@@ -216,6 +267,9 @@ const (
 // the words that stand in the scrollback as the record of it.
 func (qs *question) answer(res menu.Result) (ans agent.Answer, record string, how int) {
 	if res.Cancelled {
+		if qs.escCancels {
+			return agent.Answer{Choice: "cancel"}, "cancelled", endRefused
+		}
 		for _, k := range qs.keys {
 			if k == "no" {
 				return agent.Answer{Choice: "no"}, "No", endRefused
@@ -292,7 +346,7 @@ func formOf(data any) []menu.Question {
 	}
 	var out []menu.Question
 	for _, q := range form.Questions {
-		mq := menu.Question{Header: oneLine(q.Header), Text: q.Question, Multi: q.MultiSelect}
+		mq := menu.Question{Header: oneLine(q.Header), Text: q.Question, Multi: q.MultiSelect, NoOther: q.NoOther}
 		for _, o := range q.Options {
 			mq.Options = append(mq.Options, menu.Option{Label: o.Label, Description: o.Description})
 		}

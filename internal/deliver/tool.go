@@ -15,11 +15,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/gnosh-ai/gnosh/internal/app"
 	"github.com/gnosh-ai/gnosh/internal/core"
+	gtext "github.com/gnosh-ai/gnosh/internal/text"
 	"github.com/gnosh-ai/gnosh/internal/tools/shelltool"
 )
 
@@ -40,6 +42,10 @@ const unrecorded = "Nothing was recorded: "
 // tool is the Deliver tool of one session.
 type tool struct {
 	j *join
+	// judged is the file each call was described with, by call id, its
+	// links followed then: what the person or the rules judged, which
+	// the run is held to.
+	judged sync.Map
 }
 
 // Spec is what the model is told about the tool. The words are the same in
@@ -130,7 +136,7 @@ func (t *tool) read(raw json.RawMessage) (request, error) {
 		return req, err
 	}
 	target = strings.TrimSpace(target)
-	if strings.IndexFunc(target, unicode.IsControl) >= 0 {
+	if hidden(target) {
 		return req, fmt.Errorf("the %s holds a line break or another character that cannot be seen, so it is not a path or an address as it stands", argTarget)
 	}
 	host, err := text(argHost)
@@ -139,6 +145,9 @@ func (t *tool) read(raw json.RawMessage) (request, error) {
 	}
 	if host = strings.TrimSpace(host); host == shelltool.LocalName {
 		host = ""
+	}
+	if hidden(host) {
+		return req, fmt.Errorf("the %s holds a character that cannot be seen, so it names no machine as it stands", argHost)
 	}
 
 	switch found := scheme.FindString(target); strings.ToLower(found) {
@@ -179,14 +188,34 @@ func (j *join) copyLimit() int64 {
 	return j.p.opts.MaxCopyBytes
 }
 
+// hostTable is the machines the session may name now, by name, with the
+// destination ssh is given for each, and their names in order: the
+// shell's table, which a settings change replaces while the session runs.
+// (The table the session began with was kept: a question named the old
+// address of a host whose file came from the new one, the hosts review of
+// 2026-11-19.)
+func (j *join) hostTable() (map[string]string, []string) {
+	if j.s.Shell != nil {
+		if shell := j.s.Shell(); shell != nil {
+			where, names := map[string]string{}, []string{}
+			for _, h := range shell.Hosts() {
+				where[h.Name], names = h.Target, append(names, h.Name)
+			}
+			return where, names
+		}
+	}
+	return j.hosts, j.hostNames
+}
+
 // unknownHost words the refusal of a machine that is not declared.
 func (j *join) unknownHost(name string) error {
-	if len(j.hostNames) == 0 {
+	hosts, hostNames := j.hostTable()
+	if len(hostNames) == 0 {
 		return fmt.Errorf("the %s %q was given, and no other machine is declared for this session. Leave %s out for a file on this machine. To deliver a file from another machine, ask the user to declare that machine as a host in gnosh's config", argHost, name, argHost)
 	}
-	listed := make([]string, len(j.hostNames))
-	for i, n := range j.hostNames {
-		listed[i] = n + " (" + j.hosts[n] + ")"
+	listed := make([]string, len(hostNames))
+	for i, n := range hostNames {
+		listed[i] = n + " (" + hosts[n] + ")"
 	}
 	return fmt.Errorf("the %s %q is not a machine declared for this session. The declared hosts are: %s. Leave %s out for a file on this machine", argHost, name, strings.Join(listed, ", "), argHost)
 }
@@ -238,11 +267,12 @@ func checkFile(path, cwd string) (length int64, problem string) {
 	case !st.Mode().IsRegular():
 		return 0, fmt.Sprintf("%s is not a regular file (it is a device, a pipe or a socket), so it cannot be handed over", path)
 	}
-	f, err := os.Open(path)
-	if err != nil {
+	// Asked, not opened: a pipe put in the file's place since the look
+	// above would hold an open for reading until something wrote to it
+	// (the deliverables review of 2026-11-19).
+	if err := mayRead(path); err != nil {
 		return 0, fmt.Sprintf("%s is there, and this account may not read it (%v), so it cannot be handed over", path, err)
 	}
-	f.Close()
 	return st.Size(), ""
 }
 
@@ -265,7 +295,8 @@ func (t *tool) Describe(call core.ToolCall, env *core.ToolEnv) (core.Action, err
 		return core.Action{Kind: core.ActionOther, Summary: fmt.Sprintf("Record the deliverable %q: the address %s", req.label, req.target)}, nil
 	case req.host != "":
 		summary := fmt.Sprintf("Record the deliverable %q: the file %s on %s", req.label, req.target, req.host)
-		where, known := j.hosts[req.host]
+		hosts, _ := j.hostTable()
+		where, known := hosts[req.host]
 		if !known {
 			return core.Action{Kind: core.ActionOther, Summary: summary}, j.unknownHost(req.host)
 		}
@@ -282,7 +313,19 @@ func (t *tool) Describe(call core.ToolCall, env *core.ToolEnv) (core.Action, err
 	if _, problem := checkFile(path, cwd); problem != "" {
 		return action, errors.New(problem)
 	}
+	if call.ID != "" {
+		t.judged.Store(call.ID, realFile(path))
+	}
 	return action, nil
+}
+
+// realFile is a path with its links followed, or the path when they
+// cannot be.
+func realFile(path string) string {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return real
+	}
+	return path
 }
 
 // Run carries out a call.
@@ -302,7 +345,16 @@ func (t *tool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEnv) (
 	case req.host != "":
 		return j.fromHost(ctx, req, before, had), nil
 	}
-	return j.local(ctx, req, j.cwdOf(env), before, had), nil
+	cwd := j.cwdOf(env)
+	// The file the call was judged by is the one it may deliver: a cd or
+	// a link changed between the question and the run makes the same
+	// words name another (the deliverables review of 2026-11-19).
+	if v, ok := t.judged.LoadAndDelete(call.ID); ok {
+		if was, now := v.(string), realFile(j.localPath(req.target, cwd)); was != now {
+			return refuse(fmt.Sprintf("the call was judged for the file %s, and %s now leads to %s. Deliver it again, so that what is delivered is what is judged", was, req.target, now)), nil
+		}
+	}
+	return j.local(ctx, req, cwd, before, had), nil
 }
 
 // refuse is the result of a call that recorded nothing.
@@ -367,7 +419,8 @@ func (j *join) local(ctx context.Context, req request, cwd string, before app.De
 // served from the copy. A file that is too large to copy is recorded with
 // its path there and not served.
 func (j *join) fromHost(ctx context.Context, req request, before app.Deliverable, had bool) core.ToolResult {
-	if _, known := j.hosts[req.host]; !known {
+	hosts, _ := j.hostTable()
+	if _, known := hosts[req.host]; !known {
 		return refuse(j.unknownHost(req.host).Error())
 	}
 	var shell *shelltool.Manager
@@ -408,6 +461,9 @@ func (j *join) fromHost(ctx context.Context, req request, before app.Deliverable
 	final := reg.copyPath(req.host, req.target)
 	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
 		return refuse(fmt.Sprintf("%s could not be copied to this machine: the folder for the copy could not be made (%v)", where, err))
+	}
+	if err := noLinks(reg.dir, filepath.Dir(final)); err != nil {
+		return refuse(fmt.Sprintf("%s could not be copied to this machine: %v", where, err))
 	}
 	incoming, err := os.CreateTemp(filepath.Dir(final), ".incoming-*")
 	if err != nil {
@@ -498,4 +554,13 @@ func size(n int64) string {
 		}
 	}
 	return strings.TrimSuffix(strconv.FormatFloat(v, 'f', 1, 64), ".0") + " " + unit
+}
+
+// hidden reports whether s holds a control character, or one a terminal
+// draws as nothing or that turns the order text is drawn in (a bidi
+// override, a zero-width space): with one, what the person is shown is
+// not what the link or the path is (the deliverables review of
+// 2026-11-19). The joiners emoji and some scripts are written with stay.
+func hidden(s string) bool {
+	return strings.IndexFunc(s, unicode.IsControl) >= 0 || gtext.ShowInvisible(s) != s
 }

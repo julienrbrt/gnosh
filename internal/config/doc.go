@@ -61,20 +61,58 @@
 //
 //	permissions      allow, ask and deny (lists of rules), defaultMode,
 //	                 additionalDirectories, disableBypassPermissionsMode,
-//	                 disableAutoMode, denyInsteadOfPrompting
+//	                 disableAutoMode, denyInsteadOfPrompting,
+//	                 blockReadsOutsideWorkingDirectories and
+//	                 blockWritesOutsideWorkingDirectories (a true in any
+//	                 file holds; the directories only a project's file
+//	                 adds do not count for them)
 //	hooks            event, then matcher groups, then command handlers, each
 //	                 with an "if" filter if it likes (one permission rule)
 //	env              variables for the commands and hooks gnosh starts
 //	disableAllHooks  true switches every hook off, and the status line
+//	sandbox          {"enabled": true, ...}: the shell's commands run in
+//	                 the operating system's sandbox (bubblewrap on Linux,
+//	                 Seatbelt on macOS): writes only in the working
+//	                 folders, no network; autoAllowBashIfSandboxed,
+//	                 excludedCommands, allowUnsandboxedCommands,
+//	                 failIfUnavailable, filesystem.allowWrite/denyWrite/
+//	                 allowRead/denyRead. A project's file can turn it on
+//	                 and narrow it before trust, never turn it off
+//	allowedHttpHookUrls, httpHookAllowedEnvVars
+//	                 the URL patterns an http hook may post to (* is any
+//	                 run of characters), and the variables its headers may
+//	                 take beside its own allowedEnvVars: every file's list
+//	                 merged, a project's once the folder is trusted (it
+//	                 would switch off the person's own hooks), and an
+//	                 empty list lets none
 //	statusLine       {"type": "command", "command": ..., "padding": ...,
 //	                 "refreshInterval": ...}: a command whose output is the
 //	                 status line under the prompt; a program to run, so a
 //	                 project's waits for trust, as a hook does
+//	attribution      {"commit": ..., "pr": ...} or false: the lines the
+//	                 model ends its commits' messages and its pull
+//	                 requests' descriptions with. gnosh adds none of its
+//	                 own (includeCoAuthoredBy, Claude Code's older word for
+//	                 leaving its own out, is taken and changes nothing)
+//	fileSuggestion   {"type": "command", "command": ...}: a command that
+//	                 offers the paths an @ mention completes to, in place
+//	                 of gnosh's own search; it is given {"query": what was
+//	                 typed} on its standard input and prints a path a line
+//	                 (15 are shown); a project's waits for trust
 //	model            the session's model
 //	skillOverrides   how far each skill is seen, by its name: "on" (as its
 //	                 file says), "name-only", "user-invocable-only" or
 //	                 "off"; a later file wins, and a folder that is not
 //	                 trusted keeps its own, since each only takes away
+//	lspServers       language servers, each under a name, with the fields
+//	                 of Claude Code's .lsp.json entries (command, args,
+//	                 extensionToLanguage, env, initializationOptions,
+//	                 settings, workspaceFolder, the three timeouts in
+//	                 milliseconds, restartOnCrash, maxRestarts,
+//	                 diagnostics): a server is started for the first file of
+//	                 its endings that is read or changed, gives the model
+//	                 the problems a change brings, and answers the LSP
+//	                 tool; a project's waits for trust, none in safe mode
 //	$schema          accepted and not read
 //
 // gnosh's own keys stand beside them:
@@ -97,6 +135,8 @@
 //	  maxOutputTokens the reply limit sent with a request
 //	  thinkingLevels  its thinking levels, the least thinking first; an
 //	                  empty list says the model has no thinking switch
+//	  thinkingBudget  the most tokens it may think before a reply, 0 for
+//	                  no cap (a llama.cpp server's model: 4096 unless set)
 //	model       the session's model, as "<provider>/<model id>"
 //	smallModel  the model for the short side jobs (titles, summaries,
 //	            checks); the session's model does them when none is named
@@ -112,8 +152,18 @@
 //	  autoCompactWindow        tokens of context before room is made
 //	  loopMaxTurns             an optional cap on /loop
 //	  maxBackgroundTasks       background commands that may run at once
+//	  bashOutputMaxChars       characters of a command's output the model
+//	                           reads (30000; BASH_MAX_OUTPUT_LENGTH wins)
+//	  askUserQuestionTimeout   60s, 5m or 10m: a question of the model's
+//	                           with no key for that long closes by itself
+//	  respondToBashCommands    the model answers a command run behind !
+//	                           when it ends; false waits for the next prompt
+//	  fileCheckpointingEnabled what Write and Edit change is kept for
+//	                           /rewind (true); false keeps nothing
 //	  userInstructionFiles     more instruction files of the person's own
 //	  projectInstructionFiles  more instruction files of the project
+//	  claudeMdExcludes         instruction files never to read, as patterns
+//	                           of their absolute paths
 //	  hiddenSkills             skills to hide from the model
 //	  memoryText               "lean" or "full": which of gnosh's two texts
 //	                           about mem the model is given
@@ -128,9 +178,21 @@
 //	  sidePanel                start with the side panel on (/panel)
 //	  verbose                  reasoning and whole outputs in the conversation
 //	                           as they come (Claude Code's verbose)
+//	  viewMode                 "default", "verbose" or "focus": how the
+//	                           conversation is shown as a session starts;
+//	                           focus folds each run of tool calls into one
+//	                           line (/focus; not from a project's file)
+//	  showTurnDuration         the line under a turn that ended as it
+//	                           should (true); not from a project's file
+//	  respectGitignore         leave what git ignores out of the @ file
+//	                           picker (true)
 //	  projectDataDir           the name of the project's data folder
 //	  outputStyle              how the model replies: "Concise", say, or a
 //	                           style of your own (/output-style)
+//	  language                 the language the model replies in, as you
+//	                           name it ("japanese")
+//	  includeGitInstructions   say how git stands ahead of a session's
+//	                           first prompt (true)
 //	  editorMode               "normal" or "vim": how the box takes keys
 //	                           (not from a project's file)
 //	  preferredNotifChannel    how a person who seems away is told the
@@ -140,6 +202,11 @@
 //	                           from a project's file)
 //	  vimInsertModeRemaps      pairs typed in vim's INSERT mode that stand
 //	                           for Esc, as ["jj"] (not from a project's file)
+//	  theme                    the interface's colours: auto, dark, light or
+//	                           ansi (the terminal's own sixteen); /theme
+//	  promptSuggestionEnabled  after a turn, the person's likely next prompt
+//	                           in the box, Tab to take it (off; not from a
+//	                           project's file)
 //
 // "model" and "smallModel" are each the model as a string, or an object
 // when how the model is asked matters:
@@ -148,6 +215,19 @@
 //
 // "thinking" is true, false, or one of the model's own levels, such as
 // "low".
+//
+// "fallbackModel" is one model, or a list of up to three, that a turn goes
+// on with, in order, when the session's model cannot answer: its server
+// cannot be reached, is not ready or is too busy, does not have the model,
+// or keeps failing until the wait for it runs out. A limit on the
+// person's requests is waited out as always. The switch holds for the rest
+// of the turn, and the next turn asks the session's model first again; a
+// fallback that cannot hold the conversation as it stands, or that is on a
+// model server of one's own that failed in the turn, is passed over, and
+// when every fallback fails too the turn waits for the session's model as
+// it would without them. --fallback-model outranks it:
+//
+//	"fallbackModel": ["box2/qwen3.8-27b", "studio/glm-5.3-flash"]
 //
 // A provider's "type" names the server where gnosh treats that server in
 // a way of its own: llamacpp, anthropic, openai. Every other server that
@@ -206,12 +286,17 @@
 // API_TIMEOUT_MS, BASH_DEFAULT_TIMEOUT_MS, BASH_MAX_TIMEOUT_MS,
 // BASH_MAX_OUTPUT_LENGTH, CLAUDE_CODE_MAX_OUTPUT_TOKENS,
 // CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS,
-// CLAUDE_CODE_GLOB_TIMEOUT_SECONDS, CLAUDE_CODE_AUTO_COMPACT_WINDOW,
-// CLAUDE_AUTOCOMPACT_PCT_OVERRIDE and CLAUDE_CODE_SAFE_MODE; and
-// ANTHROPIC_API_KEY and OPENAI_API_KEY for a provider of that type that is
-// given no key. One of them in the env block of a config file wins over
-// the shell's. A value that cannot be used is passed over with a warning,
-// never a mistake.
+// CLAUDE_CODE_GLOB_TIMEOUT_SECONDS, CLAUDE_CODE_GLOB_NO_IGNORE (gnosh's
+// Glob honours .gitignore unless it is true, the opposite of Claude Code's
+// default), CLAUDE_CODE_WEBFETCH_CACHE_TTL_MS,
+// CLAUDE_CODE_WEBFETCH_DEADLINE_MS, MCP_TIMEOUT, MCP_TOOL_TIMEOUT,
+// MAX_MCP_OUTPUT_TOKENS, CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+// CLAUDE_AUTOCOMPACT_PCT_OVERRIDE and CLAUDE_CODE_SAFE_MODE, of which one
+// in the env block of a config file wins over the shell's; and
+// ANTHROPIC_API_KEY and OPENAI_API_KEY, from the shell's environment
+// alone (an env block is for commands; a provider's own key goes in its
+// apiKey), for a provider of that type that is given no key. A value that
+// cannot be used is passed over with a warning, never a mistake.
 //
 // # Variables in a config file
 //

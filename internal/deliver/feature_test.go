@@ -508,7 +508,7 @@ func TestATakenPortIsSaid(t *testing.T) {
 	if len(started) != 1 || !strings.HasPrefix(list[0].URL, started[0]+"/") {
 		t.Fatalf("the session started %q, and the address is %s", started, list[0].URL)
 	}
-	want := "The port of " + addr + " is taken on this machine, so the files gnosh delivers are served at " + started[0] + "/ in this session, to this machine only."
+	want := "The port of " + addr + " is taken on this machine, so the files gnosh delivers are served at " + started[0] + "/ in this session, to this machine only. An address handed out earlier at " + addr + " now reaches whatever holds that port: another gnosh session, or a program that is not gnosh, which would see the address."
 	if !slices.Contains(f.noticed(), want) {
 		t.Errorf("the person was told %q, want among it:\n%s", f.noticed(), want)
 	}

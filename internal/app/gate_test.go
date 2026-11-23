@@ -499,9 +499,9 @@ func TestSlashHooksShowsTheFilter(t *testing.T) {
 	has(t, "/hooks", r.out, "PreToolUse:", "[matches Bash]", "[if Bash(git push *)]")
 }
 
-// --permission-prompts none: nobody answers, so the tool that asks a
-// person is not offered, and a call that needs a yes is refused with word
-// not to send it again. host (the default) refuses as a run always has.
+// --permission-prompts none: nobody answers, so a call that needs a yes is
+// refused with word not to send it again. host (the default) refuses as a
+// run always has. The tool that asks a person is offered in neither.
 func TestPermissionPromptsNone(t *testing.T) {
 	w := apptest.NewWorld(t,
 		apptest.Reply{Calls: []apptest.Call{{ID: "c1", Name: "Bash", Args: `{"command":"touch made.txt"}`}}},
@@ -516,8 +516,35 @@ func TestPermissionPromptsNone(t *testing.T) {
 	w.Model.Add(apptest.Reply{Calls: []apptest.Call{{ID: "c1", Name: "Bash", Args: `{"command":"touch made.txt"}`}}}, apptest.Reply{Text: "Could not."})
 	run(t, w, "-p", "make it", "--permission-prompts", "host").wantCode(t, 0)
 	reqs := w.Model.Requests()
-	has(t, "the tools offered with host", string(reqs[2].Body), `"name":"AskUserQuestion"`)
+	// (Nor with host: nobody answers in a run, a PreToolUse hook aside.)
+	hasNot(t, "the tools offered with host", string(reqs[2].Body), `"name":"AskUserQuestion"`)
 	hasNot(t, "what the model read with host", toolResult(t, w, 3, "c1"), "do not send this call again")
+}
+
+// permissions.denyInsteadOfPrompting, as Claude Code's: in a session a
+// person attends, a call that would ask is refused instead and the turn
+// goes on; the tools that need a person (AskUserQuestion and the plan
+// tools) are not offered. A project cannot set it.
+func TestDenyInsteadOfPrompting(t *testing.T) {
+	w := apptest.NewWorld(t,
+		apptest.Reply{Calls: []apptest.Call{{ID: "c1", Name: "Bash", Args: `{"command":"touch made.txt"}`}}},
+		apptest.Reply{Text: "Could not."})
+	w.Settings(`{"permissions": {"denyInsteadOfPrompting": true}}`)
+	s := sit(t, w)
+	s.see("Type a prompt and Enter.")
+	s.typeLine("make it")
+	s.see("Could not.")
+	if strings.Contains(s.out.String(), "Allow Bash?") {
+		t.Error("a permission question was put")
+	}
+	body := string(w.Model.Requests()[0].Body)
+	hasNot(t, "the tools offered", body, `"name":"AskUserQuestion"`, `"name":"ExitPlanMode"`, `"name":"EnterPlanMode"`)
+	has(t, "what the model read", toolResult(t, w, 1, "c1"), "permissions.denyInsteadOfPrompting", "Do not send this call again")
+	if w.Exists("made.txt") {
+		t.Errorf("the call ran")
+	}
+	s.typeLine("/exit")
+	s.exit()
 }
 
 // When nobody answers the question gnosh puts even with permissions

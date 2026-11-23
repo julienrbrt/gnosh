@@ -3,7 +3,9 @@ package ui
 import (
 	"slices"
 	"testing"
+	"time"
 
+	"github.com/gnosh-ai/gnosh/internal/agent"
 	"github.com/gnosh-ai/gnosh/internal/app"
 	"github.com/gnosh-ai/gnosh/internal/text"
 )
@@ -62,5 +64,35 @@ func TestModelPicker(t *testing.T) {
 	g.keys(`"/model big/reasoner low" <Enter>`)
 	if got := ran(); len(got) != 3 || got[2] != "/model big/reasoner low" {
 		t.Fatalf("/model with a name ran %q", got)
+	}
+}
+
+// A permission question that comes while a picker is up waits behind it,
+// and is still in line after the picker's second screen: the first screen's
+// close put it up, and the second screen took its place without keeping
+// it, so the turn waited for an answer nobody could give (the TUI review
+// of 2026-11-19).
+func TestQuestionWaitsThroughAPickersSecondScreen(t *testing.T) {
+	g := newRig(t, 100, 30, text.NoColor, func(c *controls) {
+		c.models = []app.ModelChoice{
+			{Ref: "qwen/qwen3.8-27b", Window: 262144, Levels: []string{"off", "on"}, Level: "off", Current: true},
+			{Ref: "big/reasoner", Window: 131072, Levels: []string{"low", "medium", "high"}, Level: "high"},
+		}
+		c.info.Commands = append(c.info.Commands, "model")
+	})
+	g.keys(`"/model" <Enter>`)
+	g.liveHas("Which model? The choice is saved")
+	g.ev(&agent.QuestionEvent{Question: permission("p1")})
+	g.liveLacks("Allow Bash?")
+	g.keys(`<Down> <Enter>`)
+	g.liveHas("How is big/reasoner to think?")
+	g.keys(`<Enter>`)
+	if g.s.q == nil || g.s.q.q.ID != "p1" {
+		t.Fatalf("after the picker the screen holds %+v and %d wait", g.s.q, len(g.s.qwait))
+	}
+	g.liveHas("Allow Bash?")
+	g.wait(time.Second).keys(`<Enter>`)
+	if len(g.c.answers) != 1 || g.c.answers[0].ans.Choice != "yes" {
+		t.Fatalf("answers: %+v", g.c.answers)
 	}
 }

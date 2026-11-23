@@ -38,9 +38,10 @@ const (
 	argWS          = "ws"                // Monitor in Claude Code: a WebSocket to watch; refused here
 )
 
-// argNoSandbox is an argument of Claude Code's Bash that a model trained on
-// it may send. gnosh has no sandbox to leave, so the argument changes
-// nothing: it is taken and passed over, and is not advertised.
+// argNoSandbox is Claude Code's Bash argument that runs a command outside
+// the sandbox (Options.Sandbox), asking first as any command would. It is
+// advertised only when there is a sandbox to leave; a model trained on
+// Claude Code may send it anyway, and it is then taken and passed over.
 const argNoSandbox = "dangerouslyDisableSandbox"
 
 // LocalName is the name this machine goes by wherever a machine is named:

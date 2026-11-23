@@ -25,12 +25,23 @@ type seat struct {
 	pos     int
 }
 
-// sit starts an interactive session with a person at its terminal.
+// sit starts an interactive session with a person at its terminal, who
+// answers a question as soon as it shows (the wait for a line typed before
+// it could be read is off: Options.AnswerWait).
 func sit(t *testing.T, w *apptest.World, args ...string) *seat {
+	t.Helper()
+	none := time.Duration(0)
+	return sitWaiting(t, w, &none, args...)
+}
+
+// sitWaiting is sit with the plain front end's wait for an answer typed
+// before its question (nil: gnosh's own).
+func sitWaiting(t *testing.T, w *apptest.World, wait *time.Duration, args ...string) *seat {
 	t.Helper()
 	pr, pw := io.Pipe()
 	s := &seat{t: t, in: pw, out: &safeBuffer{}, errs: &safeBuffer{}, signals: make(chan os.Signal, 4), done: make(chan int, 1)}
 	o := testOptions(w, args...)
+	o.AnswerWait = wait
 	o.Stdin, o.Stdout, o.Stderr = pr, s.out, s.errs
 	o.StdinIsTerminal, o.StdoutIsTerminal = true, true
 	o.Signals = s.signals
@@ -80,6 +91,27 @@ func (s *seat) see(piece string) {
 			s.t.Fatalf("the screen never showed %q after what was seen before.\nseen before:\n%s\nsince then:\n%s\nstderr:\n%s", piece, clip(screen[:s.pos]), clip(screen[s.pos:]), s.errs.String())
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// mcpConnected waits until /mcp says the server is connected: a session
+// connects its servers in the background, and a prompt typed before then
+// finds none of their tools.
+func (s *seat) mcpConnected(name string) {
+	s.t.Helper()
+	deadline := time.Now().Add(patience)
+	for {
+		s.typeLine("/mcp")
+		for wait := time.Now().Add(time.Second); time.Now().Before(wait); time.Sleep(10 * time.Millisecond) {
+			screen := s.out.String()
+			if i := strings.LastIndex(screen, name+": connected"); i >= s.pos {
+				s.pos = i + len(name+": connected")
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			s.t.Fatalf("/mcp never said %s is connected.\nthe screen:\n%s\nstderr:\n%s", name, clip(s.out.String()), s.errs.String())
+		}
 	}
 }
 
@@ -291,4 +323,49 @@ func TestPlainPipedPromptWithNobodyToType(t *testing.T) {
 		t.Errorf("the piped text is not the one prompt: %q", users)
 	}
 	w.Model.Done()
+}
+
+// A line typed before a question could be read is not its answer: a "2"
+// meant for a list in the model's reply picked "Yes, and don't ask again"
+// (the cd review of 2026-11-19). It is said so, and the question waits for
+// an answer typed after it.
+func TestPlainAnswerTypedBeforeTheQuestion(t *testing.T) {
+	w := apptest.NewWorld(t, editScript()...)
+	w.Write("a.txt", "two plus two\n")
+	s := sitWaiting(t, w, nil)
+	s.see("Type a prompt and Enter.")
+	s.typeLine("change it")
+	s.see("  1. Yes")
+	s.typeLine("1") // at once: before the question could be read
+	s.see("typed before the question could be read")
+	if got := w.Read("a.txt"); got != "two plus two\n" {
+		t.Fatalf("a.txt = %q: the line typed at once answered the question", got)
+	}
+	time.Sleep(answerWait + 100*time.Millisecond)
+	s.typeLine("1")
+	s.see("Done.")
+	if got := w.Read("a.txt"); got != "three plus two\n" {
+		t.Errorf("a.txt = %q after the answer typed in time", got)
+	}
+	s.typeLine("/exit")
+	s.exit()
+}
+
+// What plain mode writes holds nothing a terminal acts on: C0 and C1
+// controls are written as escapes, a byte that is no UTF-8 as U+FFFD (alone,
+// 0x9b is the 8-bit CSI), and a mark that turns text around as its \u
+// form (the cd review of 2026-11-19).
+func TestVisible(t *testing.T) {
+	for in, want := range map[string]string{
+		"plain text":        "plain text",
+		"a\x1b[2Jb":         `a\x1b[2Jb`,
+		"c1 \u009b31m":      `c1 \x9b31m`,
+		"raw \x9b31m":       "raw \uFFFD31m",
+		"evil\u202etxt.exe": `evil\u202etxt.exe`,
+		"tab\tand\nnewline": "tab\tand\nnewline",
+	} {
+		if got := visible(in); got != want {
+			t.Errorf("visible(%q) = %q, want %q", in, got, want)
+		}
+	}
 }

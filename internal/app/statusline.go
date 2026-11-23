@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gnosh-ai/gnosh/internal/agent"
+	"github.com/gnosh-ai/gnosh/internal/text"
 )
 
 // This file runs the status line command a configuration names (Claude
@@ -63,6 +64,7 @@ type statusLiner struct {
 	ended   chan struct{} // closed by stop, which ends the ticker's goroutine
 	stopped bool
 	runs    sync.WaitGroup
+	heldIn  string // the folder last said to hold the command (held)
 }
 
 // startStatusLine starts the status line of an interactive session, when
@@ -70,6 +72,13 @@ type statusLiner struct {
 func (l *live) startStatusLine() {
 	sl := l.cfg.StatusLine
 	if sl == nil || !l.interactive {
+		return
+	}
+	if l.gitRunsPrograms() {
+		// The person's command may well call git, and git would run what
+		// the repository's own settings name: gnosh's own git status is
+		// held there for that (the config review of 2026-11-19).
+		l.notice(agent.LevelInfo, "statusline", "Your status line command is not run in this folder: the repository's own git settings name programs that git would run, and the folder is not trusted. gnosh trust trusts it.")
 		return
 	}
 	s := &statusLiner{l: l, ended: make(chan struct{})}
@@ -129,7 +138,32 @@ func (s *statusLiner) stop() {
 		s.cancel()
 	}
 	s.mu.Unlock()
-	s.runs.Wait()
+	// (Not for ever: a run held up where nothing can stop it kept the
+	// session from closing, its file unsynced. The status line review of
+	// 2026-11-19.)
+	done := make(chan struct{})
+	go func() {
+		s.runs.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(statusStopWait):
+	}
+}
+
+// statusStopWait is how long stop waits for a run of the command to end.
+const statusStopWait = 3 * time.Second
+
+// held notes, once for each folder, that the command is not run there.
+func (s *statusLiner) held(dir string) {
+	s.mu.Lock()
+	said := s.heldIn == dir
+	s.heldIn = dir
+	s.mu.Unlock()
+	if !said {
+		s.l.notice(agent.LevelInfo, "statusline", "Your status line command is not run in "+homeTilde(s.l.cfg.Paths.Home, dir)+" while the shell is there: the repository there has git settings of its own that name programs git would run.")
+	}
 }
 
 // run runs the command once, and hands the front end what it printed,
@@ -152,6 +186,14 @@ func (s *statusLiner) run() {
 
 	l := s.l
 	sl := l.cfg.StatusLine
+	dir := l.cwd()
+	if dir != l.st.folder.Start && l.gitRunsProgramsAt(dir) {
+		// The shell has gone into a repository whose own git settings name
+		// programs: the command, which may call git there, waits until it
+		// is somewhere else, and what it printed last stays.
+		s.held(dir)
+		return
+	}
 	input, err := json.Marshal(l.statusInput())
 	if err != nil {
 		return
@@ -163,9 +205,11 @@ func (s *statusLiner) run() {
 		}
 	}
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", sl.Command)
-	cmd.Dir = l.cwd()
-	cmd.Env = append(append([]string(nil), l.p.o.Environ...), l.cfg.CommandEnv()...)
-	cmd.Env = append(cmd.Env, fmt.Sprintf("COLUMNS=%d", max(cols-sl.Padding, 1)), fmt.Sprintf("LINES=%d", rows))
+	cmd.Dir = dir
+	// Its own process group, which a timeout or a newer run stops whole:
+	// what it started outlived it (the status line review of 2026-11-19).
+	groupOf(cmd)
+	cmd.Env = append(l.ownCommandEnv(), fmt.Sprintf("COLUMNS=%d", max(cols-sl.Padding, 1)), fmt.Sprintf("LINES=%d", rows))
 	cmd.Stdin = bytes.NewReader(input)
 	var out capBuffer
 	out.max = statusMaxBytes
@@ -188,12 +232,12 @@ func (s *statusLiner) run() {
 }
 
 // statusLines are the lines a status line command printed, as many as are
-// shown: blank ones are left out, as gnosh shows no empty lines.
+// shown: blank ones are left out, as the status line has no row to spare.
 func statusLines(out string) []string {
 	var lines []string
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimRight(line, "\r")
-		if strings.TrimSpace(stripSGR(line)) == "" {
+		if strings.TrimSpace(text.Strip(line)) == "" {
 			continue
 		}
 		lines = append(lines, line)
@@ -202,22 +246,6 @@ func statusLines(out string) []string {
 		}
 	}
 	return lines
-}
-
-// stripSGR takes colour sequences out of a line, to see whether anything
-// else is in it.
-func stripSGR(s string) string {
-	for {
-		i := strings.Index(s, "\x1b[")
-		if i < 0 {
-			return s
-		}
-		j := strings.IndexByte(s[i:], 'm')
-		if j < 0 {
-			return s
-		}
-		s = s[:i] + s[i+j+1:]
-	}
 }
 
 // capBuffer keeps the first max bytes written to it.
@@ -292,6 +320,25 @@ type statusInput struct {
 	Vim            *struct {
 		Mode string `json:"mode"`
 	} `json:"vim,omitempty"`
+	// PromptCache is how the model server's prompt cache served the main
+	// requests, from the first reply on.
+	PromptCache *statusCache `json:"prompt_cache,omitempty"`
+}
+
+// statusCache is Claude Code's prompt_cache object, in the fields gnosh
+// can tell (agent.CacheTotals): a model server of the person's own has no
+// cache lifetime, so ttl and expires_at are left out, as is why a miss
+// was one.
+type statusCache struct {
+	Warm             bool     `json:"warm"`
+	CachingObserved  bool     `json:"caching_observed"`
+	Requests         int      `json:"requests"`
+	Misses           int      `json:"misses"`
+	ExpectedRebuilds int      `json:"expected_rebuilds"`
+	HitRatio         *float64 `json:"hit_ratio"`
+	CacheWriteTokens int      `json:"cache_write_tokens"`
+	MissRecache      int      `json:"miss_recache_tokens"`
+	LastMissAt       *int64   `json:"last_miss_at"`
 }
 
 // statusRepo is the repository the project is, as its origin remote names
@@ -386,6 +433,18 @@ func (l *live) statusInput() statusInput {
 		last := u.Last
 		in.ContextWindow.CurrentUsage = &statusTokens{InputTokens: last.InputTokens, OutputTokens: last.OutputTokens,
 			CacheCreationInputTokens: last.CacheWriteTokens, CacheReadInputTokens: last.CacheReadTokens}
+		c := u.Cache
+		pc := &statusCache{Warm: c.Warm, CachingObserved: c.Observed, Requests: u.Requests, Misses: c.Misses,
+			ExpectedRebuilds: c.Rebuilds, CacheWriteTokens: u.Main.CacheWriteTokens, MissRecache: c.MissTokens}
+		if all := u.Main.PromptTokens(); all > 0 {
+			r := float64(u.Main.CacheReadTokens) / float64(all)
+			pc.HitRatio = &r
+		}
+		if !c.LastMiss.IsZero() {
+			at := c.LastMiss.Unix()
+			pc.LastMissAt = &at
+		}
+		in.PromptCache = pc
 	}
 	if lvl := l.agent.Model().Level; lvl != "" {
 		in.Thinking = &struct {

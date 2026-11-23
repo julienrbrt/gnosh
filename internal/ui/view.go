@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,11 +19,19 @@ import (
 //	each call being written or run: its heading, and its last output
 //	(a blank row)
 //	what gnosh is doing or waiting for   one row, only while it is busy
+//	the session's task list, unless Ctrl+T has put it out of sight
 //	the prompts that wait for their turn
 //	the question, when one is put; otherwise the prompt box
-//	the session's task list, unless Ctrl+T has put it out of sight
 //	the status line                    one row
 //	a short notice a key called for    for a few seconds; wrapped, three rows at most
+//
+// The rows a person types into, and the status line and notice that go
+// with them, are the region's last rows, as Claude Code's input box is
+// the last thing on its screen; the task list stands above them, under
+// the row that says what gnosh is doing (Jae, 2026-11-21: "the todos
+// should be above the prompt not below it"). The renderer keeps the
+// region on the bottom rows of the screen from the first frame (Jae,
+// 2026-11-22: "the text field is not fixed on bottom of screen").
 //
 // It is kept small: everything above the row that says what gnosh is
 // doing is cut from its top when the region would grow past its bound,
@@ -143,7 +152,8 @@ func (s *session) compose() (lines []string, row, col int) {
 	}
 
 	// What is still being written, in what room is left: its last rows
-	// when it has more. No blank row stands above it or below it.
+	// when it has more. A blank row goes above it when there is one to
+	// spare, and another below it when there are two.
 	var stream []string
 	if room > 0 {
 		stream = s.streamLines(w)
@@ -151,12 +161,22 @@ func (s *session) compose() (lines []string, row, col int) {
 			stream = stream[len(stream)-room:]
 		}
 	}
+	spare := room - len(stream)
+	gapAbove := spare >= 1 && s.last != blkNone
+	gapBelow := len(stream) > 0 && (spare >= 2 || spare == 1 && !gapAbove)
 
 	lines = make([]string, 0, bound)
+	if gapAbove {
+		lines = append(lines, "")
+	}
 	lines = append(lines, stream...)
+	if gapBelow {
+		lines = append(lines, "")
+	}
 	if act != "" {
 		lines = append(lines, act)
 	}
+	lines = append(lines, tasks...)
 	lines = append(lines, notes...)
 	if midRow >= 0 {
 		row, col = len(lines)+midRow, midCol
@@ -164,7 +184,6 @@ func (s *session) compose() (lines []string, row, col int) {
 		row = -1
 	}
 	lines = append(lines, mid...)
-	lines = append(lines, tasks...)
 	lines = append(lines, status...)
 	lines = append(lines, hint...)
 
@@ -199,12 +218,39 @@ func (s *session) lock() {
 // placeholder is what an empty prompt box says.
 func (s *session) placeholder() string {
 	switch {
+	case s.suggestion != "" && !s.busy:
+		return s.suggestion + "  (Tab takes it)"
 	case s.busy && len(s.personQueue()) > 0:
 		return "Type to queue another prompt; Up takes the queue back"
 	case s.busy:
-		return "Type to queue a prompt; Esc stops the turn"
+		if k := s.keyHint("chat:cancel", "Esc"); k != "" {
+			return "Type to queue a prompt; " + k + " stops the turn"
+		}
+		return "Type to queue a prompt"
+	case s.failHint != "":
+		return s.failHint
 	}
 	return "Ask for something, or ? for the keys"
+}
+
+// failHintFor is what the empty prompt box says after a turn failed in the
+// way kind names (agent.TurnResult.ErrorKind): what to try next, as
+// Claude Code 2.1.326 says it. The conversation keeps the prompt, so
+// "go on" is all a second try needs.
+func failHintFor(kind string) string {
+	switch kind {
+	case "rate_limit", "overloaded":
+		return `The model's server is busy: wait a little, then send "go on" to try again`
+	case "context_too_long":
+		return `Too long for the model: /compact makes room, then send "go on"`
+	case "authentication_failed":
+		return "The model's server refused gnosh's key: /doctor says more, /model picks another model"
+	case "invalid_request":
+		return `The server refused the request: /rewind edits the prompt, /doctor says more, /model picks another`
+	case "server_error":
+		return `Send "go on" to try again; /doctor checks the model's server, /model picks another`
+	}
+	return `Send "go on" to try again; /debug looks into what went wrong`
 }
 
 // streamLines is what is still being written: the answer's lines that may
@@ -212,6 +258,10 @@ func (s *session) placeholder() string {
 // flight.
 func (s *session) streamLines(width int) []string {
 	var out []string
+	if s.focus && s.fold.calls > 0 {
+		// (Above what is being written, where the scrollback will have it.)
+		out = append(out, fit(s.m, s.foldLine(true), width))
+	}
 	rp := &s.reply
 	if rp.thinking {
 		words := rp.thinkRest
@@ -230,14 +280,23 @@ func (s *session) streamLines(width int) []string {
 			if !s.detail {
 				// Folded, only its last rows show: say every time how
 				// to have all of it.
-				head += s.th.Quiet.Render(s.th.Sep + "Ctrl+O shows all of it")
+				if h := s.transcriptHint(s.th.Sep, "shows all of it"); h != "" {
+					head += s.th.Quiet.Render(h)
+				}
 			}
 			out = append(out, fit(s.m, head, width))
 		}
 		out = append(out, rows...)
 	}
 	if rp.md != nil {
-		out = append(out, rp.md.Live()...)
+		live := rp.md.Live()
+		if !rp.begun && len(live) > 0 && len(out) > 0 {
+			out = append(out, "")
+		}
+		out = append(out, live...)
+	}
+	if len(s.calls) > 0 && len(out) > 0 {
+		out = append(out, "")
 	}
 	shown := s.calls
 	const most = 4
@@ -322,7 +381,7 @@ func (s *session) queueLines(width, most int) []string {
 	return rows
 }
 
-// taskLines draws the session's task list under the prompt box: a box for
+// taskLines draws the session's task list above the prompt box: a box for
 // each task, ticked when it is done and pointed at when it is the one in
 // hand, which reads the way it does while it is being done. A list longer
 // than its rows shows the tasks around the one in hand, and counts the
@@ -406,6 +465,13 @@ func (s *session) hintLines(width int, now time.Time) []string {
 		words = s.hint
 	case s.q == nil || s.q.guarded:
 		words = s.ed.Hint().String()
+		if h := s.ed.Hint(); h == editor.HintCtrlCExit || h == editor.HintCtrlDExit {
+			// Leaving stops what runs in the background: said before the
+			// second press, not found out after it.
+			if n, err := strconv.Atoi(oneLine(s.facts["background"])); err == nil && n > 0 {
+				words += ": " + count(n, "command running in the background stops", "commands running in the background stop") + " with it"
+			}
+		}
 	}
 	if words == "" {
 		return nil
@@ -421,8 +487,10 @@ func (s *session) hintLines(width int, now time.Time) []string {
 // for, with how long that has lasted. It is empty when the session is
 // idle; the status line then says so.
 //
-// Nothing in it moves but the clock, and nothing in it looks like data: a
-// mark, plain words, a time.
+// Nothing in it looks like data: a mark, plain words, a time. With colour
+// the mark turns and colour falls through the words, the more the longer
+// the model has been in one thought (fall.go); the words stay as they
+// are.
 func (s *session) activityLine(width int, now time.Time) string {
 	th := &s.th
 	// what says it in full and brief in fewer words, for a terminal too
@@ -437,8 +505,13 @@ func (s *session) activityLine(width int, now time.Time) string {
 		// The question itself stands right under this line.
 		what = "waiting for your answer"
 		since = s.q.opened
-		if d := s.q.deadline; !d.IsZero() {
+		switch d := s.q.deadline; {
+		case !d.IsZero():
 			extra = "answered as no in " + span(d.Sub(now))
+		case s.q.idle > 0:
+			if left := s.q.idle - now.Sub(s.q.idleSince(s.lastInput)); left <= awayCountdown {
+				extra = "goes on without you in " + span(max(left, 0))
+			}
 		}
 	case !s.busy && s.cmdRun != "":
 		shown, _ := shownCommand(s.cmdRun)
@@ -466,6 +539,10 @@ func (s *session) activityLine(width int, now time.Time) string {
 			}
 		case phThinking:
 			what, brief = model+" is thinking", "thinking"
+			if s.thinkingFor(now) >= deepAfter {
+				// The words say what the working mark shows.
+				what, brief = model+" is deep in thought", "deep in thought"
+			}
 		case phWriting:
 			what, brief = model+" is writing", "writing"
 			if s.reply.chars > 0 {
@@ -496,7 +573,14 @@ func (s *session) activityLine(width int, now time.Time) string {
 			what = firstNonEmpty(s.said(), "working")
 		}
 	}
-	markText, markWidth := s.busyMark(now)
+	// With colour, and unless a question waits for the person (a line
+	// that waits for someone does not move), the line moves: its mark
+	// turns, and the fall passes over its words (fall.go).
+	moving := th.Fall.moves() && s.q == nil
+	markWidth := s.m.Width(th.BusyMark)
+	if moving {
+		markWidth = 1
+	}
 	room := width - markWidth - 1
 	if brief != "" && s.m.Width(what) > room {
 		what = brief
@@ -508,46 +592,33 @@ func (s *session) activityLine(width int, now time.Time) string {
 	if extra != "" {
 		parts = append(parts, extra)
 	}
-	if !s.stopping && s.q == nil {
-		parts = append(parts, "Esc stops")
+	if k := s.keyHint("chat:cancel", "Esc"); k != "" && !s.stopping && s.q == nil {
+		parts = append(parts, k+" stops")
 	}
 	// As many of the parts as fit; what gnosh is doing is always there.
-	mark := markText + " "
-	line := th.Activity.Render(parts[0])
+	rest := ""
 	used := s.m.Width(parts[0])
 	for _, p := range parts[1:] {
 		if used+s.m.Width(th.Sep)+s.m.Width(p) > room {
 			break
 		}
-		line += th.Quiet.Render(th.Sep + p)
+		rest += th.Sep + p
 		used += s.m.Width(th.Sep) + s.m.Width(p)
 	}
-	return fit(s.m, mark+line, width)
+	if !moving {
+		return fit(s.m, th.Busy.Render(th.BusyMark)+" "+th.Activity.Render(parts[0])+th.Quiet.Render(rest), width)
+	}
+	s.fall.step(now, depthOf(s.thinkingFor(now)), used)
+	return fit(s.m, s.fall.mark(&th.Fall)+" "+s.fall.wash(&th.Fall, s.m, parts[0], rest), width)
 }
 
-// busyMark draws the mark that leads the activity line, and says how wide
-// it is. While gnosh works and there is colour, it is the spinner: a comet
-// of sparkle marks crossing its few cells, the head in the lightest colour
-// and the tail fading behind it, one step every SpinEvery of the clock.
-// With no colour, and while a question waits for the person, it is
-// BusyMark, standing still: a line that waits for someone does not move.
-func (s *session) busyMark(now time.Time) (string, int) {
-	th := &s.th
-	n := len(th.Spinner)
-	if n == 0 || len(th.SpinnerStyles) < n || th.SpinnerCells < 1 || th.SpinEvery <= 0 || s.q != nil {
-		return th.Busy.Render(th.BusyMark), s.m.Width(th.BusyMark)
+// thinkingFor is how long the thought that is arriving now has lasted, or
+// nothing when the model is not thinking.
+func (s *session) thinkingFor(now time.Time) time.Duration {
+	if !s.busy || s.ph != phThinking || !s.reply.thinking {
+		return 0
 	}
-	steps := int64(th.SpinnerCells + n - 1)
-	head := int((now.UnixNano() / int64(th.SpinEvery)) % steps)
-	var b strings.Builder
-	for cell := range th.SpinnerCells {
-		if d := head - cell; d >= 0 && d < n {
-			b.WriteString(th.SpinnerStyles[d].Render(th.Spinner[d]))
-		} else {
-			b.WriteByte(' ')
-		}
-	}
-	return b.String(), th.SpinnerCells
+	return max(now.Sub(s.reply.thinkSince), 0)
 }
 
 // said is what the session itself says it is waiting for, in its own
@@ -577,14 +648,17 @@ func (s *session) running() string {
 		if h.shell {
 			return "running " + firstNonEmpty(h.arg, "a command")
 		}
+		// (The name as the call's heading gives it: an MCP tool's as
+		// Claude Code names it.)
+		name := firstNonEmpty(h.name, oneLine(c.name))
 		if h.arg != "" {
-			return "running " + oneLine(c.name) + " " + h.arg
+			return "running " + name + " " + h.arg
 		}
-		return "running " + oneLine(c.name)
+		return "running " + name
 	}
 	names := make([]string, len(started))
 	for i, c := range started {
-		names[i] = oneLine(c.name)
+		names[i] = firstNonEmpty(s.headOf(c.name, c.input, &c.action).name, oneLine(c.name))
 	}
 	return fmt.Sprintf("running %d tool calls: %s", len(started), strings.Join(names, ", "))
 }
@@ -608,8 +682,9 @@ var modeNames = map[string]string{
 
 // customLines is the status line the configured command printed (Claude
 // Code's statusLine): the permission mode first, when it is not the
-// default, since it is always in sight, and then the command's lines, made
-// safe to draw and set in by the padding.
+// default, and the runs in the background that wait on the person, since
+// those are always in sight, and then the command's lines, made safe to
+// draw and set in by the padding.
 func (s *session) customLines(width int) []string {
 	var out, head []string
 	if v := s.vimWords(); v != "" {
@@ -617,6 +692,9 @@ func (s *session) customLines(width int) []string {
 	}
 	if s.mode != "" && s.mode != "default" {
 		head = append(head, s.modeWords())
+	}
+	if v := s.agentsWord(); v != "" {
+		head = append(head, s.th.Status.Render(v))
 	}
 	if len(head) > 0 {
 		out = append(out, strings.Join(head, "  "))
@@ -632,6 +710,24 @@ func (s *session) customLines(width int) []string {
 		out = append(out, pad+l)
 	}
 	return out
+}
+
+// agentsWord is what the status line says of the runs in the background
+// (the "agents" fact): how many wait on the person, or are done since they
+// looked, after the ← that opens the agent view over the session, as Claude
+// Code's footer reads "← 2 agents"; for a session's first seconds, "← for
+// agents". Where there is no agent view to open, gnosh agents answers them.
+func (s *session) agentsWord() string {
+	v := oneLine(s.facts["agents"])
+	switch {
+	case v == "" && s.agentsOffered() && s.now().Before(s.agentsHintUntil):
+		return "← for agents"
+	case v == "":
+		return ""
+	case s.agentsOffered():
+		return "← " + v
+	}
+	return v + ": gnosh agents"
 }
 
 // vimWords names the mode of the box's vim keys as vim's status line does
@@ -739,6 +835,9 @@ func (s *session) statusLine(width int) string {
 	}
 	if v := oneLine(s.facts["background"]); v != "" && v != "0" {
 		segs = append(segs, segment{v + " in the background", th.Status, 65})
+	}
+	if v := s.agentsWord(); v != "" {
+		segs = append(segs, segment{v, th.Status, 66})
 	}
 	if delivered, pending := app.CountDeliverables(s.deliv); delivered+pending > 0 {
 		// What the agent has handed over and what it has promised, which

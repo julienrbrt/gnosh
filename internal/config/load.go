@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -79,6 +80,9 @@ type Flags struct {
 	Model string
 	// SmallModel is --small-model: the model for the short side jobs.
 	SmallModel string
+	// FallbackModel is --fallback-model: the models a turn goes on with
+	// when the session's model cannot answer, separated by commas.
+	FallbackModel string
 	// ReasoningEffort is --reasoning-effort / --effort: the thinking level.
 	ReasoningEffort string
 	// PermissionMode is --permission-mode.
@@ -336,6 +340,7 @@ func (ld *loader) file(path string, layer Layer, scope, ruleDir string, project 
 		return false
 	}
 	src := ld.source(path, layer, scope, filepath.Dir(path), ruleDir)
+	src.theirs = project
 	readFile(src, data)
 	ld.apply(src, File{Path: path, Role: "settings", Scope: scope}, project)
 	return true
@@ -381,9 +386,23 @@ func (ld *loader) run() *Config {
 	// writes there (saved approvals).
 	ld.dataDir()
 	p.LocalSettings = filepath.Join(p.DataDir, "settings.local.json")
-	ld.projectFiles = append(ld.projectFiles, p.LocalSettings)
+	own := ld.ownLocal(p.LocalSettings)
+	if !own {
+		ld.projectFiles = append(ld.projectFiles, p.LocalSettings)
+	}
 	if reads("local") {
-		ld.file(p.LocalSettings, LayerProject, "local", in.Cwd, true)
+		if linkedFile(in.FS, p.LocalSettings) {
+			// The file gnosh writes the person's saved approvals in is
+			// never a link: a repository's link to the person's own
+			// gnosh.json was read as the project's, and the next save left
+			// a copy of it in the repository (the settings-commands review
+			// of 2026-11-20).
+			ld.probs.warnf(p.LocalSettings, 0, "this is a link, and the file gnosh keeps your saved approvals in never is one, so it was not read, and nothing is saved there. Remove the link.")
+		} else {
+			// (The person's own while it holds what their gnosh wrote:
+			// localwrite.go.)
+			ld.file(p.LocalSettings, LayerProject, "local", in.Cwd, !own)
+		}
 	}
 
 	// --settings: a file, or the JSON itself.
@@ -396,7 +415,7 @@ func (ld *loader) run() *Config {
 		switch {
 		case !ld.exists(path):
 			ld.probs.at(Error, flagOrigin("--settings"), "the file %s is not there. --settings takes the path of a settings file, or the JSON itself, starting with a brace.", path)
-		case !in.Trusted && slices.Contains(ld.projectFiles, path):
+		case !in.Trusted && ld.isProjectFile(path):
 			// Naming the folder's own file is not a way round the gate,
 			// and neither is naming it while --setting-sources leaves
 			// the folder's files out.
@@ -461,6 +480,27 @@ func (ld *loader) dirs() {
 	p.CacheDir = filepath.Join(xdg("XDG_CACHE_HOME", ".cache"), "gnosh")
 	p.StateFile = filepath.Join(p.StateDir, "state.json")
 	p.TrustDir = filepath.Join(p.StateDir, "trusted-folders")
+}
+
+// isProjectFile reports whether path is one of the folder's own settings
+// files: by its name, or as the same file under another (a link in the
+// path, as /tmp is on a Mac, or another case on a disk that ignores case).
+// Compared by name alone, such a spelling put an untrusted folder's file in
+// force as the command line's (the config review of 2026-11-19).
+func (ld *loader) isProjectFile(path string) bool {
+	if slices.Contains(ld.projectFiles, path) {
+		return true
+	}
+	info, err := ld.in.FS.Stat(path)
+	if err != nil {
+		return false
+	}
+	for _, p := range ld.projectFiles {
+		if other, err := ld.in.FS.Stat(p); err == nil && os.SameFile(info, other) {
+			return true
+		}
+	}
+	return false
 }
 
 // dataDir finds the project's data folder: the closest folder of the

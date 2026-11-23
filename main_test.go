@@ -333,8 +333,8 @@ func TestCommandLineHoldsOnlyWhatIsBuilt(t *testing.T) {
 	want := []string{
 		"gnosh", "gnosh doctor", "gnosh trust", "gnosh models",
 		"gnosh session", "gnosh session list", "gnosh session show", "gnosh session last", "gnosh session rename",
-		"gnosh mem", "gnosh bridge", "gnosh logs", "gnosh dirs", "gnosh ssh",
-		"gnosh mcp", "gnosh mcp add", "gnosh mcp add-json", "gnosh mcp get", "gnosh mcp list", "gnosh mcp remove",
+		"gnosh mem", "gnosh bridge", "gnosh prompt", "gnosh prompt show", "gnosh prompt path", "gnosh prompt export", "gnosh agents", "gnosh logs", "gnosh attach", "gnosh stop", "gnosh dirs", "gnosh ssh",
+		"gnosh mcp", "gnosh mcp add", "gnosh mcp add-json", "gnosh mcp get", "gnosh mcp list", "gnosh mcp remove", "gnosh mcp login", "gnosh mcp logout",
 		"gnosh help", "gnosh version",
 	}
 	if strings.Join(titles, ", ") != strings.Join(want, ", ") {
@@ -610,6 +610,9 @@ func TestBinarySubAgentHasNoMachineTools(t *testing.T) {
 		apptest.Reply{Calls: []apptest.Call{{ID: "c1", Name: "Agent", Args: `{"description":"say hello","prompt":"Say hello."}`}}},
 		apptest.Reply{Text: "Hello from the sub-agent."},
 		apptest.Reply{Text: "It said hello."})
+	// (A PreToolUse hook may answer a question in a run, so the session is
+	// offered the tool that asks one: DECISIONS 298.)
+	w.Hook("PreToolUse", "*", w.Script(w.Home+"/hooks/ok.sh", `exit 0`))
 	o := gnosh(t, w, "-p", "have it say hello").wantCode(t, 0)
 	if o.out != "It said hello.\n" {
 		t.Errorf("stdout %q, stderr %q", o.out, o.err)
@@ -633,7 +636,8 @@ func TestBinarySubAgentHasNoMachineTools(t *testing.T) {
 	if strings.Contains(sub, "gnovm_") || !strings.Contains(sub, "Read") {
 		t.Errorf("the stock sub-agent's tools are %q", sub)
 	}
-	// Only the session the person is in may put questions to them.
+	// Only the session the person is in may put questions to them, never
+	// a sub-agent.
 	if !strings.Contains(session, "AskUserQuestion") || strings.Contains(sub, "AskUserQuestion") {
 		t.Errorf("the question tool: the session's tools are %q, the sub-agent's %q", session, sub)
 	}

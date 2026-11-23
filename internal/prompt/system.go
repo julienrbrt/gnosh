@@ -1,6 +1,7 @@
 package prompt
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/gnosh-ai/gnosh/internal/core"
@@ -71,6 +72,15 @@ type SystemInput struct {
 	// Style is the output style the person chose (Claude Code's
 	// outputStyle), or nil for the default.
 	Style *Style
+
+	// Language is the language the person wants replies in, as they
+	// named it (Claude Code's language), or empty.
+	Language string
+
+	// AttributionCommit and AttributionPR are the lines the model ends a
+	// commit's message and a pull request's description with (Claude
+	// Code's attribution), or empty for none.
+	AttributionCommit, AttributionPR string
 }
 
 // Style is an output style: instructions on how the model replies, sent
@@ -104,6 +114,10 @@ func (s *Set) BuiltinStyles() []Style {
 //     bytes whatever is in SystemInput, but for a Style of the person's
 //     own that does not keep the coding instructions, whose role stands in
 //     place of the core's first line; then the Style, when there is one;
+//     then the language replies are in, when the person set one, and
+//     what commits and pull requests are signed with, when a settings
+//     file says (with Replace too: they are the person's choices, not
+//     gnosh's words);
 //  2. the note that there are no tools, when there are none;
 //  3. the part about mem, when the session has gnovm_run: the lean text,
 //     or with Memory set to MemoryFull the full one;
@@ -138,6 +152,13 @@ func (s *Set) System(in SystemInput) []string {
 	}
 	if own && in.Style != nil {
 		add(in.Style.Text)
+	}
+	if lang := oneLine(in.Language, maxName); lang != "" {
+		// The person's own choice: it holds under --system-prompt too.
+		add(s.fill(textLanguage, values{"language": lang}))
+	}
+	if commit, pr := lines(Defuse(in.AttributionCommit), maxQuote), lines(Defuse(in.AttributionPR), maxQuote); commit != "" || pr != "" {
+		add(s.fill(textAttribution, values{"commit": commit, "pr": pr}))
 	}
 	if len(in.Tools) == 0 {
 		add(s.fill(textNoTools, nil))
@@ -182,4 +203,29 @@ func hasTool(tools []core.ToolSpec, name string) bool {
 // the person's checkout at repo, and that its changes stay there.
 func (s *Set) AgentWorkTree(tree, repo string) string {
 	return s.fill(textAgentWorkTree, values{"tree": tree, "repo": repo})
+}
+
+// memoryClose finds what could close the block MEMORY.md is given in, in
+// any letter case and with blanks inside ("</AGENT-MEMORY>", "< /agent-memory":
+// the review of 2026-11-20). Untrusted breaks such a tag wherever it
+// stands whole; this catches one left open at the very end of the index,
+// which the line after it would close.
+var memoryClose = regexp.MustCompile(`(?i)<(\s*/\s*agent-memory)`)
+
+// AgentMemory is the part of a sub-agent's system prompt, sent last, for
+// a kind of agent that keeps a memory of its own (its definition's
+// memory): the folder dir, kept as scope says ("in this project, ..."),
+// and index, the beginning of its MEMORY.md, or "" where there is none;
+// cut says index is not all of it. What the index holds was written by
+// an agent, and is given defused, as a report is.
+func (s *Set) AgentMemory(dir, scope, index string, cut bool) string {
+	v := values{"dir": dir, "scope": scope}
+	if index = strings.TrimRight(index, "\n"); strings.TrimSpace(index) == "" {
+		v.flag("none", true)
+	} else {
+		// (Nor can it close the block it stands in.)
+		v["index"] = memoryClose.ReplaceAllString(Untrusted(index), "<"+Mark+"$1")
+		v.flag("cut", cut)
+	}
+	return s.fill(textAgentMemory, v)
 }

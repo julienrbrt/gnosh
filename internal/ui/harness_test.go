@@ -523,6 +523,7 @@ func (g *rig) box() string { return g.s.ed.Text() }
 type controls struct {
 	mu        sync.Mutex
 	vimModes  []string // what SetVimMode was told, in order
+	resized   int      // how often Resized was called
 	prompts   []agent.Prompt
 	ids       []string
 	submitErr error
@@ -547,10 +548,18 @@ type controls struct {
 	options   []app.ConfigChoice
 	memFiles  []app.MemoryFile
 	servers   []app.MCPChoice
+	hooks     []app.HookChoice
+	hooksNote string
+	agents    []app.AgentChoice
+	agentsOn  bool
 	rules     []app.PermissionRule
 	skills    []app.SkillChoice
 	levels    []string
 	level     string
+	// suggest answers SuggestFiles, the person's own @ search, when set.
+	suggest func(query string) ([]string, error)
+	// picture answers PastePicture (Ctrl+V), when set.
+	picture func(ctx context.Context) (string, error)
 	// agentsStopped counts the calls of StopBackgroundAgents, and
 	// agentsRunning is what each says it stopped.
 	agentsStopped int
@@ -577,6 +586,19 @@ func (c *controls) MCPChoices() []app.MCPChoice {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return slices.Clone(c.servers)
+}
+
+// HookChoices is the hooks a test set, and its note.
+func (c *controls) AgentChoices() ([]app.AgentChoice, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.agents), c.agentsOn
+}
+
+func (c *controls) HookChoices() ([]app.HookChoice, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.hooks), c.hooksNote
 }
 
 // SkillChoices is the skills a test set.
@@ -698,6 +720,12 @@ func (c *controls) Mode() string {
 }
 
 // SetVimMode notes the mode of the box's vim keys the session is told.
+func (c *controls) Resized() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.resized++
+}
+
 func (c *controls) SetVimMode(mode string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -741,6 +769,17 @@ func (c *controls) Context() agent.ContextStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.ctxs
+}
+
+func (c *controls) SuggestFiles(_ context.Context, query string) ([]string, bool, error) {
+	c.mu.Lock()
+	f := c.suggest
+	c.mu.Unlock()
+	if f == nil {
+		return nil, false, nil
+	}
+	paths, err := f(query)
+	return paths, true, err
 }
 
 func (c *controls) Info() app.SessionInfo {
@@ -903,4 +942,12 @@ func (g *rig) start() *rig {
 	meta := g.c.prompts[n-1].Meta
 	g.c.mu.Unlock()
 	return g.ev(busy(), turnStart(), &agent.PromptEvent{ID: id, Prompt: agent.Prompt{ID: id, Text: words, Meta: meta}}, request(1))
+}
+
+// PastePicture is what picture says, or that there is no clipboard.
+func (c *controls) PastePicture(ctx context.Context) (string, error) {
+	if c.picture == nil {
+		return "", app.ErrNoClipboard
+	}
+	return c.picture(ctx)
 }

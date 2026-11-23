@@ -36,7 +36,7 @@ func (t *globTool) Spec() core.ToolSpec {
 	if o.GlobNoIgnore {
 		rules = append(rules, "Files that .gitignore rules leave out are listed too.")
 	} else {
-		rules = append(rules, "Files that .gitignore rules leave out are not listed; to find those, name their directory in path or in the pattern.")
+		rules = append(rules, "Files that .gitignore rules leave out are not listed, unless the pattern spells out their names: .env, **/.env and dist/app.js find those files, and a directory named in path or in the pattern is searched, whatever the rules say.")
 	}
 	if o.GlobSkipHidden {
 		rules = append(rules, "Names that start with a dot are passed over.")
@@ -68,6 +68,39 @@ type globPlan struct {
 	base location
 	// rest is the pattern for paths below base.
 	rest *wild.Glob
+	// named are the names the pattern spells out in full.
+	named namedOutright
+}
+
+// namedOutright are the names a pattern spells out in full: the file names
+// its alternatives end with, and the directory names on their way, where
+// they hold no wildcard. A file or directory so named is listed, or
+// entered, whatever the ignore rules say: the description promises it, and
+// ".env" in .gitignore hid .env from a Glob of ".env" (the search-tools
+// review of 2026-11-20).
+type namedOutright struct{ files, dirs map[string]bool }
+
+// namesIn finds the names pattern spells out in full.
+func namesIn(pattern string) namedOutright {
+	n := namedOutright{files: map[string]bool{}, dirs: map[string]bool{}}
+	alts, err := wild.Expand(pattern, 64)
+	if err != nil {
+		return n
+	}
+	for _, alt := range alts {
+		segs := strings.Split(alt, "/")
+		for i, seg := range segs {
+			if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, `*?[\`) {
+				continue
+			}
+			if i == len(segs)-1 {
+				n.files[seg] = true
+			} else {
+				n.dirs[seg] = true
+			}
+		}
+	}
+	return n
 }
 
 func (t *globTool) plan(call core.ToolCall, env *core.ToolEnv) (*globPlan, *failure) {
@@ -115,6 +148,7 @@ func (t *globTool) plan(call core.ToolCall, env *core.ToolEnv) (*globPlan, *fail
 	if err != nil {
 		return nil, failf("%s: %v.", o.GlobName, patternProblem(err, pattern))
 	}
+	p.named = namesIn(pat)
 	if p.start, f = o.locate(env, o.GlobName, "path", dir); f != nil {
 		return nil, f
 	}
@@ -281,8 +315,19 @@ func (t *globTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEn
 		rules:   o.ignoreRules(o.GlobNoIgnore, p.base.real),
 		workers: o.SearchWorkers,
 		enter:   p.rest.MatchPrefix,
+		over: func(rel string, isDir bool) bool {
+			name := rel[strings.LastIndexByte(rel, '/')+1:]
+			if isDir {
+				return p.named.dirs[name] && p.rest.MatchPrefix(rel)
+			}
+			return p.named.files[name] && p.rest.Match(rel)
+		},
 		visit: func(f walkedFile) {
 			if !p.rest.Match(f.rel) {
+				return
+			}
+			shown := filepath.Join(p.base.abs, filepath.FromSlash(f.rel))
+			if o.denied(shown, f.path) {
 				return
 			}
 			var info fs.FileInfo
@@ -297,7 +342,7 @@ func (t *globTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEn
 			if err != nil || !info.Mode().IsRegular() {
 				return
 			}
-			found.add(foundFile{path: filepath.Join(p.base.abs, filepath.FromSlash(f.rel)), modTime: info.ModTime()})
+			found.add(foundFile{path: shown, modTime: info.ModTime()})
 		},
 	}
 	if err := walkTree(sctx, job, problems); err != nil {

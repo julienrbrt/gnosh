@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gnosh-ai/gnosh/internal/agent"
@@ -337,14 +338,79 @@ func (l *live) buildModel(ctx context.Context, ref config.ModelRef, slot config.
 	case l.cfg.Limits.MaxOutputTokens.Set:
 		m.MaxTokens = l.cfg.Limits.MaxOutputTokens.V
 	}
+	if lim := l.cfg.Limits.MaxThinkingTokens; lim.Set && lim.V == 0 && slices.Contains(levels, "off") {
+		// MAX_THINKING_TOKENS=0 turns thinking off, as in Claude Code.
+		m.Level = "off"
+	}
+	if m.ThinkingBudget = thinkingBudget(pu.cfg, cm, registered, l.cfg.Limits.MaxThinkingTokens); m.ThinkingBudget > 0 {
+		m.BudgetNote = "\n\n" + l.texts.ThinkingBudget() + "\n"
+	}
 	if slot.Temperature.Set {
 		t := slot.Temperature.V
 		m.Temperature = &t
 	}
 	l.typeMu.Lock()
-	l.types[ref.ID] = pu.cfg.Type
+	l.types[ref.Provider+"/"+ref.ID] = pu.cfg.Type
 	l.typeMu.Unlock()
 	return &modelUse{ref: ref, pu: pu, model: m}, nil
+}
+
+// fallbacks are the session's fallback models ("fallbackModel",
+// --fallback-model), each made the first time a turn needs it, so that a
+// fallback whose server is down costs the session nothing until then. One
+// that cannot be made is tried again the next time.
+func (l *live) fallbacks() []agent.Fallback {
+	var out []agent.Fallback
+	for _, ref := range l.cfg.Fallback.V {
+		var mu sync.Mutex
+		var made *agent.Model
+		out = append(out, agent.Fallback{Name: ref.String(), Make: func(ctx context.Context) (agent.Model, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if made != nil {
+				return *made, nil
+			}
+			// (As every other maker of a model: the providers' lists of
+			// models are not to be read and filled at once.)
+			l.switchMu.Lock()
+			defer l.switchMu.Unlock()
+			r, err := l.resolveRef(ctx, ref, true, nil)
+			if err != nil {
+				return agent.Model{}, err
+			}
+			u, err := l.buildModel(ctx, r, config.Slot{}, true)
+			if err != nil {
+				return agent.Model{}, err
+			}
+			made = &u.model
+			return u.model, nil
+		}})
+	}
+	return out
+}
+
+// defaultThinkingBudget is how many tokens a model on a llama.cpp server
+// may think before a reply when nothing says otherwise. Such a model runs
+// on the person's own machine, at some 8 to 20 tokens a second: on Jae's
+// AI box, with thinking on, Qwen thought for 14,270 tokens, half an hour,
+// before one reply, and seven turns before it were stopped by hand with
+// nothing to show. 4,096 is some minutes of thinking at most, more than an
+// ordinary step of the work takes.
+const defaultThinkingBudget = 4096
+
+// thinkingBudget returns how many tokens a model may think before a reply:
+// MAX_THINKING_TOKENS, then the model's own thinkingBudget, then gnosh's
+// default for a llama.cpp server; 0 means no cap.
+func thinkingBudget(pc config.Provider, cm config.Model, registered bool, env config.Value[int]) int {
+	switch {
+	case env.Set && env.V > 0:
+		return env.V
+	case registered && cm.ThinkingBudget.Set:
+		return cm.ThinkingBudget.V
+	case pc.Type == "llamacpp":
+		return defaultThinkingBudget
+	}
+	return 0
 }
 
 // thinkingLevels returns a model's thinking levels, the least thinking
@@ -463,10 +529,10 @@ func (l *live) setupModels(ctx context.Context, pick func(models []string) (stri
 // outgoing is the loop's last look at every request before it is sent: the
 // conversation is made harmless, and for the servers that take the
 // thinking switch in a field of their own, the switch is put there.
-func (l *live) outgoing(req *core.Request) {
+func (l *live) outgoing(provider string, req *core.Request) {
 	defuseRequest(req)
 	l.typeMu.Lock()
-	typ := l.types[req.Model]
+	typ := l.types[provider+"/"+req.Model]
 	l.typeMu.Unlock()
 	if typ == "openai-compatible" {
 		// Such a server reads the switch from the chat template's

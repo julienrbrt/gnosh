@@ -1,5 +1,7 @@
 // Package webtool fetches a web page for the WebFetch tool and turns it
 // into text a model can read: HTML into Markdown, other text as it is.
+// What is not text (a picture, a PDF, an archive) comes back as its bytes,
+// for the tool to keep in a file.
 //
 // It fetches from the open web only. A URL is refused before any request
 // when its host is localhost, a name without a dot, or an address of this
@@ -12,6 +14,7 @@
 package webtool
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -61,6 +64,11 @@ type Page struct {
 	// Text is the page as text: Markdown made of HTML, or the response's
 	// own text.
 	Text string
+	// Body is the response itself when it is not text (a picture, a PDF,
+	// an archive, or bytes that are not UTF-8), and Text is then empty.
+	// ContentType says what it is, read from its first bytes when the
+	// server named no type, or only application/octet-stream.
+	Body []byte
 	// Redirect is set when the page redirects to another host, which was
 	// not followed: it is the address it led to, and Text is empty.
 	Redirect string
@@ -71,9 +79,16 @@ type Page struct {
 // ErrRefused wraps every refusal made before a request goes out.
 var ErrRefused = errors.New("refused")
 
+// MaxURL is the most characters of a URL Fetch takes, as Claude Code's
+// WebFetch: a longer one is refused before anybody is asked about it.
+const MaxURL = 2000
+
 // Check reads a URL as Fetch would and says why it would be refused, or
 // returns the URL Fetch would ask for (http upgraded to https).
 func Check(raw string, allowPrivate bool) (*url.URL, error) {
+	if n := utf8.RuneCountInString(strings.TrimSpace(raw)); n > MaxURL {
+		return nil, fmt.Errorf("%w: the URL is %d characters long, and one of at most %d is fetched", ErrRefused, n, MaxURL)
+	}
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Host == "" {
 		return nil, fmt.Errorf("%w: %q is not a URL with a host", ErrRefused, raw)
@@ -97,6 +112,11 @@ func Check(raw string, allowPrivate bool) (*url.URL, error) {
 			return nil, fmt.Errorf("%w: %s is an address of this machine or of a private network; use curl through the shell for those", ErrRefused, host)
 		}
 		return u, nil
+	}
+	if strings.ContainsAny(host, "*?[]{}") {
+		// No name on the web holds one, and a rule made from such a host
+		// would stand for many.
+		return nil, fmt.Errorf("%w: %s is not a host name: it holds a wildcard", ErrRefused, host)
 	}
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") || !strings.Contains(host, ".") {
 		return nil, fmt.Errorf("%w: %s is not a host on the open web (it is localhost, or a name without a dot); use curl through the shell for those", ErrRefused, host)
@@ -203,9 +223,20 @@ func Fetch(ctx context.Context, raw string, o Options) (Page, error) {
 	}
 	p.Bytes = len(body)
 	media, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if media == "" {
-		media = http.DetectContentType(body)
-		media, _, _ = mime.ParseMediaType(media)
+	if media == "" || media == "application/octet-stream" || media == "binary/octet-stream" {
+		// No type, or bytes of no type named: the first bytes say what
+		// they are, so that a PDF or a picture sent as octet-stream is
+		// known as one (Claude Code 2.1.329 fixed the same in its own).
+		// Text it is only when all of it is: a shell installer with its
+		// archive after the script begins as text (the review of the
+		// day's code, 2026-11-20).
+		sniffed, _, _ := mime.ParseMediaType(http.DetectContentType(body))
+		if strings.HasPrefix(sniffed, "text/") && (!utf8.Valid(body) || bytes.IndexByte(body, 0) >= 0) {
+			sniffed = "application/octet-stream"
+		}
+		if media == "" || sniffed != "application/octet-stream" {
+			media = sniffed
+		}
 	}
 	p.ContentType = media
 	text := strings.ToValidUTF8(string(body), "�")
@@ -215,14 +246,35 @@ func Fetch(ctx context.Context, raw string, o Options) (Page, error) {
 	case strings.HasPrefix(media, "text/") || media == "application/json" || media == "application/xml" ||
 		strings.HasSuffix(media, "+json") || strings.HasSuffix(media, "+xml") || media == "application/javascript":
 		p.Text = text
+	case binaryType(media) || !utf8.Valid(body) || bytes.IndexByte(body, 0) >= 0:
+		p.Body = body
 	default:
-		if !utf8.Valid(body) || strings.ContainsRune(string(body), 0) {
-			return p, fmt.Errorf("the page is not text (it is %s), and WebFetch reads text only", firstOf(media, "of no type it names"))
-		}
 		p.Text = text
 	}
 	p.Took = time.Since(start)
 	return p, nil
+}
+
+// binaryType reports whether a media type names bytes that are never read
+// as text: pictures, sound, video, fonts, PDFs and archives. (A picture in
+// SVG is XML, which is text.)
+func binaryType(media string) bool {
+	if strings.HasSuffix(media, "+xml") {
+		return false
+	}
+	for _, kind := range []string{"image/", "audio/", "video/", "font/"} {
+		if strings.HasPrefix(media, kind) {
+			return true
+		}
+	}
+	switch media {
+	case "application/pdf", "application/zip", "application/gzip", "application/x-gzip", "application/x-tar",
+		"application/x-bzip2", "application/x-xz", "application/zstd", "application/x-7z-compressed",
+		"application/vnd.rar", "application/x-rar-compressed", "application/wasm", "application/java-archive",
+		"application/ogg", "application/vnd.ms-fontobject":
+		return true
+	}
+	return false
 }
 
 func firstOf(ss ...string) string {

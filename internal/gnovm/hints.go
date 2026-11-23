@@ -23,7 +23,7 @@ import (
 )
 
 var (
-	undeclaredRe   = regexp.MustCompile(`name (\w+) not declared`)
+	undeclaredRe   = regexp.MustCompile(`name (\w+) not (?:declared|defined)`) // ("not defined in fileset" where a name is the left of a selector in a define)
 	missingFieldRe = regexp.MustCompile(`missing field (\w+) in ` + replPath + `\.(\w+)`)
 	// The GnoVM's words where Gno is not Go: a builtin's name taken, and
 	// an untyped constant shifted by a variable, which it types as an

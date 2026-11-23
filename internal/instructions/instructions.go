@@ -131,6 +131,14 @@ type Options struct {
 	// the model instructions. Nil means the host's test: the owner is the
 	// account gnosh runs as, or root.
 	Owned func(info fs.FileInfo) bool
+	// Trees is a directory below the working directory whose folders are
+	// work trees of the project (gnosh's own, for sub-agents that work in
+	// one): the files at the top of each, and in Trees itself, are copies
+	// of the project's own and are not read again as nested files, as
+	// Claude Code does not read a work tree's top CLAUDE.md or rules for a
+	// sub-agent working there. What lies deeper in a tree is read as
+	// usual. Empty means none.
+	Trees string
 
 	// MaxDepth is how many imports may follow one another. Zero means
 	// DefaultMaxDepth; a negative number turns imports off.
@@ -280,6 +288,22 @@ const (
 	// WarnCut: a late file was longer than Options.LateMaxChars and the
 	// model was given only its start.
 	WarnCut WarningKind = "cut"
+	// WarnTooMany: a file imports more than importsMost files, or one
+	// reading found more than rulesMost rules; the rest were left out.
+	WarnTooMany WarningKind = "too_many"
+	// WarnInvisible: a file held characters drawn as nothing that can hide
+	// words or change their order; they were taken out.
+	WarnInvisible WarningKind = "invisible"
+)
+
+// importsMost is how many imports of one file are followed, and rulesMost
+// how many rule files one reading takes: a repository's AGENTS.md of half
+// a million "@x/1 @x/2 …" cost as many lookups and warnings at each start,
+// and a rules folder linked to the top of the repository made every .md
+// in it a rule (the instruction-files review of 2026-11-20).
+const (
+	importsMost = 100
+	rulesMost   = 200
 )
 
 // Warning is something that went wrong with one file. Loading goes on past
@@ -312,9 +336,15 @@ type Set struct {
 	// followed.
 	cwd, root, home   string
 	realCwd, realRoot string
-	userFiles         []string
-	projectFiles      []string
-	exclude           []pattern
+	// realHome is the home directory with its links followed, and secret
+	// the places in it where the person keeps keys (secretNames).
+	realHome string
+	secret   []string
+	// realTrees is Options.Trees with its links followed, or "".
+	realTrees    string
+	userFiles    []string
+	projectFiles []string
+	exclude      []pattern
 
 	files    []File
 	warnings []Warning
@@ -324,8 +354,10 @@ type Set struct {
 	// value is the real path of the file whose arrival brought it in (its
 	// own, unless it was imported); for the others it is empty.
 	loaded map[string]string
-	// approved remembers what ApproveImport said about each target.
-	approved map[string]bool
+	// approved remembers what ApproveImport said about each target, and
+	// unapproved lists those it did not let in, in the order they came.
+	approved   map[string]bool
+	unapproved []string
 	// rules are the rules that wait for a matching path, in the order they
 	// were found; ruleAt finds one by its real path.
 	rules  []*pathRule
@@ -475,10 +507,23 @@ func newSet(o Options) (*Set, error) {
 		s.owned = hostOwner()
 	}
 	s.o = o
-	s.d = disk{o.FS}
+	s.d = disk{fsys: o.FS, mine: append([]string{s.cwd, s.root, s.home}, s.userFiles...)}
 
 	s.realCwd = s.d.resolveLoose(s.cwd)
 	s.realRoot = s.d.resolveLoose(s.root)
+	if o.Trees != "" {
+		trees, err := absPath("the work trees' folder", o.Trees)
+		if err != nil {
+			return nil, err
+		}
+		s.realTrees = s.d.resolveLoose(trees)
+	}
+	if s.home != "" {
+		s.realHome = s.d.resolveLoose(s.home)
+		for _, name := range secretNames {
+			s.secret = append(s.secret, path.Join(s.realHome, name))
+		}
+	}
 	if !within(s.realCwd, s.realRoot) {
 		return nil, fmt.Errorf("instructions: the working directory %s is not inside the project root %s", osPath(s.cwd), osPath(s.root))
 	}
@@ -546,6 +591,11 @@ func (s *Set) ForPath(ctx context.Context, p string) ([]File, []Warning) {
 			if s.walked[at] {
 				continue
 			}
+			if s.realTrees != "" && (at == s.realTrees || path.Dir(at) == s.realTrees) {
+				// A work tree's top holds the project's own files again.
+				s.walked[at] = true
+				continue
+			}
 			l.dir(shown, true, p)
 			if ctx.Err() != nil {
 				break
@@ -610,6 +660,50 @@ func (s *Set) Forget(paths ...string) {
 	clear(s.walked)
 }
 
+// Reload reads again what Load read, in place of what the Set holds: the
+// files in effect from the start as they are on disk now, and none of the
+// late ones, which are given again as the model works where they apply.
+// It returns the warnings of the new reading that the old one did not
+// have. Claude Code reads its instruction files again after a summary;
+// without this an edit, a file /init wrote or a rule taken out never
+// reached a running session, and a summary gave back the copy read at
+// the start (the instruction-files review of 2026-11-20).
+func (s *Set) Reload(ctx context.Context) ([]Warning, error) {
+	n, err := Load(ctx, s.o)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var fresh []Warning
+	for _, w := range n.warnings {
+		if !s.warned[w] {
+			fresh = append(fresh, w)
+		}
+	}
+	s.files, s.warnings, s.warned = n.files, n.warnings, n.warned
+	s.loaded, s.approved, s.unapproved = n.loaded, n.approved, n.unapproved
+	s.rules, s.ruleAt, s.walked = n.rules, n.ruleAt, n.walked
+	s.stamps, s.fallback = n.stamps, n.fallback
+	return fresh, nil
+}
+
+// Unapproved returns the files outside the project that a project's file
+// would have brought in, by an import or through a link, and that were
+// left out for want of approval (Options.ApproveImport), with their links
+// followed; never the places keys are kept, which are left out whatever
+// is approved. Claude Code asks the person once per project whether to
+// load such files.
+func (s *Set) Unapproved() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.unapproved))
+	for i, p := range s.unapproved {
+		out[i] = osPath(p)
+	}
+	return out
+}
+
 // Changed returns the paths that are no longer as they were when the loader
 // looked at them: a loaded file that was edited or removed, a file that has
 // appeared under one of the names, a rules directory that gained or lost a
@@ -670,6 +764,28 @@ func absPath(what, p string) (string, error) {
 // osPath turns one of the package's slash-separated paths into the host's
 // form.
 func osPath(p string) string { return filepath.FromSlash(p) }
+
+// secretNames are the places under the home directory where keys and
+// passwords are kept: ssh's and gpg's keys, cloud, GitHub, container and
+// cluster credentials, and the passwords of .netrc and git's store.
+var secretNames = []string{".ssh", ".gnupg", ".aws", ".config/gh", ".netrc", ".git-credentials", ".docker", ".kube"}
+
+// secretPath reports whether real, a link-free path, lies in one of the
+// places the person keeps keys in.
+func (s *Set) secretPath(real string) bool {
+	for _, d := range s.secret {
+		if within(real, d) {
+			return true
+		}
+	}
+	return false
+}
+
+// wide reports whether d, a link-free directory, is the home directory, a
+// directory that holds it, or the top of the disk.
+func (s *Set) wide(d string) bool {
+	return d == "/" || (s.realHome != "" && within(s.realHome, d))
+}
 
 // within reports whether p is dir or lies under it. Both are cleaned,
 // absolute, slash-separated paths.

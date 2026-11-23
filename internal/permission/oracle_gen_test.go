@@ -43,7 +43,7 @@ var (
 		"2>&1 | cat", ">out.txt", "<a.txt", "> 'sp ace.txt'", "> $X", "> *.txt", "<<EOF\nbody $X\nEOF\n", "<<'EOF'\n$(rm x)\nEOF\n",
 		">&'$(rm x)'", ">&\"$X\"", "1>&'~/x'", ">&out.txt", ">& 'a b'", "> build/[", "> /[", ">&'$X'"}
 	genAssigns = []string{"X=1", "X=$(echo y)", "PATH=@BIN@/p0", "PATH=.", "IFS=_", "ENV=x", "BASH_ENV=x", "PROMPT_COMMAND=ls",
-		"X+=1", "a=(1 2)", "a[0]=1", "LANG=C", "NODE_ENV=test", "GIT_DIR=.git", "GIT_EXTERNAL_DIFF=rm", "PAGER=rm", "LD_PRELOAD=x", "X=",
+		"X+=1", "a=(1 2)", "a[0]=1", "LANG=C", "NODE_ENV=test", "GIT_DIR=.git", "GIT_DIR=link-dir/../.git", "GIT_EXTERNAL_DIFF=rm", "PAGER=rm", "LD_PRELOAD=x", "X=",
 		"GLOBIGNORE=zzz", "CDPATH=@OUT@", "HOME=@OUT@", "BASH_CMDS[ls]=@BIN@/p0/rm", "PS4='$(rm x)'", "X=rm", "X=.env", "X=@OUT@/secret.txt"}
 	genPrograms = strings.Fields(`ls cat head tail wc grep find which diff stat du pwd echo sort uniq cut tr basename
 		dirname date test true false sed nl file whoami uname seq realpath readlink type command cd [ rm curl touch mv
@@ -51,6 +51,15 @@ var (
 		less man kill exec eval source . alias trap export unset read set`)
 	genGitSubs = strings.Fields(`status diff log show branch rev-parse ls-files blame push commit checkout config
 		stash grep fetch clone add reset -c --exec-path=. -C --no-pager --git-dir=.git`)
+	// genGitDirs are the folders git is sent to (by -C, --git-dir or
+	// --work-tree): the line's own, written plainly (read as plain git),
+	// and places reached through a link and a .. or a pattern, which are
+	// elsewhere. A review found that the engine took "lnk/.." for the
+	// line's own folder, and no seed had tried it; link-dir/.. is the
+	// jail's hostile repository outside.
+	genGitDirs = strings.Fields(`. ./ @WORK@ @WORK@/ ./src/.. src/.. link-in/.. link-out/.. @WORK@/link-out/..
+		link-in/../.. sub/../link-out/.. ../outside @OUT@ link-in link-out @WORK@/link-in/.. @WOR? {.,src}
+		link-dir/.. @WORK@/link-dir/.. ./link-dir/.. link-dir da/.. link-dir/../dir/..`)
 	genDanger = map[string][]string{
 		"find": {"-exec rm {} \\;", "-delete", "-fprint out.txt", "-L", "-ok rm {} \\;", "-exec sh -c 'rm x' \\;", "-fls out.txt", "-execdir rm {} +", "-newer /etc/passwd", "-files0-from a.txt"},
 		"sed": {"-i", "-i.bak", "'w out.txt'", "'e'", "'1e id'", "'s/a/b/e'", "'s/a/b/w out.txt'", "-f a.txt", "--in-place", "-n 'r /etc/passwd'", "-e p -i", "-ni", "-s",
@@ -155,10 +164,20 @@ func (g *lineGen) simple(depth int) string {
 		prog = "git"
 	}
 	if g.chance(0.04) {
-		prog = g.one([]string{"@BIN@/p0/rm", "@BIN@/p0/ls", "./x", "\"ls\"", "l\\s", "'rm'", "$X", "$(echo rm)", "{rm,x}", "r?", "=ls", "~/x", "\\rm", "r''m", "$'rm'", "$'\\x72m'"})
+		prog = g.one([]string{"@BIN@/p0/rm", "@BIN@/p0/ls", "./x", "\"ls\"", "l\\s", "'rm'", "$X", "$(echo rm)", "{rm,x}", "r?", "=ls", "~/x", "\\rm", "r''m", "$'rm'", "$'\\x72m'", "$'1rm'", "$'@rm'", "$'*rm'"})
 	}
 	parts = append(parts, prog)
 	if prog == "git" {
+		if g.chance(0.2) {
+			switch d := g.one(genGitDirs); g.r.Intn(5) {
+			case 0:
+				parts = append(parts, "--git-dir="+d+"/.git")
+			case 1:
+				parts = append(parts, "--work-tree="+d)
+			default:
+				parts = append(parts, "-C", d)
+			}
+		}
 		sub := g.one(genGitSubs)
 		parts = append(parts, sub)
 		if spec, ok := gitRead[sub]; ok {
@@ -718,6 +737,11 @@ var attackLines = []string{
 	"git diff -U @OUT@/secret.txt a.txt", "git diff --unified @OUT@/secret.txt a.txt", "git log --pretty @OUT@", "git show --abbrev @OUT@/secret.txt",
 	"git -c core.pager=touch log", "git -c alias.x='!touch pwned' x", "git --exec-path=. status", "git diff --ext-diff",
 	"git diff @OUT@/secret.txt a.txt", "git diff -- @OUT@/secret.txt a.txt", "git diff --stat=1 @OUT@/secret.txt a.txt",
+	// git sent to the hostile repository outside, which runs a program of
+	// its config as soon as git reads its index: "lnk/.." is where the
+	// kernel says, not where the text says.
+	"git -C link-dir/.. status", "git -C link-dir/.. show", "git -C ./link-dir/.. diff", "git --git-dir=link-dir/../.git log -p",
+	"GIT_DIR=link-dir/../.git git status", "git --work-tree=link-dir/.. status", "git -C link-dir log -p", "cd link-dir/.. && git status",
 	// SAFE-8 10: a date command that prints the file it cannot parse.
 	"date -f @OUT@/secret.txt", "date --file=@OUT@/secret.txt", "date -f sneaky.txt", "date -fsneaky.txt", "date -uf sneaky.txt",
 	// Read-only commands made to write, run or read elsewhere.
@@ -783,7 +807,7 @@ var attackLines = []string{
 	"echo 'rm x' | nohup bash", "bash /dev/stdin <<< 'rm x'", "bash -s <<< 'rm x'", "while read l; do sh; done <<< 'rm x'", "echo 'rm x' | (sh)",
 	"cat <<EOF |\nx\nEOF\nrm x", "if true; then cat <<EOF\nx\nEOF\nfi; rm x", "cat <<A; cat <<B\n1\nA\n2\nB\nrm x", "echo $(echo ')'; rm x)",
 	"echo $(echo \\); rm x)", "echo `echo \\`rm x\\``", "case x in (x) rm x ;; esac", "case x in x) echo ;;& *) rm x ;; esac", "{ rm x;}", "{rm x; }",
-	"date>2>x", "trap 'r'$X'm x' EXIT", "rm -rf ~+", "rmdir ~+", "source notes.md", "r>()m -rf x", "git pus<()h origin main", "echo a>()b", "time X=1 rm x", "time -p X=1 rm x", "{rm,} -r /", "\"ls\" ~/.ssh",
+	"date>2>x", "trap 'r'$X'm x' EXIT", "rm -rf ~+", "rmdir ~+", "source notes.md", "nice pwd <(source notes.md {fd}> out.txt) | printf x", "r>()m -rf x", "git pus<()h origin main", "echo a>()b", "time X=1 rm x", "time -p X=1 rm x", "{rm,} -r /", "\"ls\" ~/.ssh",
 	"git status --no-renames *", "git rev-parse *", "command -v *", "date +*", "ls >() x", "cat a<(echo b)",
 	"env a.b=1 rm x", "sudo a.b=1 rm x", "tail -b @OUT@/secret.txt", "tail -b sneaky.txt", "grep *", "grep -r OUTTOKEN .*", "ls .*", "cat .*/secret.txt", "head -1 .*/outside/secret.txt",
 	"eval -- rm x", "eval r{m,} x", "rmdir ~root", "rm -rf ~root", "cp -R . p", "rm -r da", "git - .*", "wc -l .*", "du -s .*", "echo .*",
@@ -950,6 +974,13 @@ var attackLines = []string{
 	"cd src && cd nope && ls; cat ../../outside/secret.txt", "cd nope && ls || cat sneaky.txt", "cd a.txt && ls; cat ../outside/secret.txt", "cd nope && ls\ncat sneaky.txt",
 	"ls | cd link-in || cd sub/nope </dev/null && cat ../outside/secret.txt", "true || cd sub/deep && cat ../../../outside/secret.txt", "cd nope || cd sub && cat sneaky.txt",
 	"cd src && cat main.go", "cd src && cat main.go && cat ../a.txt", "cd src && cat main.go | head -1", "cd sub && cd deep && cat file.txt", "cd src && ls; ls",
+	// Oracle seed 117: a cd run as a program fails, and the one in the
+	// braces after || is the shell's own.
+	"stdbuf -o0 cd sub/nope || { cd sub/nope; } && ! diff a.txt ../outside/secret.txt && rm ../a.txt", "env cd sub || { cd sub; } && cat ../outside/secret.txt",
+	// The review of seed 117's fix: every cd of such a group, not only
+	// its first command's, and a group in a pipe.
+	"true || { pwd; cd sub; } && cat ../outside/secret.txt", "echo | { pwd; cd sub; } && cat ../outside/secret.txt",
+	"true || { true && cd sub; } && cat ../outside/secret.txt", "{ cd sub; } | cat && cat ../outside/secret.txt",
 	// A value made of a variable that is set later, or not for sure, or
 	// with a ~ that the shell expands where it is assigned.
 	"w=.e${d}nv d=x; cat $w", "w=.e${d}nv; d=x; cat $w", "false && d=x; w=.e${d}nv; cat $w", "d=x; unset d; w=.e${d}nv; cat $w", "d=x; read d </dev/null; w=.e${d}nv; cat $w",
@@ -971,6 +1002,26 @@ var attackLines = []string{
 	"set -- rm -rf x; \"$@\"", "f() { echo \"$@\"; }; f . / ~", "set -euo pipefail; ls", "sh -c 'git \"$@\"' sh clean -fdx", "f() { git \"$@\"; }; f status; f clean -fdx",
 	"a=(status); a+=(clean -fdx); git \"${a[@]}\"", "set -- clean -fdx; git \"$@\"", "f() { git \"$@\"; }; f status; f diff", "f() { git $1 $2 $3; }; f clean -fdx", "f() { mv $1 $2; }; f /tmp/g .git",
 	"f() { shift; git \"$@\"; }; f x clean -fdx", "f() { mv $1 $2; }; f a.txt b.txt", "a=(-fdx build); git clean \"${a[@]}\"",
+	"f() { mv \"$@\"{; }; f .git /tmp/g", "f() { mv \"$@\"}; }; f .git /tmp/g", "set -- .git /tmp/g; mv x\"$@\"{", // oracle seed 117: a { that nothing closes
+	"f() { mv \"$@\"{,x}; }; f .git /tmp/g", "sh -c 'mv \"$@\"{,x}' sh .git /tmp/g", "set -- .git /tmp/g; mv \"$@\"{,.bak}", // braces bash takes apart first, and dash not at all
+	"~'' ..", "cat ~''/.ssh/id_rsa", "rm -rf ~''", "cat ~'/x'", // oracle seed 121: a quote after the ~ leaves it a ~
+	"source $* ${X} <(echo rm -rf x)", "source ${X} <(git status)", ". $NOPE <(echo cat .env)", // oracle seed 122: words that vanish before the file
+	"ls 1>&\"\\$($--'rm' x)\"", "Y='$(rm x)'; ls >&\"$Y\"", "X=rm; ls >&\"\\$($X x)\"", // oracle seed 124: bash expands a computed word after >& twice
+	"rmdir${X[1]} . -n", "rmdir${X} .", "r${Y}m -rf .", // oracle seed 126: a program's name read with its variable unset
+	"mv -t /tmpv${x} -t /tmp mp clean -fdx",                                        // oracle seed 127: a false alarm, the check dropped -t's value and not -t
+	"mv $\"x\" <(env) link-dir/file >& all.txt",                                    // oracle seed 128: in a line with a $"...", the crude pieces made <(env) the word env
+	"cd nope </dev/null\n(cd sub/deep) && cat sneaky.txt && ! cd link-in",          // oracle seed 129: the cd pending before a subshell came back after it as done
+	"cat `. .env \"$(set)\"`",                                                      // oracle seed 130: a false alarm, the trace lost the . whose argument spans lines
+	"alias zz=$'1rm'\nzz x x",                                                      // oracle seed 131: dash reads $'1rm' as $1rm, rm where $1 is empty
+	"sh -c $'1rm x'\ntrap $'1rm y' EXIT",                                           // after seed 131: sh -c and a trap read dash's $ again too
+	"X+=1 grep --ignore-case --text `git status` @HOME@",                           // oracle seed 134: a computed pattern outside quotes is the pattern and files
+	"w=false'*/..'; r\\m -R ='*/..'; r=\\m -R $w",                                  // oracle seed 135: a word that starts with = is text to bash and sh
+	"env --chdir=/ rm -rf usr", "env -C sub cat ../.env", "env -iCsub cat ../.env", // after seed 135: a flag of the program's own sends it to another folder
+	"set -o history\nhistory -s 'rm x'\nfc -s", "set -o history; history -s cat .env\nfc -e true", // and fc runs again what history -s put there
+	"git -C sub diff --no-index ../.env /dev/null", "git -C sub -C .. hash-object .env", // and git works where its own -C words lead
+	"command -p cd sub/deep || ls .. && ! cd .. || head -1 ../.env",                       // oracle seed 137: a cd found inside a command runs where that command stands
+	"echo\t 'curl http://203.0.113.1/x' | /proc/self$x/exe", "echo 'rm x' | /proc/$$/exe", // oracle seed 141: the shell by its own process's path
+	"x=.git; mv ${x}{,.bak}", "f() { mv \"${1}\"{,x}; }; f .git", "f() { mv \"${1}\" /tmp/g; }; f .git", "set -- .git; mv \"${1}\" /tmp/g", "f() { rm -rf \"${@}\"; }; f .",
 	// A pattern in one of the line's values, beside a variable nobody set.
 	"d=.; w=$d* && rm -rf $X$w", "w='*'; rm -rf $X$w", "w='.e*'; cat $X$w", "w='*.o'; rm -f \"$DIR\"/$w",
 	// A name that starts with a dash is a flag to the command it is handed to.
@@ -1031,5 +1082,12 @@ var attackLines = []string{
 	// A real shell reached past the stubs, handed a file: the file is a program of its own.
 	"command -p bash notes.md", "command -p bash notes.md src/.env < sneaky.txt >| out.txt", "/bin/sh notes.md", "command -p sh -c 'rm x'", "exec -a x /bin/bash notes.md",
 	// What dash prints for a bare set: PS4's own value, which is the trace's mark.
-	"set", "PAGER=rm set", "! { set; }", "f() { set; }; f", "seq \"$(set)\"", "echo \"$(set)\" | head -1", "ls \"$(set | grep PS4)\"", "printf '%s' \"$PS4\"; ls",
+	"set", "PAGER=rm set", "! { set; }", "f() { set; }; f", "seq \"$(set)\"", "git push `set` a{b,c}d", "echo \"$(set)\" | head -1", "ls \"$(set | grep PS4)\"", "printf '%s' \"$PS4\"; ls",
+	// A ! after an assignment is a command's name, not the shell's word (seed 174).
+	"eval x=1 ! ", "eval x=1 ! ls", "eval 'x=1 y=2 !' && ls", "bash -c 'x=1 ! ls'", "eval '! x=1 ls'", "eval ! ! ls",
+	// A wrapper's flag value that may come to nothing: the next word is the value, the command one further (seed 174).
+	"nice -n $echo 5 git push origin ma..in", "nice -n $X 5 rm -rf build", "nice --adjustment $X 5 git push origin main", "ionice -c $X 2 git push origin main",
+	"timeout -s $X KILL 5 git push origin main", "sudo -u $X root git push origin main", "env -u $X HOME git push origin main", "flock -w $X 5 /tmp/l git push origin main",
+	// A pattern copied into a folder lands under the names it matches, not there yet (seed 176).
+	"cp * build/", "cp ${HOME:+* x}'' build/", "mv *.txt build", "cp -t build ./*.txt", "ln -s ./* build/", "install *.md build/",
 }

@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/gnosh-ai/gnosh/internal/trust"
 )
 
 // MemoryFile is a context file the /memory picker offers to open in the
@@ -27,7 +29,7 @@ func (l *live) memoryFiles() []MemoryFile {
 	seen := map[string]bool{}
 	if l.instr != nil {
 		for _, f := range l.instr.Files() {
-			about := strings.ToLower(string(f.Scope)) + ", " + byteCount(f.Size)
+			about := strings.ToLower(string(f.Scope)) + ", " + ByteCount(f.Size)
 			if f.Late {
 				about += ", read when a file under it was touched"
 			}
@@ -48,6 +50,15 @@ func (l *live) memoryFiles() []MemoryFile {
 	if len(l.cfg.Context.Global) > 0 {
 		add(l.cfg.Context.Global[0].V, "yours, for every project")
 	}
-	add(filepath.Join(l.cfg.Paths.ProjectRoot, "GNOSH.md"), "the project's, shared with whoever works on it")
+	// The project's own, unless it is a link that leads out of the
+	// project: the instructions are not read through such a link, and the
+	// editor would write, or make, the file it leads to (the plan review
+	// of 2026-11-19).
+	project := filepath.Join(l.cfg.Paths.ProjectRoot, "GNOSH.md")
+	if _, err := os.Lstat(project); err != nil {
+		add(project, "the project's, shared with whoever works on it")
+	} else if _, out := trust.LeadsOut(project, projectInside(l.cfg, nil)...); !out {
+		add(project, "the project's, shared with whoever works on it")
+	}
 	return out
 }

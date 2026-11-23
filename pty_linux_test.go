@@ -151,6 +151,9 @@ func TestBinaryInteractiveSession(t *testing.T) {
 	term.see("- two plus two")
 	term.see("+ three plus two")
 	term.see("1. Yes, this once")
+	// (As a person would, after reading it: a line typed as the question
+	// came is not taken for its answer.)
+	time.Sleep(600 * time.Millisecond)
 	term.typeLine("1")
 	term.see("The file is changed.")
 	term.see("-- done in ")

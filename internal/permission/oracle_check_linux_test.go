@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -204,6 +205,14 @@ func (j *jail) ran(r shellRun) []ranCmd {
 		}
 		switch w0 {
 		case "((", "for", "case", "select":
+			continue
+		}
+		if strings.Contains(w0, "/") {
+			// A name with a slash is run by its path, never as a builtin
+			// or a function: a program that ran has a record of its own,
+			// and one that has none was not there to run. (Oracle seed
+			// 161: bash tried 'evalalias@BIN@/0/rm x', which is not a
+			// file, and the trace's name ended in "rm x".)
 			continue
 		}
 		if names[baseName(w0)] && !shellBuiltins[w0] {
@@ -458,7 +467,6 @@ type lineCheck struct {
 	line  string
 	view  *bashView // the engine's reading
 	plain *Engine
-	runs  []shellRun
 }
 
 // guardHit says which deny or ask rule names something the run did, or
@@ -489,7 +497,12 @@ func (lc *lineCheck) guardHit(e *Engine, rs ruleSet, r shellRun, rcs []ranCmd) s
 		if rc.fuzzy || rc.by == 0 || sourced && rc.path == "" {
 			continue // started by a program no rule reads, or read from a file that was sourced
 		}
-		if sourced && rc.by == 2 {
+		if sourced && (rc.by == 2 || j.fileLines[rc.text()]) {
+			// A line of a file that was sourced: started by the shell,
+			// or under a wrapper when the subshell that sourced it was
+			// started for one of its arguments ("nice pwd <(source
+			// notes.md)": the subshell's parent became nice). Oracle
+			// seed 144.
 			continue
 		}
 		texts := []string{rc.text()}
@@ -525,6 +538,15 @@ func (lc *lineCheck) guardHit(e *Engine, rs ruleSet, r shellRun, rcs []ranCmd) s
 		for _, w := range f.writes {
 			if abs, ok := cleanAbs(w.joined(), rc.cwd); ok {
 				writes = append(writes, abs)
+			}
+		}
+		// A copy lands under its place by the source's name where the
+		// place is a folder, as it is in the jail after the run.
+		for _, ld := range f.lands {
+			if abs, ok := cleanAbs(ld.into.joined(), rc.cwd); ok {
+				if st, err := os.Stat(path.Dir(abs)); err == nil && st.IsDir() {
+					writes = append(writes, abs)
+				}
 			}
 		}
 		if j.treeFile(rc.fd[0]) {
@@ -580,6 +602,20 @@ func (lc *lineCheck) guardHit(e *Engine, rs ruleSet, r shellRun, rcs []ranCmd) s
 		if b := baseName(rc.name); destroyers[b] && rc.path != "" {
 			ws := []word{litOf(b)}
 			for _, a := range rc.args {
+				// As for rm above: a variable in front of a lone name at
+				// the top that is not one of the usual ones ("$OUT/build")
+				// is not a target the engine claims to stop.
+				if abs, ok := cleanAbs(a, rc.cwd); ok && abs != "/" && path.Dir(abs) == "/" && !topLevelNames[path.Base(abs)] && !lc.writes(a) {
+					// It may be the value of the option before it ("-t
+					// /tmpv"), which goes with it: left alone, the option
+					// would take the next word for its value instead, and
+					// the command judged would not be the one that ran
+					// (oracle seed 127).
+					if n := len(ws); n > 1 && strings.HasPrefix(ws[n-1].lit(), "-") && ws[n-1].lit() != "--" {
+						ws = ws[:n-1]
+					}
+					continue
+				}
 				ws = append(ws, litOf(a))
 			}
 			known := &bashView{sc: &script{ok: true}, vars: map[string]*lineVar{}}
@@ -934,8 +970,32 @@ func realShellFile(words []string) bool {
 // always show the command that did.
 func (lc *lineCheck) runsFile() bool {
 	for _, u := range lc.view.units {
-		if len(u.cmd.words) > 1 && allStatic(u.cmd.words) && realShellFile(litsOf(u.cmd.words)) {
+		ws := u.cmd.words
+		if len(ws) > 1 && allStatic(ws) && realShellFile(litsOf(ws)) {
 			return true
+		}
+		// A file sourced, as the engine read it (". .env", "source x"): its
+		// commands are a program of their own, as sourcesFile has it from
+		// the trace. The trace can lose the command when an argument after
+		// the file spans lines (". .env \"$(set)\"", oracle seed 130).
+		if len(ws) > 1 && ws[0].static() && ws[1].static() && (ws[0].lit() == "." || ws[0].lit() == "source") {
+			if f := ws[1].lit(); f != "/dev/stdin" && !strings.HasPrefix(f, "/dev/fd/") && !strings.HasPrefix(f, "/proc/self/fd/") {
+				return true
+			}
+		}
+		// A login shell (sh -l, bash --login) runs the profile files first:
+		// programs of their own, as a sourced file is (oracle seed 142:
+		// "command -p sh -la" ran /etc/profile's id -u).
+		if len(ws) > 1 && ws[0].static() && lineShells[baseName(ws[0].lit())] {
+			for _, a := range ws[1:] {
+				l := a.lit()
+				if !a.static() || !strings.HasPrefix(l, "-") && !strings.HasPrefix(l, "+") {
+					break
+				}
+				if l == "--login" || !strings.HasPrefix(l, "--") && strings.HasPrefix(l, "-") && strings.Contains(l[1:], "l") {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -1076,6 +1136,16 @@ func (lc *lineCheck) disagreement(r shellRun, rcs []ranCmd) string {
 	if strings.Contains(lc.line, "PS4") || strings.Contains(lc.line, "XTRACE") || strings.Contains(lc.line, "set +") {
 		return "" // the line turns the trace off, or makes it unreadable
 	}
+	if r.shell == "dash" && slices.ContainsFunc(v.units, func(u *unit) bool { return len(u.cmd.words) == 1 && u.cmd.words[0].lit() == "set" }) {
+		// A bare set lists every variable, PS4's value among them, which is
+		// the trace's mark. dash's trace runs in with what the commands
+		// print, and a command handed the list ("git push `set` a{b,c}d",
+		// oracle seed 148: under the stubs that print their arguments)
+		// prints the mark where the trace reader takes it for the start of
+		// a command. The engine asks about or refuses every such line, for
+		// the substitution in it.
+		return ""
+	}
 	if strings.Contains(lc.line, "-C ''") || strings.Contains(lc.line, "-C \"\"") {
 		// compgen -C with an empty command: the words bash adds for the
 		// callback become a command of their own ("compgen '' ''").
@@ -1171,6 +1241,12 @@ func (lc *lineCheck) disagreement(r shellRun, rcs []ranCmd) string {
 			}
 		}
 		switch name {
+		case ":":
+			// The trace reader leaves every ":" out (parseTrace: what
+			// stands after it may be another stage's lines), so it is not
+			// looked for. (Oracle seed 171: ": #${X:=x}; cat *", a ":"
+			// with a comment, as the engine read it.)
+			continue
 		case "[[":
 			// bash refuses a test it cannot make sense of, and runs
 			// nothing.
@@ -1178,6 +1254,26 @@ func (lc *lineCheck) disagreement(r shellRun, rcs []ranCmd) string {
 		case "exit", "exec", "return", "kill", "set", "trap", "eval", "command", "builtin", "wait", "time",
 			"break", "continue", "shopt", "enable", "alias", "unalias", "hash", "suspend", "logout", "ulimit":
 			return ""
+		}
+		for _, rd := range c.redirs {
+			// A redirection's word can fail to expand too (> ${}), which
+			// ends the line.
+			if _, ok := e.known(rd.target); !ok {
+				return ""
+			}
+		}
+		if len(c.redirs) > 0 {
+			// A command's redirections can hide it from the trace: one
+			// that sends standard error elsewhere takes its own trace
+			// line with it (seed 157: ":&> $((x))" ran, and made the file
+			// 0, which then held the trace), and one that fails (a folder
+			// that is not there) keeps the command from running while
+			// bash goes on to the next. Either way the trace cannot say
+			// the engine read too much, and the command is not looked
+			// for. (The checks above, that end the line, still apply to
+			// it: seed 158 skipped them for a redirected exec and a
+			// redirected command holding ${}.)
+			continue
 		}
 		want = append(want, c)
 	}

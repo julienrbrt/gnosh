@@ -315,6 +315,10 @@ func TestProtectedPaths(t *testing.T) {
 		"/proj/.gnosh/worktrees/agent-1", "/proj/.gnosh/worktrees/.gitignore",
 		"/proj/.gnosh/worktrees/agent-1/.git", "/proj/.gnosh/worktrees/agent-1/.gnosh/settings.local.json",
 		"/proj/.gnosh/worktrees/agent-1/sub/.envrc",
+		// In an agent's memory folder, what is not a note of its.
+		"/proj/.claude/agent-memory/rev/run.sh", "/proj/.claude/agent-memory/x.md", "/proj/.gnosh/agent-memory/rev/.git/x.md",
+		"/proj/.claude/agent-memory/rev/.claude/settings.json", "/home/u/.config/gnosh/agent-memory/rev/hook.json",
+		"/home/u/.config/gnosh/agents/rev.md",
 	}
 	open := []string{
 		"/proj/a.go", "/proj/git/config", "/proj/.github/workflows/ci.yml", "/proj/.claude/worktrees/w/a.go",
@@ -323,9 +327,12 @@ func TestProtectedPaths(t *testing.T) {
 		"/proj/gnoshrc", "/proj/.gnoshrc", "/proj/gnosh.json.bak",
 		// What is inside a work tree gnosh made for a sub-agent.
 		"/proj/.gnosh/worktrees/agent-1/a.go", "/proj/.gnosh/worktrees/agent-1/sub/b.go",
+		// The notes in an agent's memory folder, as Claude Code leaves them.
+		"/proj/.claude/agent-memory/rev/MEMORY.md", "/proj/.gnosh/agent-memory-local/rev/notes/tests.md",
+		"/home/u/.claude/agent-memory/rev/MEMORY.md", "/home/u/.config/gnosh/agent-memory/rev/MEMORY.md",
 	}
 	o := testOptions(ModeAcceptEdits, rules{allow: []string{"Edit", "Write", "Edit(**)", "Edit(//**)"}})
-	o.Protected = []string{"/custom/settings.json", "/var/mem/store", "/proj/.gnosh"}
+	o.Protected = []string{"/custom/settings.json", "/var/mem/store", "/proj/.gnosh", "/home/u/.config/gnosh"}
 	o.WorkTrees = []string{"/proj/.gnosh/worktrees"}
 	e := mustEngine(t, o)
 	for _, p := range protected {
@@ -472,12 +479,33 @@ func TestCommandWrites(t *testing.T) {
 		{"cat /repo/a.go", ""},
 		{"echo hi > /dev/null", ""},
 	} {
-		got := e.CommandWrites("/proj", c.cmd)
+		got, _ := e.CommandWrites("/proj", c.cmd)
 		switch {
 		case c.want == "" && len(got) > 0:
 			t.Errorf("CommandWrites(%q) = %q, want none", c.cmd, got)
 		case c.want != "" && !slices.Contains(got, c.want):
 			t.Errorf("CommandWrites(%q) = %q, want %s among them", c.cmd, got, c.want)
+		}
+	}
+}
+
+// CommandWrites says when a file a line writes is named by text computed
+// when it runs, which no path can stand for; a file read so, or a target
+// the line itself gives its value, is not one (review, 17 November: a
+// write to "$(git rev-parse --git-common-dir)/config" was read as /config).
+func TestCommandWritesUnknown(t *testing.T) {
+	e := mustEngine(t, testOptions(ModeDefault, rules{}))
+	for cmd, want := range map[string]bool{
+		`printf x >> "$(git rev-parse --git-common-dir)/config"`: true,
+		`echo x > "$OUT"`:             true,
+		`cp a.txt "$DEST"`:            true,
+		`cat "$F" > out.txt`:          false,
+		`f=out.txt; echo x > "$f"`:    false,
+		`echo x > /tmp/known.txt`:     false,
+		`grep -r "$PAT" . > hits.txt`: false,
+	} {
+		if _, why := e.CommandWrites("/proj", cmd); (why != "") != want {
+			t.Errorf("CommandWrites(%q): unknown %q, want unknown %v", cmd, why, want)
 		}
 	}
 }
@@ -515,7 +543,9 @@ func TestGitPlaces(t *testing.T) {
 		{"git status", ""},
 		{"git log --oneline -C x", ""}, // after the subcommand: its own words
 		{"git -C /repo commit -am x", "/repo"},
-		{"git -C ../repo log", "/repo"},
+		{"git -C ../repo log", "-"}, // (a .. goes through a link first)
+		{"git -C lnk/.. status", "-"},
+		{"git --git-dir=/repo/x/../.git log", "-"},
 		{"git --git-dir=/repo/.git log", "/repo/.git"},
 		{"git --git-dir /repo/.git --work-tree /repo log", "/repo/.git /repo"},
 		{"GIT_DIR=/repo/.git git log", "/repo/.git"},
@@ -540,5 +570,29 @@ func TestGitPlaces(t *testing.T) {
 		if !ok || got != c.want {
 			t.Errorf("GitPlaces(%q) = %q, %v; want %q", c.cmd, got, ok, c.want)
 		}
+	}
+}
+
+// A protected file or folder that is a link protects what it leads to:
+// that is the file the settings are read from. And a work tree named as a
+// protected folder (.git) gets no work tree's exemption.
+func TestProtectedLinksAndTrees(t *testing.T) {
+	o := testOptions(ModeAcceptEdits, rules{allow: []string{"Edit", "Write", "Edit(**)", "Edit(//**)"}})
+	o.Protected = []string{"/home/u/.config/gnosh"}
+	o.Resolve = func(p string) (string, error) {
+		if p == "/home/u/.config/gnosh" {
+			return "/home/u/dotfiles/gnosh", nil
+		}
+		return p, nil
+	}
+	o.WorkTrees = []string{"/proj/.gnosh/worktrees"}
+	e := mustEngine(t, o)
+	for _, p := range []string{"/home/u/dotfiles/gnosh/settings.json", "/proj/.gnosh/worktrees/.git/config"} {
+		if d := file(e, "Write", p); d.Behavior != Ask || d.Stage != StageSafety {
+			t.Errorf("%s: got %s at %s, want a plain ask at the safety stage", p, d.Behavior, d.Stage)
+		}
+	}
+	if d := file(e, "Write", "/home/u/dotfiles/other.txt"); d.Stage == StageSafety {
+		t.Errorf("a file beside the linked folder hit the safety check")
 	}
 }

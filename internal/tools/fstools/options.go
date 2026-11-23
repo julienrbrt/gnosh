@@ -1,6 +1,7 @@
 package fstools
 
 import (
+	"context"
 	"runtime"
 	"time"
 
@@ -13,15 +14,16 @@ import (
 // set below one takes its default too, except where a field says what a
 // negative value means.
 type Options struct {
-	// ReadName, WriteName, EditName, GlobName and GrepName are the names
-	// the model calls the tools by, which are also the names permission
-	// rules and hooks use. Defaults: "Read", "Write", "Edit", "Glob",
-	// "Grep".
-	ReadName  string
-	WriteName string
-	EditName  string
-	GlobName  string
-	GrepName  string
+	// ReadName, WriteName, EditName, GlobName, GrepName and
+	// NotebookEditName are the names the model calls the tools by, which
+	// are also the names permission rules and hooks use. Defaults: "Read",
+	// "Write", "Edit", "Glob", "Grep", "NotebookEdit".
+	ReadName         string
+	WriteName        string
+	EditName         string
+	GlobName         string
+	GrepName         string
+	NotebookEditName string
 
 	// HomeDir is what a leading "~/" in a path argument stands for. When
 	// it is empty, which is the default, a path that starts with "~" is
@@ -49,8 +51,34 @@ type Options struct {
 	ReadCountBytes int64
 
 	// ReadMaxImageBytes is the largest image file Read returns as a
-	// picture. Default 5 MiB. Read does not shrink images.
+	// picture. Default 5 MiB. A larger PNG, JPEG or GIF is shrunk to fit,
+	// and so is one longer than 1568 pixels on a side (shrink.go).
 	ReadMaxImageBytes int64
+
+	// ReadRoom, when not nil, says how many bytes of text a Read with
+	// allow_large may return now: about what the context of the agent
+	// that calls has room for, which the app works out. Read then reads
+	// the whole file, or as much of it as that, in one call, as Claude
+	// Code's allow_large does. Nil, or no more than ReadMaxBytes, leaves
+	// allow_large without effect. done is called once the Read is over,
+	// with the bytes it returned, so that the rest of the room may go to
+	// another call of the same round.
+	ReadRoom func(ctx context.Context) (room int, done func(used int))
+
+	// ReadResultMost, when not nil, says the most bytes one Read result
+	// may hold, line numbers and all, before the loop that called it cuts
+	// it (to a quarter of the model's window, say), or 0 for no such
+	// limit. Read stops short of it, as at ReadMaxBytes, so that the lines
+	// it records as read are the lines the model is shown: Write takes a
+	// file read whole to be known whole.
+	ReadResultMost func(ctx context.Context) int
+
+	// PDFPages and PDFText read a PDF for Read (pdf.go): how many pages it
+	// has, and the text of pages first to last, each page ended by a form
+	// feed. Nil means poppler's pdfinfo and pdftotext, found on the PATH
+	// when they are wanted; Read says so when they are not there.
+	PDFPages func(ctx context.Context, path string) (int, error)
+	PDFText  func(ctx context.Context, path string, first, last int) (string, error)
 
 	// EditMaxBytes is the largest file Edit changes. Edit holds the whole
 	// file in memory, twice. Default 32 MiB.
@@ -78,6 +106,13 @@ type Options struct {
 	// does. By default they write the file the link leads to and leave the
 	// link alone.
 	RefuseLinkWrites bool
+
+	// ReadDenied, when set, reports whether a Read deny rule covers a file,
+	// given its absolute path as written or as reached. Glob and Grep leave
+	// out what it covers in a folder they walk: its name is not listed and
+	// its content is not searched. (The folder itself is judged by the gate,
+	// before the walk.)
+	ReadDenied func(path string) bool
 
 	// GlobMaxResults is the most files Glob lists. Default 100.
 	GlobMaxResults int
@@ -140,8 +175,9 @@ type Options struct {
 	SearchWorkers int
 
 	// IgnoreFiles are the names of the ignore files Glob and Grep read in
-	// every directory, in rising order of weight. Default: .gitignore
-	// alone. An empty, non-nil list reads none.
+	// every directory, in rising order of weight. Default: .gitignore,
+	// .ignore and .rgignore, the files ripgrep reads, and so Claude Code's
+	// Grep, with that weight. An empty, non-nil list reads none.
 	IgnoreFiles []string
 
 	// NoGitExclude stops Glob and Grep reading a repository's
@@ -179,6 +215,7 @@ func (o Options) withDefaults() Options {
 	text(&o.EditName, "Edit")
 	text(&o.GlobName, "Glob")
 	text(&o.GrepName, "Grep")
+	text(&o.NotebookEditName, "NotebookEdit")
 	num(&o.ReadDefaultLines, 2000)
 	num(&o.ReadMaxBytes, 100_000)
 	num(&o.ReadMaxLineChars, 2000)
@@ -211,7 +248,7 @@ func (o Options) withDefaults() Options {
 		o.SearchWorkers = min(runtime.GOMAXPROCS(0), 8)
 	}
 	if o.IgnoreFiles == nil {
-		o.IgnoreFiles = []string{".gitignore"}
+		o.IgnoreFiles = []string{".gitignore", ".ignore", ".rgignore"}
 	}
 	return o
 }
@@ -230,5 +267,19 @@ func New(opts Options) []core.Tool {
 		&editTool{opts: &o, sys: sys},
 		&globTool{opts: &o},
 		&grepTool{opts: &o},
+		&notebookEditTool{opts: &o, sys: sys},
 	}
+}
+
+// denied reports whether ReadDenied covers one of the paths of a file.
+func (o *Options) denied(paths ...string) bool {
+	if o.ReadDenied == nil {
+		return false
+	}
+	for _, p := range paths {
+		if p != "" && o.ReadDenied(p) {
+			return true
+		}
+	}
+	return false
 }

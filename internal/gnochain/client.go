@@ -66,9 +66,6 @@ func (c *Client) WithSigner(s Signer) *Client {
 	return &cc
 }
 
-// ChainID is the chain the client talks to.
-func (c *Client) ChainID() string { return c.chainID }
-
 // Caller is the address a realm sees calling: the signer's own, or for a
 // session key, its master's.
 func (c *Client) Caller() (crypto.Address, error) {
@@ -125,11 +122,6 @@ func (c *Client) EvalAt(ctx context.Context, height int64, pkgPath, expr string)
 	return ParseValue(string(out))
 }
 
-// EvalJSON is Eval of an expression whose value is JSON, decoded into v.
-func (c *Client) EvalJSON(ctx context.Context, pkgPath, expr string, v any) error {
-	return c.EvalJSONAt(ctx, 0, pkgPath, expr, v)
-}
-
 // EvalJSONAt is EvalJSON on the state at height (0 for the latest); see
 // QueryAt.
 func (c *Client) EvalJSONAt(ctx context.Context, height int64, pkgPath, expr string, v any) error {
@@ -142,10 +134,6 @@ func (c *Client) EvalJSONAt(ctx context.Context, height int64, pkgPath, expr str
 	}
 	return nil
 }
-
-// Quote is s as a Gno string literal, for an argument in an Eval
-// expression.
-func Quote(s string) string { return strconv.Quote(s) }
 
 // ParseValue reads a Gno value as qeval and call results print it, such as
 // ("t1/r1/u1" string) or (5 int64), into its text (unquoted for strings).
@@ -346,24 +334,6 @@ func (c *Client) account(ctx context.Context) (uint64, uint64, error) {
 	}
 	seq, err := num(b.Sequence)
 	return accNum, seq, err
-}
-
-// BlockTxs returns the transactions of the block at height that decode as
-// transactions (with MsgCall and the messages tm2's std package knows).
-func (c *Client) BlockTxs(ctx context.Context, height int64) ([]std.Tx, error) {
-	raws, err := c.rpc.blockTxs(ctx, height)
-	if err != nil {
-		return nil, fmt.Errorf("fetching block %d: %w", height, err)
-	}
-	var txs []std.Tx
-	for _, raw := range raws {
-		var tx std.Tx
-		if err := amino.Unmarshal(raw, &tx); err != nil {
-			continue
-		}
-		txs = append(txs, tx)
-	}
-	return txs, nil
 }
 
 // realmError turns a failed call into the realm's own words where it said

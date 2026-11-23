@@ -151,7 +151,7 @@ func resourceText(parts []mcp.ResourceContents, uri string) string {
 			out = append(out, p.Text)
 		case p.Blob != "":
 			out = append(out, fmt.Sprintf("[%s holds binary data (%s, about %s), which is not shown here.]",
-				firstOf(p.URI, uri), firstOf(p.MimeType, "of a type it does not name"), byteCount(int64(len(p.Blob)*3/4))))
+				firstOf(p.URI, uri), firstOf(p.MimeType, "of a type it does not name"), ByteCount(int64(len(p.Blob)*3/4))))
 		}
 	}
 	if len(out) == 0 {

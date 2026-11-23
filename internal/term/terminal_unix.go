@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -67,6 +68,11 @@ type Terminal struct {
 
 	sigs chan os.Signal
 	cont chan struct{} // the process was continued while Suspend waited
+
+	// screen says a Panel has the whole screen: the alternate screen,
+	// with mouse reporting on and the line wrapping off (noteScreen). It
+	// is read without the lock by RestoreOnPanic.
+	screen atomic.Bool
 }
 
 // requests are what other goroutines ask of the reader.
@@ -245,6 +251,13 @@ func (t *Terminal) CopyToClipboard(text string) error {
 	return err
 }
 
+// noteScreen is told by a Panel when it takes the whole screen and when it
+// gives it back, so that whatever gives the terminal up (a panic, a stop
+// from outside, an editor) gives the screen back too, and takes it again
+// with the terminal. They were left on: the shell ran on the alternate
+// screen with every click typed into it (the TUI review of 2026-11-19).
+func (t *Terminal) noteScreen(taken bool) { t.screen.Store(taken) }
+
 // leave gives the terminal up: modes off, settings as they were found.
 // The caller holds t.mu.
 func (t *Terminal) leave() error {
@@ -252,7 +265,11 @@ func (t *Terminal) leave() error {
 		return nil
 	}
 	t.raw = false
-	_, werr := t.out.WriteString(leaveSequence(t.modes))
+	seq := leaveSequence(t.modes)
+	if t.screen.Load() {
+		seq = screenOff + seq
+	}
+	_, werr := t.out.WriteString(seq)
 	if err := xterm.Restore(t.inFd, t.saved); err != nil {
 		return fmt.Errorf("restore terminal %s: %w", t.in.Name(), err)
 	}
@@ -272,7 +289,11 @@ func (t *Terminal) enter() error {
 		return fmt.Errorf("put terminal %s in raw mode: %w", t.in.Name(), err)
 	}
 	t.raw = true
-	if seq := t.modes.on(); seq != "" {
+	seq := t.modes.on()
+	if t.screen.Load() {
+		seq = screenOn + seq
+	}
+	if seq != "" {
 		if _, err := t.out.WriteString(seq); err != nil {
 			return fmt.Errorf("terminal %s: turn modes on: %w", t.in.Name(), err)
 		}
@@ -435,7 +456,11 @@ func (t *Terminal) RestoreOnPanic() {
 		t.mu.Unlock()
 	} else {
 		// The lock is held, perhaps by the code that panicked.
-		t.out.WriteString(leaveSequence(Modes{BracketedPaste: true, FocusReporting: true}))
+		seq := leaveSequence(Modes{BracketedPaste: true, FocusReporting: true})
+		if t.screen.Load() {
+			seq = screenOff + seq
+		}
+		t.out.WriteString(seq)
 		xterm.Restore(t.inFd, t.saved)
 	}
 	panic(r)

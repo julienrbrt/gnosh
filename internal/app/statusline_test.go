@@ -78,6 +78,37 @@ func TestStatusLineCommand(t *testing.T) {
 	s.exit()
 }
 
+// A command that changes what the status line is told runs it again: after
+// /rename it is told the new name at once, not at the next reply (Claude
+// Code 2.1.326 stopped keeping a stale name, folder or width).
+func TestStatusLineAfterACommand(t *testing.T) {
+	w := apptest.NewWorld(t)
+	runs := w.Home + "/sl-runs"
+	script := w.Script(w.Home+"/bin/sl.sh", "{ cat; echo; } >> "+runs+"\necho line")
+	w.Settings(`{"statusLine": {"type": "command", "command": "` + script + `"}}`)
+	named := func(name string) bool {
+		data, _ := os.ReadFile(runs)
+		for _, line := range strings.Split(string(data), "\n") {
+			var obj map[string]any
+			if json.Unmarshal([]byte(line), &obj) == nil && obj["session_name"] == name {
+				return true
+			}
+		}
+		return false
+	}
+	s := sit(t, w)
+	s.see("Type a prompt and Enter.")
+	s.typeLine("/rename the new name")
+	for deadline := time.Now().Add(15 * time.Second); !named("the new name"); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			data, _ := os.ReadFile(runs)
+			t.Fatalf("the status line was never told the new name; it was given:\n%s", data)
+		}
+	}
+	s.typeLine("/exit")
+	s.exit()
+}
+
 // With a refreshInterval the command runs again on its own, with nothing
 // else happening.
 func TestStatusLineRefresh(t *testing.T) {

@@ -40,6 +40,12 @@ type Theme struct {
 	Image text.Style
 	// HTML is raw HTML, which is shown as the text it is.
 	HTML text.Style
+	// Quote is the prose of a block quote, in place of Text: what an
+	// answer quotes is someone else's words, and does not take the
+	// answer's own colour (Jae, 21 November 2026: "the stuff to the right
+	// of the purple bar shouldn't be green"). Emphasis, links and code
+	// inside it are drawn over it as over Text.
+	Quote text.Style
 	// QuoteMark is the bar down the left of a block quote.
 	QuoteMark text.Style
 	// ListMark is a bullet or an item's number.
@@ -120,6 +126,7 @@ func defaultTheme(purple, pink, lilac text.Color) Theme {
 		LinkAddress:   plain.Fg(lilac),
 		Image:         plain.Italic(),
 		HTML:          plain.Fg(lilac),
+		Quote:         plain,
 		QuoteMark:     plain.Fg(purple),
 		ListMark:      plain.Fg(purple),
 		TaskOpen:      plain.Fg(purple),

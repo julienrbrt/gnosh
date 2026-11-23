@@ -1,0 +1,25 @@
+gnosh prompt
+
+  Read gnosh's own words to the model, and make any of them yours. These start
+  no model. A file of yours in the folder gnosh prompt path names stands in
+  for gnosh's text of its name in every session from then on. What fills the
+  model's window, each tool's share with it, is /context all (in a session, or
+  gnosh -p '/context all').
+
+  None of these commands is built yet in this build of gnosh: typing one stops
+  with a message that says so.
+
+Usage
+  gnosh prompt <command> [flags] [arguments]
+
+Commands
+  show [name]             List gnosh's texts to the model, or print one as it
+                          is sent. (Not built yet.)
+  path                    Print the folder your own texts go in. (Not built
+                          yet.)
+  export [name...]        Write gnosh's own texts into the folder yours go in,
+                          to edit them. (Not built yet.)
+
+Flags
+  -h, --help
+      Show help: gnosh's, or after a command's name that command's.

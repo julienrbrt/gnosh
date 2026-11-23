@@ -22,7 +22,7 @@ import (
 // reads on both (theme_test.go holds them to that). The last two are the
 // mint and the gold of the brand as the specs give them (UI-50). They are
 // too light to read on a white background and are used for nothing but
-// the wordmark.
+// the wordmark and the working mark.
 type Palette struct {
 	// Purple is for structure: the marks gnosh draws itself, links.
 	Purple text.Color
@@ -41,11 +41,12 @@ type Palette struct {
 	// terminals whose palette has no safe grey.
 	Grey text.Color
 
-	// Mint and Sun are the brand's green and gold, for the wordmark.
+	// Mint and Sun are the brand's green and gold, for the wordmark; the
+	// gold is also one of the colours of the working mark.
 	Mint, Sun text.Color
 	// Aqua is the blue-green of gnosh.ai, for the prompt mark, the pointer
-	// and the head of the spinner. Jae chose it for the mark (14 November
-	// 2026: "make it one of the blue/green from gnosh.ai site"). Like the
+	// and the working mark. Jae chose it for the mark (14 November 2026:
+	// "make it one of the blue/green from gnosh.ai site"). Like the
 	// brand's two it is light: on a white background it is faint, and
 	// nothing but a mark is drawn in it.
 	Aqua text.Color
@@ -134,14 +135,12 @@ type Theme struct {
 	// BusyMark stands before the line that says what gnosh is doing, where
 	// nothing moves: with no colour, and while a question waits.
 	BusyMark string
-	// Spinner is the working mark that moves: a small comet of sparkle
-	// marks, its head first, each drawn in the style of the same place in
-	// SpinnerStyles. It crosses SpinnerCells cells, one step every
-	// SpinEvery. With no colour there is none.
-	Spinner       []string
-	SpinnerStyles []text.Style
-	SpinnerCells  int
-	SpinEvery     time.Duration
+	// Fall is what moves in the line that says what gnosh is doing: one
+	// mark that turns before the words, and colour that falls to the
+	// right through the words themselves, more of it, faster and in more
+	// colours the deeper the model is in a thought (fall.go). With no
+	// colour there is none.
+	Fall Fall
 	// ThinkMark stands before the model's reasoning.
 	ThinkMark string
 	// AskMark stands before the record of a question and its answer.
@@ -216,7 +215,8 @@ type Theme struct {
 // whatever is chosen; grey is for what is not the text itself. Nothing is
 // filled in, blurred or dimmed into a background. Two things have more
 // than one colour: the wordmark, once, at the top of a session, and the
-// spinner while gnosh works.
+// line that says what gnosh is doing while it works, which starts grey
+// and pale and takes its colours as the model thinks on.
 func DefaultTheme(p text.Profile) Theme {
 	return NewTheme(p, DefaultPalette(p))
 }
@@ -291,14 +291,23 @@ func NewTheme(p text.Profile, pal Palette) Theme {
 	}
 
 	if p != text.NoColor {
-		// The comet: a bright head and a tail that fades behind it, in the
-		// site's blue-green, the hot pink, the purple and the lilac.
-		th.Spinner = []string{"✦", "✧", "⋆", "∙"}
-		th.SpinnerStyles = []text.Style{
-			plain.Fg(pal.Aqua).Bold(), plain.Fg(pal.Pink), plain.Fg(pal.Purple), plain.Fg(pal.Lilac),
+		// The fall: a spark that swells and dwindles before the words,
+		// the words in a grey lighter than the quiet one, and through
+		// them drops of colour: pale while calm (the colour of the
+		// person's own words, white on a dark background), and in a deep
+		// thought the colours every fade of gnosh's runs through: the
+		// site's blue-green, the purple, the hot pink and the gold. A
+		// glint is toward the pale colour again.
+		th.Fall = Fall{
+			Marks: []string{"∙", "⋆", "✧", "✦", "✧", "⋆"},
+			Every: 110 * time.Millisecond, EveryDeep: 60 * time.Millisecond,
+			Plain: plain,
+			Text:  text.Blend(pal.Grey, pal.Prompt, 0.4),
+			Quiet: pal.Grey,
+			Bland: pal.Prompt,
+			Hues:  []text.Color{pal.Aqua, pal.Purple, pal.Pink, pal.Sun},
+			Glint: pal.Prompt,
 		}
-		th.SpinnerCells = 6
-		th.SpinEvery = 110 * time.Millisecond
 	}
 
 	th.Editor = editor.Theme{
@@ -363,6 +372,9 @@ func NewTheme(p text.Profile, pal Palette) Theme {
 	md.Link = plain.Fg(pal.Purple).Underline()
 	md.LinkAddress = plain.Fg(pal.Lilac)
 	md.HTML = plain.Fg(pal.Lilac)
+	// What an answer quotes is not in the answer's green: the terminal's
+	// own colour, behind the purple bar.
+	md.Quote = plain
 	md.QuoteMark = plain.Fg(pal.Purple)
 	md.ListMark = plain.Fg(pal.Purple)
 	md.TaskOpen = plain.Fg(pal.Purple)

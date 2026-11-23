@@ -44,6 +44,9 @@ type Reply struct {
 	// In and Out are the token counts the server reports. With both zero
 	// it reports a quarter of the bytes it was sent and of what it wrote.
 	In, Out int
+	// Cached is the part of In the server says came from its prompt cache
+	// (usage.prompt_tokens_details.cached_tokens).
+	Cached int
 
 	// Arrived is called when the request has arrived, before anything is
 	// answered.
@@ -352,10 +355,14 @@ func (m *Model) chat(w http.ResponseWriter, r *http.Request) {
 	if in == 0 && out == 0 {
 		in, out = len(body)/4, size/4+1
 	}
+	usage := map[string]any{"prompt_tokens": in, "completion_tokens": out, "total_tokens": in + out}
+	if rep.Cached > 0 {
+		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": rep.Cached}
+	}
 	send(map[string]any{
 		"id": "chatcmpl-test", "object": "chat.completion.chunk", "created": 1, "model": model,
 		"choices": []any{},
-		"usage":   map[string]any{"prompt_tokens": in, "completion_tokens": out, "total_tokens": in + out},
+		"usage":   usage,
 	})
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	if flusher != nil {

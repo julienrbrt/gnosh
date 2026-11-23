@@ -40,7 +40,8 @@ func uses(tab *Table) []flagUse {
 				if !f.printOnly {
 					out = append(out, flagUse{c, f, false})
 				}
-				if f.id != idPrint {
+				// (--bg starts a session in the background, never with -p.)
+				if f.id != idPrint && f.id != idBack {
 					out = append(out, flagUse{c, f, true})
 				}
 			default:
@@ -112,7 +113,7 @@ func (u flagUse) around() (before, args []string) {
 	if u.f.id == idFork {
 		before = append(before, "-C")
 	}
-	if u.f.id == "--include-partial-messages" {
+	if u.f.id == "--include-partial-messages" || u.f.id == "--include-hook-events" {
 		before = append(before, "--output-format", "stream-json")
 	}
 	switch u.f.id {

@@ -133,13 +133,14 @@ func TestMissingImports(t *testing.T) {
 		ProjectNames: []string{"CLAUDE.md"},
 		Trusted:      true,
 		FS: tree(map[string]string{
-			"/p/CLAUDE.md": "See @docs/gone.md and @gone.md. Ask @alice, or use @Override. Also @~/x.md\n",
+			"/p/CLAUDE.md": "See @docs/gone.md and @gone.md. Ask @alice, or use @Override. Also @~/x.md\nInstall @types/node and @vue/cli; mark it @pytest.fixture; see @docs.\n",
 		}),
 	}
 	s := load(t, o)
 	same(t, "files", paths(s.Files()), []string{"/p/CLAUDE.md"})
 	// A single word with no slash or dot that names no file is a mention,
-	// not a broken import.
+	// not a broken import; so is a package or a decorator (@types/node,
+	// @pytest.fixture), which was warned about at every start.
 	same(t, "warnings", warned(s.Warnings()), []string{
 		"import_missing /p/docs/gone.md",
 		"import_missing /p/gone.md",

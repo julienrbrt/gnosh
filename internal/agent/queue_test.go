@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -278,8 +280,11 @@ func TestInterruptKeepsThePersonsQueue(t *testing.T) {
 	go func() { first <- r.run("first") }()
 	<-reached
 	r.a.Submit(Prompt{Text: "next"})
-	r.a.Submit(Prompt{Text: "<job>ended</job>", Hidden: true, Source: "task-notification"})
-	waitQueue(t, r, "next", "<job>ended</job>")
+	r.a.Submit(Prompt{Text: "<job>ended</job>", Hidden: true, Own: true, Source: "task-notification"})
+	// A hidden prompt the person caused (a !command's output) is theirs:
+	// it stays too (the agent loop review of 2026-11-19).
+	r.a.Submit(Prompt{Text: "$ npm test: ok", Hidden: true, Source: "shell"})
+	waitQueue(t, r, "next", "<job>ended</job>", "$ npm test: ok")
 	r.a.Interrupt()
 	if res := <-first; res.Reason != EndStopped {
 		t.Fatalf("first turn = %+v", res)
@@ -294,8 +299,13 @@ func TestInterruptKeepsThePersonsQueue(t *testing.T) {
 	if len(ends) != 2 || ends[0].Result.Reason != EndStopped || ends[1].Result.Reason != EndCompleted {
 		t.Fatalf("turn ends = %+v", ends)
 	}
-	second := r.model.requests()[1]
-	if text := lastUserText(second); !strings.Contains(text, "next") || strings.Contains(text, "ended") {
+	var sent strings.Builder
+	for _, m := range r.model.requests()[1].Messages {
+		if m.Role == core.RoleUser {
+			sent.WriteString(m.Text() + "\n")
+		}
+	}
+	if text := sent.String(); !strings.Contains(text, "next") || strings.Contains(text, "ended") || !strings.Contains(text, "npm test: ok") {
 		t.Errorf("the second turn was sent %q", text)
 	}
 	r.checkLog()
@@ -683,4 +693,381 @@ func TestWithdrawOneQueuedPrompt(t *testing.T) {
 		t.Errorf("the prompt that stayed did not go out")
 	}
 	r.checkLog()
+}
+
+// A stop at the end of a round, while a prompt the person sent is still in
+// its check and another waits in line, leaves the one in line for a turn
+// of its own: it was folded into the stopped turn and never answered (the
+// agent loop review of 2026-11-19).
+func TestStopBetweenRoundsKeepsTheQueue(t *testing.T) {
+	toolRan, finish := make(chan struct{}), make(chan struct{})
+	inCheck, release := make(chan struct{}), make(chan struct{})
+	r := newRig(t, func(o *Options) {
+		o.Tools = []core.Tool{tool("Bash", func(ctx context.Context, _ core.ToolCall, _ *core.ToolEnv) (core.ToolResult, error) {
+			close(toolRan)
+			<-finish
+			return core.TextResult("ran"), nil
+		})}
+		o.Moments.PromptSubmit = func(ctx context.Context, p Prompt) (Admission, error) {
+			if p.Text == "B" {
+				close(inCheck)
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+			}
+			return Admission{}, nil
+		}
+	})
+	r.model.push(use(tc("c1", "Bash", `{}`)), say("A answered"))
+	first := make(chan TurnResult, 1)
+	go func() { first <- r.run("first") }()
+	<-toolRan
+	r.a.Submit(Prompt{Text: "A"})
+	waitQueue(t, r, "A")
+	r.a.Submit(Prompt{Text: "B"})
+	<-inCheck
+	close(finish)
+	// (The round's end waits up to admitWait for B's check.)
+	time.Sleep(300 * time.Millisecond)
+	r.a.Interrupt()
+	close(release)
+	if res := <-first; res.Reason != EndStopped {
+		t.Fatalf("the first turn = %+v", res)
+	}
+	r.idle()
+	if n := r.model.count(); n != 2 {
+		t.Fatalf("%d requests: the prompt in line was not answered in a turn of its own", n)
+	}
+	if text := lastUserText(r.model.requests()[1]); !strings.Contains(text, "A") {
+		t.Errorf("the next turn was sent %q", text)
+	}
+	r.checkLog()
+}
+
+// The moments after a turn ended (TurnEnded, TurnFailed: the Stop and
+// StopFailure hooks) stop at Esc and at End: one that hung held the next
+// prompt, Esc did nothing, and End waited for it (the agent loop review of
+// 2026-11-19).
+func TestHungTurnEndMomentStops(t *testing.T) {
+	hangOnce := func(in chan<- struct{}) func(ctx context.Context, _ TurnResult) {
+		var calls atomic.Int32
+		return func(ctx context.Context, _ TurnResult) {
+			if calls.Add(1) == 1 {
+				in <- struct{}{}
+				<-ctx.Done()
+			}
+		}
+	}
+	inMoment := make(chan struct{}, 1)
+	r := newRig(t, func(o *Options) { o.Moments.TurnEnded = hangOnce(inMoment) })
+	r.model.push(say("one"), say("two"))
+	first := make(chan TurnResult, 1)
+	go func() { first <- r.run("first") }()
+	<-inMoment
+	second := make(chan TurnResult, 1)
+	go func() { second <- r.run("second") }()
+	waitQueue(t, r, "second")
+	r.a.Interrupt()
+	for _, c := range []struct {
+		name string
+		ch   chan TurnResult
+		want string
+	}{{"first", first, "one"}, {"second", second, "two"}} {
+		select {
+		case res := <-c.ch:
+			if res.Reason != EndCompleted || res.Text != c.want {
+				t.Errorf("%s = %+v", c.name, res)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("Esc did not stop the hung moment: %s never ended", c.name)
+		}
+	}
+
+	// End does not wait for it either.
+	inMoment = make(chan struct{}, 1)
+	r = newRig(t, func(o *Options) { o.Moments.TurnEnded = hangOnce(inMoment) })
+	r.model.push(say("one"))
+	go func() { r.run("first") }()
+	<-inMoment
+	ended := make(chan struct{})
+	go func() { r.a.End("other"); close(ended) }()
+	select {
+	case <-ended:
+	case <-time.After(10 * time.Second):
+		t.Fatal("End waited for the hung moment")
+	}
+}
+
+// A prompt taken back while its check still runs is handed back once, and
+// is not counted or shown as waiting: a second take handed it back again,
+// and the queue showed it until its check ended (the agent loop review of
+// 2026-11-19).
+func TestTakeBackDuringItsCheck(t *testing.T) {
+	inCheck, release := make(chan struct{}), make(chan struct{})
+	r := newRig(t, func(o *Options) {
+		o.Moments.PromptSubmit = func(ctx context.Context, p Prompt) (Admission, error) {
+			if p.Text == "slow" {
+				close(inCheck)
+				<-release // a check that takes its time, whatever is cancelled
+			}
+			return Admission{}, nil
+		}
+	})
+	r.a.Submit(Prompt{Text: "slow"})
+	<-inCheck
+	if got := r.a.TakeQueued(); len(got) != 1 || got[0].Text != "slow" {
+		t.Fatalf("the first take = %+v", got)
+	}
+	if got := r.a.TakeQueued(); len(got) != 0 {
+		t.Errorf("a second take handed it back again: %+v", got)
+	}
+	if st := r.a.State(); st.Queued != 0 {
+		t.Errorf("%d prompts counted as waiting", st.Queued)
+	}
+	if q := r.a.Queued(); len(q) != 0 {
+		t.Errorf("shown as waiting: %+v", q)
+	}
+	close(release)
+	r.idle()
+	if n := r.model.count(); n != 0 {
+		t.Errorf("the prompt taken back went out: %d requests", n)
+	}
+}
+
+// A prompt End returns that was written down as queued is written off as
+// well, so that the session opened again does not return it a second time
+// (the agent loop review of 2026-11-19: after /clear, the prompts it
+// returned came back again when the old session was resumed).
+func TestEndWritesOffWhatItReturns(t *testing.T) {
+	reached := make(chan struct{})
+	r := newRig(t, nil)
+	r.model.push(step{at: once(reached), stall: true})
+	go r.run("first")
+	<-reached
+	r.a.Submit(Prompt{Text: "waiting"})
+	q := waitQueue(t, r, "waiting")
+	r.a.End("clear")
+	off := false
+	for _, e := range r.log.all() {
+		if e.Kind == EntryUnqueued && e.Prompt == q.Queued[0].ID {
+			off = true
+		}
+	}
+	if !off {
+		t.Errorf("the prompt End returned was not written off")
+	}
+	if ret := eventsOf[*PromptReturnedEvent](r.rec); len(ret) != 1 || ret[0].Why != ReturnClosed {
+		t.Errorf("returned = %+v", ret)
+	}
+}
+
+// A note that was to start a turn and is stopped in its check (Esc while
+// the session's start runs for it) is kept as a note, and goes with the
+// next request: it came back as a hidden prompt nobody shows, and was
+// lost (the agent loop review of 2026-11-19).
+func TestNoteStoppedInItsCheckIsKept(t *testing.T) {
+	inStart := make(chan struct{}, 1)
+	var starts atomic.Int32
+	r := newRig(t, func(o *Options) {
+		o.Moments.SessionStart = func(ctx context.Context, _ StartInfo) ([]Part, error) {
+			if starts.Add(1) == 1 {
+				inStart <- struct{}{}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return nil, nil
+		}
+	})
+	r.model.push(say("hello"))
+	if err := r.a.Tell(Note{Text: "the build failed", Source: "task-notification", Wake: true}); err != nil {
+		t.Fatal(err)
+	}
+	<-inStart
+	r.a.Interrupt()
+	r.idle()
+	if res := r.run("what happened?"); res.Reason != EndCompleted {
+		t.Fatalf("the next turn = %+v", res)
+	}
+	var sent strings.Builder
+	for _, m := range r.model.requests()[0].Messages {
+		sent.WriteString(m.Text() + "\n")
+	}
+	if !strings.Contains(sent.String(), "the build failed") {
+		t.Errorf("the note was lost: the request held %q", sent.String())
+	}
+}
+
+// With two questions open at once (parallel sub-agents), the first answer
+// leaves the session waiting on the second, and says which; the last one
+// puts back what the session was doing: the first answer put the phase
+// back while the second still waited (the agent loop review of
+// 2026-11-19).
+func TestTwoQuestionsAtOnce(t *testing.T) {
+	r := newRig(t, func(o *Options) { o.Interactive = true })
+	before := r.a.State().Phase
+	done := make(chan error, 2)
+	for _, title := range []string{"first?", "second?"} {
+		go func() {
+			_, err := r.a.Ask(context.Background(), Question{Kind: "confirm", Title: title})
+			done <- err
+		}()
+		waitEvent(t, r.rec, func(e *QuestionEvent) bool { return e.Question.Title == title })
+	}
+	qs := eventsOf[*QuestionEvent](r.rec)
+	if len(qs) != 2 {
+		t.Fatalf("%d questions", len(qs))
+	}
+	if err := r.a.Answer(qs[0].Question.ID, Answer{Choice: "yes"}); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if st := r.a.State(); st.Phase != PhaseQuestion || !strings.Contains(st.Waiting, "second?") {
+		t.Errorf("with one question still open: %+v", st)
+	}
+	if err := r.a.Answer(qs[1].Question.ID, Answer{Choice: "yes"}); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if st := r.a.State(); st.Phase != before {
+		t.Errorf("after both: phase %v, want %v", st.Phase, before)
+	}
+}
+
+// pauseInEmitQueue is the machine's clock, except that once armed, the
+// first time it is read from inside emitQueue it waits to be let go: a
+// queue list is then held between being made and being sent.
+type pauseInEmitQueue struct {
+	armed atomic.Bool
+	held  chan struct{}
+	let   chan struct{}
+}
+
+func (c *pauseInEmitQueue) Now() time.Time {
+	if c.armed.Load() && inEmitQueue() && c.armed.CompareAndSwap(true, false) {
+		close(c.held)
+		<-c.let
+	}
+	return time.Now()
+}
+
+func (c *pauseInEmitQueue) After(d time.Duration) <-chan time.Time { return time.After(d) }
+
+func inEmitQueue() bool {
+	pc := make([]uintptr, 64)
+	frames := runtime.CallersFrames(pc[:runtime.Callers(2, pc)])
+	for {
+		f, more := frames.Next()
+		if strings.HasSuffix(f.Function, ".emitQueue") {
+			return true
+		}
+		if !more {
+			return false
+		}
+	}
+}
+
+// Queue lists reach the screen in the order they were made: a list made
+// before a prompt was taken back, and sent after the list made since,
+// left the prompt shown as waiting (the agent loop review of 2026-11-19).
+func TestQueueListsArriveInOrder(t *testing.T) {
+	c := &pauseInEmitQueue{held: make(chan struct{}), let: make(chan struct{})}
+	r := newRig(t, func(o *Options) { o.Clock = c })
+	wait := make(chan struct{})
+	r.model.push(step{wait: wait, evs: say("one").evs}, say("rest"))
+	if _, err := r.a.Submit(Prompt{Text: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	waitEvent[*RequestEvent](t, r.rec, nil)
+	idA, _ := r.a.Submit(Prompt{Text: "a"})
+	waitQueue(t, r, "a")
+
+	// The list that shows b coming in is made, and held.
+	c.armed.Store(true)
+	if _, err := r.a.Submit(Prompt{Text: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c.held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no queue list was made for b")
+	}
+	// a is taken back meanwhile, and the list made for that is sent, or
+	// waits its turn.
+	took := make(chan bool, 1)
+	go func() {
+		_, ok := r.a.Withdraw(idA)
+		took <- ok
+	}()
+	select {
+	case <-took:
+		took <- true
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(c.let)
+	if !<-took {
+		t.Fatal("a could not be taken back")
+	}
+
+	ids := func(q []QueuedPrompt) []string {
+		var out []string
+		for _, p := range q {
+			out = append(out, p.ID)
+		}
+		return out
+	}
+	want := ids(r.a.Queued())
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		qs := eventsOf[*QueueEvent](r.rec)
+		got := ids(qs[len(qs)-1].Queued)
+		if slices.Equal(got, want) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the queue shown last is %v, and what waits is %v", got, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(wait)
+	r.idle()
+	r.checkLog()
+}
+
+// The lines that go only with a session's first prompt (the instruction
+// files, the environment) go with the first of two prompts that start its
+// first turn together, not with both: each took them, and CLAUDE.md went
+// out twice (the agent loop review of 2026-11-19).
+func TestFirstLinesGoOnceWithTwoFirstPrompts(t *testing.T) {
+	var firsts []bool
+	r := newRig(t, func(o *Options) {
+		o.Moments.PromptLines = []func(context.Context, LineInfo) ([]Part, error){
+			func(_ context.Context, info LineInfo) ([]Part, error) {
+				firsts = append(firsts, info.First)
+				if info.First {
+					return []Part{{Source: "instructions", Text: "<instructions/>", Before: true}}, nil
+				}
+				return nil, nil
+			},
+		}
+	})
+	subs := []*submission{
+		{id: "p1", prompt: Prompt{ID: "p1", Text: "one"}},
+		{id: "p2", prompt: Prompt{ID: "p2", Text: "two"}},
+	}
+	ready := r.a.preparePrompts(context.Background(), &turn{id: "t1"}, subs, false)
+	if !slices.Equal(firsts, []bool{true, false}) {
+		t.Errorf("First was %v for the two prompts", firsts)
+	}
+	n := 0
+	for _, rp := range ready {
+		for _, p := range rp.parts {
+			if p.Text == "<instructions/>" {
+				n++
+			}
+		}
+	}
+	if n != 1 {
+		t.Errorf("the first prompt's lines go out %d times", n)
+	}
 }

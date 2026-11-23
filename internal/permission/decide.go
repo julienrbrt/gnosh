@@ -25,6 +25,12 @@ type Decision struct {
 	// one; in ModeBypass the caller asks with a time limit, and refuses
 	// where nobody can answer.
 	Critical bool
+	// PersonOnly marks a call only a person may approve, though it is no
+	// danger: what plan mode holds (a call that may change something while
+	// the session plans, and the plan itself, ExitPlanMode). No rule and
+	// no hook approves it, and no channel is asked (the plan review of
+	// 2026-11-19: a hook's allow approved a plan nobody had read).
+	PersonOnly bool
 	// Suggestions are the choices a "yes, and don't ask again" answer
 	// could make, narrowest first. It is empty when no rule could cover
 	// the call, and then only a one-time yes is offered.
@@ -108,6 +114,9 @@ type request struct {
 	reads, writes []string
 	// unresolved is set when a path's links could not be followed.
 	unresolved bool
+	// writeOpaque is not empty when a command names a file to write by
+	// text computed when it runs, which cannot be told: it says how.
+	writeOpaque string
 	// pathOpaque is not empty when a command names a file in a way that
 	// cannot be held against the Read and Edit rules. It says how.
 	pathOpaque string
@@ -134,7 +143,7 @@ type request struct {
 func (e *Engine) Decide(tool string, call core.ToolCall, action core.Action) Decision {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.decideLocked(tool, call, action)
+	return e.forAgent("").decideLocked(tool, call, action)
 }
 
 // DecideAs judges a call as Decide does, but as if the session were in
@@ -149,7 +158,7 @@ func (e *Engine) DecideAs(mode Mode, tool string, call core.ToolCall, action cor
 		return Decision{Behavior: Deny, Stage: StageMode, Mode: e.mode,
 			Reason: "The call was to be judged in the mode \"" + string(mode) + "\", which is not one this session may use."}
 	}
-	as := *e
+	as := *e.forAgent("")
 	as.mode = mode
 	return as.decideLocked(tool, call, action)
 }
@@ -162,14 +171,24 @@ func (e *Engine) DecideAs(mode Mode, tool string, call core.ToolCall, action cor
 // may have told it something else, so that "rm -rf *" in the project would
 // be judged as the same words in some folder under it. Here the directory
 // and the question are one step, and the engine's own directory is left as
-// it is. A dir that is not an absolute path changes nothing.
+// it is. A dir that is not an absolute path changes nothing. The call is
+// the session's own agent's: DecideFor judges a sub-agent's.
 func (e *Engine) DecideAt(dir, tool string, call core.ToolCall, action core.Action) Decision {
+	return e.DecideFor("", dir, tool, call, action)
+}
+
+// DecideFor judges a call of one agent as DecideAt does: agent is the id
+// of the sub-agent that made it, or "" for the session's own agent. The
+// layers kept to another sub-agent (Layer.Agent: a forked skill another
+// sub-agent runs) play no part.
+func (e *Engine) DecideFor(agent, dir, tool string, call core.ToolCall, action core.Action) Decision {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+	v := e.forAgent(agent)
 	if !strings.HasPrefix(dir, "/") {
-		return e.decideLocked(tool, call, action)
+		return v.decideLocked(tool, call, action)
 	}
-	at := *e
+	at := *v
 	at.cur = path.Clean(dir)
 	return at.decideLocked(tool, call, action)
 }
@@ -191,7 +210,9 @@ func (e *Engine) CommandDirs(dir, command string) (dirs []string, why string) {
 	if why := unreadable(v); why != "" {
 		return nil, why
 	}
-	dirs, unknown := at.lineDirsKnown(v)
+	// (Where the shell is: a folder a program's own flag sends it to is
+	// judged below, and git's by GitPlaces.)
+	dirs, unknown := at.dirsOf(v, false)
 	switch {
 	case unknown:
 		return nil, "a cd in it goes to a place only known when it runs"
@@ -255,10 +276,11 @@ func makesLink(name string, ws []word) bool {
 // CommandWrites are the files a shell command line names for writing, as
 // absolute paths, for a shell started in dir: a redirection's target,
 // cp's and mv's last word, sed -i's files and the like, and each with its
-// links followed where the engine follows them. Only what can be told is
-// there: a file named by text computed when the line runs, or written by
-// a program on its own account, is not.
-func (e *Engine) CommandWrites(dir, command string) []string {
+// links followed where the engine follows them. A file written by a
+// program on its own account is not there. unknown says why a file it
+// names for writing cannot be told, by text computed when the line runs
+// ("> "$(git rev-parse --git-common-dir)/config""); "" when none is.
+func (e *Engine) CommandWrites(dir, command string) (writes []string, unknown string) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	at := *e
@@ -268,7 +290,7 @@ func (e *Engine) CommandWrites(dir, command string) []string {
 	req := &request{canon: toolBash}
 	req.view = at.viewBash(command)
 	at.shellPaths(req)
-	return req.writes
+	return req.writes, req.writeOpaque
 }
 
 // cdChanger names a variable the line may set that changes where its cd,
@@ -333,53 +355,190 @@ var chdirFlags = map[string]struct{ short, long string }{
 }
 
 // chdirFlagUse names a program of the line that may be sent to another
-// folder by a flag of its own, in any of the ways the flag is written
-// (-C dir, -Cdir, -sC dir, --directory=dir, --dir dir, "-C"), or by a word
-// of its whose text is only known when the line runs. A wrapper's own
-// words end where the command it runs begins (env FOO=1 grep -C 3 x reads
-// grep's -C as grep's).
+// folder by a flag of its own (chdirValues).
 func chdirFlagUse(v *bashView) string {
 	for _, u := range v.units {
 		ws := u.cmd.words
 		if len(ws) == 0 || !ws[0].static() {
 			continue
 		}
-		name := baseName(ws[0].joined())
-		f, ok := chdirFlags[name]
-		if !ok {
-			continue
-		}
-		spec, wraps := wrappers[name]
-	words:
-		for i := 1; i < len(ws); i++ {
-			w := ws[i]
-			if !w.static() {
-				return name
-			}
-			s := w.value("")
-			switch {
-			case s == "--":
-				break words
-			case strings.HasPrefix(s, "--"):
-				long, _, _ := strings.Cut(s[2:], "=")
-				if f.long != "" && len(long) >= 2 && strings.HasPrefix(f.long, long) {
-					return name
-				}
-			case strings.HasPrefix(s, "-") && len(s) > 1:
-				if strings.Contains(s[1:], f.short) {
-					return name
-				}
-			case wraps && strings.Contains(s, "="):
-				// env and sudo take NAME=value words before the command.
-			case wraps:
-				break words // the command it runs
-			}
-			if wraps && strings.Contains(spec.valued, " "+s+" ") {
-				i++ // the flag's value
-			}
+		if name := progKey(baseName(ws[0].joined())); len(chdirValues(name, ws[1:])) > 0 {
+			return name
 		}
 	}
 	return ""
+}
+
+// gitChdirs are the folders git's own -C words name, before its
+// subcommand, in their order (each goes on from the one before it: git -C
+// a -C b works in a/b), and any word of git's own that is only known when
+// the line runs, which may be one. After the subcommand a -C is the
+// subcommand's (git log -C finds copies).
+func gitChdirs(args []word) (out []word) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !a.static() {
+			return append(out, a)
+		}
+		switch l := a.joined(); {
+		case l == "-C":
+			if i+1 < len(args) {
+				i++
+				out = append(out, args[i])
+			}
+		case l == "-c" || l == "--git-dir" || l == "--work-tree" || l == "--namespace" || l == "--config-env" || l == "--attr-source":
+			i++ // its value
+		case strings.HasPrefix(l, "-"):
+		default:
+			return out // the subcommand
+		}
+	}
+	return out
+}
+
+// gitRuns are the commands that git settings a line gives make git run:
+// the value of git's own -c, or one that git config writes, for a key
+// whose value is a command ("git -c core.sshCommand='rm -rf ~' fetch"),
+// and an alias's: what follows the ! of one that starts with ! is a shell
+// command ("git -c alias.z='!rm -rf ~' z"), and any other is a git
+// command ("git -c alias.p=push p" pushes).
+func gitRuns(args []word) (out []string) {
+	setting := func(w word) {
+		if !w.static() {
+			return
+		}
+		key, val, ok := strings.Cut(w.joined(), "=")
+		switch k := strings.ToLower(key); {
+		case !ok || val == "":
+		case strings.HasPrefix(k, "alias.") && strings.HasPrefix(val, "!"):
+			out = append(out, val[1:])
+		case strings.HasPrefix(k, "alias."):
+			out = append(out, "git "+val)
+		case gitCommandKey(k):
+			out = append(out, strings.TrimLeft(val, "!| "))
+		}
+	}
+	i := 0
+own:
+	for ; i < len(args); i++ {
+		switch l := args[i].joined(); {
+		case !args[i].static():
+			return out
+		case l == "-c":
+			if i+1 < len(args) {
+				i++
+				setting(args[i])
+			}
+		case l == "-C" || l == "--git-dir" || l == "--work-tree" || l == "--namespace" || l == "--config-env" || l == "--attr-source":
+			i++
+		case strings.HasPrefix(l, "-"):
+		default:
+			break own // the subcommand
+		}
+	}
+	if i >= len(args) || args[i].joined() != "config" {
+		return out
+	}
+	// git config [options] key value, and git config set key value: the
+	// first two words that are no options.
+	var words []word
+	rest := args[i+1:]
+	for j := 0; j < len(rest); j++ {
+		switch l := rest[j].joined(); {
+		case l == "set" && len(words) == 0:
+		case l == "-f" || l == "--file" || l == "--blob" || l == "--default" || l == "--comment" || l == "--value" || l == "--type":
+			j++ // its value
+		case strings.HasPrefix(l, "-"):
+		default:
+			words = append(words, rest[j])
+		}
+	}
+	if len(words) >= 2 && words[0].static() {
+		w := litOf(words[0].joined() + "=" + words[1].joined())
+		if words[1].static() {
+			setting(w)
+		}
+	}
+	return out
+}
+
+// gitCommandKey reports whether the value of git's setting k (in lower
+// case) is a command git runs, or a program.
+func gitCommandKey(k string) bool {
+	switch k {
+	case "core.pager", "core.editor", "core.sshcommand", "core.askpass", "core.fsmonitor", "core.gitproxy", "diff.external",
+		"sequence.editor", "interactive.difffilter", "uploadpack.packobjectshook", "web.browser":
+		return true
+	}
+	if strings.HasPrefix(k, "pager.") {
+		return true // the pager of one subcommand
+	}
+	for _, end := range []string{".command", ".textconv", ".driver", ".clean", ".smudge", ".process", ".cmd", ".program", ".helper", ".receivepack", ".uploadpack"} {
+		if strings.HasSuffix(k, end) {
+			return true
+		}
+	}
+	return false
+}
+
+// chdirValues are the folders the program name, given args, may be sent
+// to by a flag of its own (chdirFlags), in any of the ways the flag is
+// written (-C dir, -Cdir, -sC dir, --directory=dir, --dir dir), and each
+// of its words whose text is only known when the line runs, which may be
+// that flag or its folder. A wrapper's own words end where the command it
+// runs begins (env FOO=1 grep -C 3 x leaves grep's -C to grep). tar's old
+// way of writing its letters with no dash, one of them C, takes the folder
+// from the words after them, any of which may be it.
+func chdirValues(name string, args []word) (out []word) {
+	f, ok := chdirFlags[name]
+	if !ok {
+		return nil
+	}
+	spec, wraps := wrappers[name]
+	if name == "tar" && len(args) > 0 && args[0].static() && !strings.HasPrefix(args[0].value(""), "-") && strings.Contains(args[0].value(""), f.short) {
+		return args[1:]
+	}
+	for i := 0; i < len(args); i++ {
+		w := args[i]
+		if !w.static() {
+			out = append(out, w)
+			continue
+		}
+		s := w.value("")
+		value := func(attached string, has bool) {
+			switch {
+			case has:
+				out = append(out, partOf(w, attached))
+			case i+1 < len(args):
+				i++
+				out = append(out, args[i])
+			}
+		}
+		switch {
+		case s == "--":
+			return out
+		case strings.HasPrefix(s, "--"):
+			long, val, eq := strings.Cut(s[2:], "=")
+			if f.long != "" && len(long) >= 2 && strings.HasPrefix(f.long, long) {
+				value(val, eq)
+				continue
+			}
+		case strings.HasPrefix(s, "-") && len(s) > 1:
+			if j := strings.Index(s[1:], f.short); j >= 0 {
+				rest := s[2+j:]
+				value(rest, rest != "")
+				continue
+			}
+		case wraps && strings.Contains(s, "="):
+			// env and sudo take NAME=value words before the command.
+		case wraps:
+			return out // the command it runs
+		}
+		if wraps && strings.Contains(spec.valued, " "+s+" ") {
+			i++ // the flag's value
+		}
+	}
+	return out
 }
 
 // unreadable says why a line cannot be read to know what it runs, or "".
@@ -436,6 +595,13 @@ func (e *Engine) GitPlaces(dir, command string) (places []string, why string) {
 		if text == "" {
 			return
 		}
+		if strings.Contains("/"+text+"/", "/../") {
+			// The system goes into each part through a link first, so
+			// "lnk/.." is where lnk points, and above it: not the text's
+			// place (a review found it).
+			ok = false
+			return
+		}
 		if strings.HasPrefix(text, "/") {
 			places = unionStrings(places, []string{path.Clean(text)})
 			return
@@ -485,7 +651,17 @@ func (e *Engine) GitPlaces(dir, command string) (places []string, why string) {
 			ok = false
 			continue
 		}
-		if len(c.words) == 0 || path.Base(c.words[0].joined()) != "git" {
+		if len(c.words) == 0 {
+			continue
+		}
+		if c.words[0].glob || c.words[0].brace {
+			// "/usr/bin/gi[t] -C /repo": a pattern may name git.
+			ok = false
+			continue
+		}
+		if progKey(baseName(c.words[0].joined())) != "git" {
+			// (By its key: on a disk that does not tell case apart, GIT
+			// runs git.)
 			continue
 		}
 		args := c.words[1:]
@@ -539,6 +715,25 @@ func (e *Engine) decideLocked(tool string, call core.ToolCall, action core.Actio
 }
 
 func (e *Engine) decide(canon string, call core.ToolCall, action core.Action) Decision {
+	var req *request
+	d := e.decideSteps(canon, call, action, &req)
+	if d.Behavior == Allow && req != nil {
+		// The read block's question about a shell command (block.go) is
+		// put only where the command would have run: anything stricter
+		// that the steps found (a dangerous removal, plan mode's question
+		// for the person, a refusal) stands as it is (the blocks review
+		// of 2026-11-20).
+		if bd, ok := e.shellBlocked(req); ok {
+			return bd
+		}
+	}
+	return d
+}
+
+// decideSteps goes through the steps of a decision, all but the read
+// block's question about a shell command, and puts in made the call's
+// request once it is worked out.
+func (e *Engine) decideSteps(canon string, call core.ToolCall, action core.Action, made **request) Decision {
 	if off := e.toolOff(canon); off != nil {
 		if off.rule != nil {
 			return Decision{Behavior: Deny, Stage: StageTool, Rule: off.rule.Rule.String(), Source: off.rule.layer.Name,
@@ -547,11 +742,18 @@ func (e *Engine) decide(canon string, call core.ToolCall, action core.Action) De
 		return Decision{Behavior: Deny, Stage: StageTool, Reason: canon + " is switched off: " + off.why + "."}
 	}
 	req := e.newRequest(canon, call, action)
+	*made = req
 
 	// 1. Deny rules, from every layer.
 	if c := e.match(ListDeny, req); c != nil {
 		return Decision{Behavior: Deny, Stage: StageDeny, Rule: c.Rule.String(), Source: c.layer.Name,
 			Reason: "The deny rule " + c.Rule.String() + " from " + c.layer.Name + " refuses this."}
+	}
+	// 1b. The blocks of the file tools outside the working directories
+	// (block.go), which no ask rule turns into a question and no mode or
+	// allow rule passes.
+	if d, ok := e.blocked(req); ok {
+		return d
 	}
 	// 2. Ask rules.
 	if c := e.match(ListAsk, req); c != nil {
@@ -581,6 +783,9 @@ func (e *Engine) decide(canon string, call core.ToolCall, action core.Action) De
 	// 4. Allow rules, then what the mode lets run.
 	switch req.info.class {
 	case classShell:
+		if d, ok := e.sandboxAllows(req); ok {
+			return d
+		}
 		return e.decideShell(req)
 	case classFileRead:
 		return e.decideRead(req)
@@ -589,6 +794,12 @@ func (e *Engine) decide(canon string, call core.ToolCall, action core.Action) De
 	case classFetch:
 		return e.decideFetch(req)
 	case classAgent, classQuiet:
+		if e.mode == ModePlan && (canon == "EnterWorktree" || canon == "ExitWorktree") {
+			// A work tree is made or removed with git: while planning, a
+			// person decides (the plan review of 2026-11-19).
+			return Decision{Behavior: Ask, Stage: StageMode, PersonOnly: true,
+				Reason: "Plan mode: " + canon + " makes or removes a git work tree and its branch, so a person decides."}
+		}
 		return Decision{Behavior: Allow, Stage: StageMode, Reason: canon + " never needs approval; what it starts is judged call by call."}
 	}
 	return e.decideOther(req)
@@ -694,14 +905,15 @@ func absOnly(ps []string) []string {
 // that a rule is held against the path as written and as resolved: a deny
 // rule applies when either matches, an allow rule only when both do.
 func (e *Engine) expand(req *request, paths []string) []string {
+	// (Kept once each by a set: a pattern copied into a folder gives a
+	// name for each of its matches, which may be thousands.)
 	var out []string
+	seen := map[string]bool{}
 	add := func(p string) {
-		for _, o := range out {
-			if o == p {
-				return
-			}
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
 		}
-		out = append(out, p)
 	}
 	for _, p := range paths {
 		if !strings.HasPrefix(p, "/") {
@@ -741,6 +953,13 @@ func (e *Engine) match(list List, req *request) *crule {
 			if c.canon == req.canon && paramMatch(req.input, c.param, c.value) {
 				return c
 			}
+			// A Monitor call is a Bash command run in the background, and
+			// Bash's rules about its arguments hold for it as for that
+			// call: a deny of Bash(run_in_background:true) did not cover
+			// it (the hosts review of 2026-11-19).
+			if c.canon == toolBash && req.canon == toolMonitor && paramMatch(monitorAsBash(req.input), c.param, c.value) {
+				return c
+			}
 		case kindCommand:
 			if req.view != nil && list != ListAllow && e.commandHit(c, req.view) {
 				return c
@@ -751,9 +970,16 @@ func (e *Engine) match(list List, req *request) *crule {
 			}
 		case kindAgent:
 			if req.info.class == classAgent {
-				typ := "general-purpose"
+				// The kind as the tool reads it: blanks around it left
+				// off, and none given (or only blanks) the general-purpose
+				// one. Read as written, "" and " Explore" went past
+				// Agent(general-purpose) and Agent(Explore).
+				typ := ""
 				if raw, ok := req.input["subagent_type"]; ok {
 					_ = json.Unmarshal(raw, &typ)
+				}
+				if typ = strings.TrimSpace(typ); typ == "" {
+					typ = "general-purpose"
 				}
 				if typ == c.value {
 					return c
@@ -872,6 +1098,20 @@ func (e *Engine) allowsPath(p string, edit bool) *crule {
 
 // paramMatch reports whether the input has the scalar parameter with a
 // value the pattern covers.
+// monitorAsBash is a Monitor call's arguments as those of the Bash call
+// that runs its command: in the background, with timeout_ms as timeout.
+func monitorAsBash(input map[string]json.RawMessage) map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(input)+1)
+	for k, v := range input {
+		if k == "timeout_ms" {
+			k = "timeout"
+		}
+		out[k] = v
+	}
+	out["run_in_background"] = json.RawMessage("true")
+	return out
+}
+
 func paramMatch(input map[string]json.RawMessage, name, pat string) bool {
 	raw, ok := input[name]
 	if !ok {

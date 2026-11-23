@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/hooks"
 	"github.com/gnosh-ai/gnosh/internal/permission"
 	"github.com/gnosh-ai/gnosh/internal/prompt"
+	"github.com/gnosh-ai/gnosh/internal/shellquote"
 	"github.com/gnosh-ai/gnosh/internal/tools/fstools"
 	"github.com/gnosh-ai/gnosh/internal/tools/shelltool"
 	"github.com/gnosh-ai/gnosh/internal/trust"
@@ -90,8 +92,12 @@ func criticalTimeout(why string) string {
 }
 
 // Check decides about one call.
-func (g *gate) Check(ctx context.Context, req agent.GateRequest) (agent.Decision, error) {
+func (g *gate) Check(ctx context.Context, req agent.GateRequest) (dec agent.Decision, err error) {
 	l := g.l
+	// What a PreToolUse hook added for the model goes with the call's
+	// result, whatever is decided.
+	var added []agent.Part
+	defer func() { dec.Context = append(dec.Context, added...) }()
 	call, action, cannot := req.Call, req.Action, req.CannotRun
 	cwd := l.cwd()
 	if req.Env != nil && req.Env.Cwd != "" {
@@ -104,10 +110,13 @@ func (g *gate) Check(ctx context.Context, req agent.GateRequest) (agent.Decision
 	if l.hooks.has(hooks.PreToolUse) {
 		out, err := l.hooks.run(ctx, hooks.Input{
 			Event: hooks.PreToolUse, Cwd: cwd,
-			ToolName: call.Name, ToolUseID: call.ID, ToolInput: call.Input,
+			ToolName: call.Name, ToolUseID: call.ID, ToolInput: hookToolInput(call, cwd, l.cfg.Paths.Home),
 			AgentID: req.AgentID, AgentType: req.AgentType,
 			IfMatch: l.hookIf(cwd, call, action),
 		})
+		if strings.TrimSpace(out.AdditionalContext) != "" {
+			added = append(added, agent.Part{Source: "hook:PreToolUse", Text: hookWords(hooks.PreToolUse, call.Name, out.AdditionalContext)})
+		}
 		switch {
 		case err != nil && ctx.Err() != nil:
 			return agent.Decision{}, ctx.Err()
@@ -122,10 +131,11 @@ func (g *gate) Check(ctx context.Context, req agent.GateRequest) (agent.Decision
 			// The rules judge the arguments the tool will run with.
 			changed = out.UpdatedInput
 			call.Input = changed
-			if call.Name == askToolName {
+			if call.Name == askToolName && answersChanged(req.Call.Input, changed) {
 				// A hook may answer the model's questions in the
-				// person's place; the tool is told that these arguments
-				// are a hook's.
+				// person's place; the tool is told that these answers
+				// are a hook's. Answers the model wrote and the hook
+				// left as they were are not.
 				l.hookChanged.Store(call.ID, true)
 			}
 			act, err := describe(req.Tool, call, req.Env)
@@ -169,8 +179,8 @@ func (g *gate) Check(ctx context.Context, req agent.GateRequest) (agent.Decision
 	// machine (left blank, or named "local") as the call for this machine
 	// that it is, and any other as a command on another machine, which
 	// always asks.
-	d := l.reach(cwd, call, action, l.engine.DecideAt(cwd, call.Name, call, action))
-	d = l.resumeAsStart(ctx, cwd, call, d).WithHook(verdict, hookReason)
+	d := l.reach(req.AgentID, cwd, call, action, l.engine.DecideFor(req.AgentID, cwd, call.Name, call, action))
+	d = l.resumeAsStart(ctx, req.AgentID, cwd, call, d).WithHook(verdict, hookReason)
 	confirm := action.Confirm && cannot == nil
 	if confirm {
 		// Asked every time: a kept approval would be the rule that this
@@ -184,7 +194,12 @@ func (g *gate) Check(ctx context.Context, req agent.GateRequest) (agent.Decision
 		}
 		d.Reason = "This call throws away something that cannot be got back, so gnosh asks before it runs, whatever the rules and the mode allow."
 	case permission.Deny:
-		return agent.Decision{Reason: "This call did not run. " + d.Reason + " Do the work another way if there is one, or say what you could not do."}, nil
+		why := d.Reason
+		if !l.planApproved() {
+			// (No ExitPlanMode is offered to present a plan with.)
+			why = strings.Replace(why, permission.PresentPlan, planInAnswer, 1)
+		}
+		return agent.Decision{Reason: "This call did not run. " + why + " Do the work another way if there is one, or say what you could not do."}, nil
 	}
 
 	// 3. Somebody has to say yes.
@@ -198,10 +213,10 @@ func (g *gate) Check(ctx context.Context, req agent.GateRequest) (agent.Decision
 		}
 		return agent.Decision{Reason: l.unattended(d), Unattended: true}, nil
 	}
-	if !confirm && l.hooks.has(hooks.PermissionRequest) {
+	if !confirm && !d.PersonOnly && l.hooks.has(hooks.PermissionRequest) {
 		out, err := l.hooks.run(ctx, hooks.Input{
 			Event: hooks.PermissionRequest, Cwd: cwd,
-			ToolName: call.Name, ToolInput: call.Input,
+			ToolName: call.Name, ToolInput: hookToolInput(call, cwd, l.cfg.Paths.Home),
 			AgentID: req.AgentID, AgentType: req.AgentType,
 			IfMatch: l.hookIf(cwd, call, action),
 		})
@@ -210,6 +225,11 @@ func (g *gate) Check(ctx context.Context, req agent.GateRequest) (agent.Decision
 			return agent.Decision{}, ctx.Err()
 		case err != nil:
 			l.notice(agent.LevelWarning, "hook:PermissionRequest", fmt.Sprintf("The PermissionRequest hooks could not be run (%v), so the question is put to you.", err))
+		case out.PermissionDecision == hooks.Allow && d.Critical:
+			// A call that may remove what cannot be got back is the
+			// person's alone to approve: no rule and no hook does
+			// (permission.Decision.Critical). A hook's refusal stands.
+			l.notice(agent.LevelWarning, "hook:PermissionRequest", "A PermissionRequest hook approved a call that may remove what cannot be got back. Only you can approve that, so the question is put to you.")
 		case out.PermissionDecision == hooks.Allow:
 			return agent.Decision{Allow: true, Input: changed}, nil
 		case out.PermissionDecision == hooks.Deny:
@@ -217,9 +237,47 @@ func (g *gate) Check(ctx context.Context, req agent.GateRequest) (agent.Decision
 		}
 	}
 
+	if l.cfg.Permissions.DenyInsteadOfPrompting.V {
+		// (permissions.denyInsteadOfPrompting, as Claude Code's: what
+		// would ask is refused, and the turn goes on. PermissionRequest
+		// hooks have had their say.)
+		return agent.Decision{Reason: l.unattended(d), Unattended: true}, nil
+	}
 	askCtx := ctx
 	q := l.permissionQuestion(call, action, d)
-	data := QuestionData{Modes: map[string]string{}, CommentOnYes: true}
+	stops := ""
+	if req.AgentID != "" {
+		// A sub-agent asks: the question says which, and a background
+		// one's says what it was started for, so that it is never taken
+		// for a question of the conversation the person is in.
+		asker := "The sub-agent " + trust.Escape(firstOf(req.AgentType, "of this session"))
+		if b, ok := l.backgroundAgent(req.AgentID); ok {
+			asker = fmt.Sprintf("The background sub-agent %s (%s)", trust.Escape(b.kind), trust.Escape(oneLine(b.desc, 80)))
+			stops = "that sub-agent"
+			for i := range q.Choices {
+				if q.Choices[i].Key == "no" {
+					q.Choices[i].Label = "No (alone it stops that sub-agent; with words after it, it reads them and carries on)"
+				}
+			}
+		}
+		q.Title = asker + " asks: " + q.Title
+		// What a yes keeps holds for the whole session, its conversation
+		// and every agent of it, not for the asking one alone: said, where
+		// the title invites reading it as that agent's (the approvals
+		// review of 2026-11-19).
+		for i := range q.Choices {
+			if strings.HasPrefix(q.Choices[i].Key, "always:") {
+				q.Choices[i].Label = strings.Replace(q.Choices[i].Label, "Yes, and ", "Yes, for the whole session and all its agents, and ", 1)
+			}
+		}
+	}
+	if changed != nil {
+		// A hook changed the call: the question shows what will run, not
+		// what the model wrote (its diff, its command).
+		act := action
+		q.Action = &act
+	}
+	data := QuestionData{Modes: map[string]string{}, CommentOnYes: true, Input: call.Input, PersonOnly: confirm || d.Critical || d.PersonOnly, Stops: stops}
 	for i, s := range d.Suggestions {
 		if s.Mode != "" {
 			data.Modes["always:"+strconv.Itoa(i)] = string(s.Mode)
@@ -265,7 +323,8 @@ func (g *gate) Check(ctx context.Context, req agent.GateRequest) (agent.Decision
 // feature's own keeping, and returns the answer that holds for the call:
 // own, which is the engine's answer for the call as its own tool's, or
 // the engine's answer for the call of gnosh's own tool that reaches the
-// same thing, whichever is the stricter.
+// same thing, whichever is the stricter. who is the id of the agent that
+// made the call ("" for the session's own), as the engine is told it.
 //
 // A feature's tool is known to the engine by its name alone: quiet, or
 // asking every time. What a call of it touches is said by the tool
@@ -285,7 +344,7 @@ func (g *gate) Check(ctx context.Context, req agent.GateRequest) (agent.Decision
 //     the tool's own answer stands.)
 //
 // Nothing here makes an answer milder than the engine's own.
-func (l *live) reach(cwd string, call core.ToolCall, action core.Action, own permission.Decision) permission.Decision {
+func (l *live) reach(who, cwd string, call core.ToolCall, action core.Action, own permission.Decision) permission.Decision {
 	if own.Behavior == permission.Deny || !l.featureTool(call.Name) {
 		return own
 	}
@@ -316,7 +375,7 @@ func (l *live) reach(cwd string, call core.ToolCall, action core.Action, own per
 		}
 		input := json.RawMessage(`{"command":` + string(quoted) + `,"host":` + string(host) + `}`)
 		own = stricter(own, call.Name+" runs a command on another machine for this call, which is judged as that command is.",
-			l.engine.DecideAt(cwd, shelltool.BashName,
+			l.engine.DecideFor(who, cwd, shelltool.BashName,
 				core.ToolCall{ID: call.ID, Name: shelltool.BashName, Input: input},
 				core.Action{Kind: core.ActionExecute, Command: action.Command, Summary: action.Summary}))
 	case core.ActionRead:
@@ -329,7 +388,7 @@ func (l *live) reach(cwd string, call core.ToolCall, action core.Action, own per
 			if err != nil {
 				continue
 			}
-			d := l.engine.DecideAt(cwd, read,
+			d := l.engine.DecideFor(who, cwd, read,
 				core.ToolCall{ID: call.ID, Name: read, Input: json.RawMessage(`{"file_path":` + string(quoted) + `}`)},
 				core.Action{Kind: core.ActionRead, Paths: []string{path}, Summary: action.Summary})
 			if d.Stage == permission.StageTool {
@@ -365,7 +424,7 @@ func stricter(own permission.Decision, why string, other permission.Decision) pe
 // one of that kind more to do, as it covers starting one. A call whose
 // sub-agent cannot be found is left as it is; it refuses itself when it
 // runs.
-func (l *live) resumeAsStart(ctx context.Context, cwd string, call core.ToolCall, own permission.Decision) permission.Decision {
+func (l *live) resumeAsStart(ctx context.Context, who, cwd string, call core.ToolCall, own permission.Decision) permission.Decision {
 	if call.Name != sendMessageName || own.Behavior == permission.Deny {
 		return own
 	}
@@ -385,7 +444,7 @@ func (l *live) resumeAsStart(ctx context.Context, cwd string, call core.ToolCall
 	as := core.ToolCall{ID: call.ID, Name: agentToolName, Input: input}
 	act, _ := (&agentTool{l: l}).Describe(as, nil)
 	return stricter(own, sendMessageName+" gives a "+kind+" sub-agent more to do, which is judged as starting one is.",
-		l.engine.DecideAt(cwd, agentToolName, as, act))
+		l.engine.DecideFor(who, cwd, agentToolName, as, act))
 }
 
 // featureTool reports whether a tool is one a feature brought, and not
@@ -471,12 +530,83 @@ func describe(tool core.Tool, call core.ToolCall, env *core.ToolEnv) (act core.A
 // unattended is what the model reads when a call needs a person's yes and
 // nobody is there to give it.
 func (l *live) unattended(d permission.Decision) string {
-	text := "This call did not run: it needs a person's approval, and nobody is here to give it (" + strings.TrimSuffix(d.Reason, ".") +
+	why := strings.TrimSuffix(d.Reason, ".")
+	if l.cfg.Permissions.DenyInsteadOfPrompting.V {
+		return "This call did not run: it needs approval, and the user's settings refuse what would ask instead of asking (permissions.denyInsteadOfPrompting) (" + why +
+			"). Do the work another way if there is one, or say what you could not do. Do not send this call again."
+	}
+	text := "This call did not run: it needs a person's approval, and nobody is here to give it (" + why +
 		"). Do the work another way if there is one, or say what you could not do."
 	if l.inv.PermissionPrompts == "none" {
 		text += " Nobody answers permission questions in this run: do not send this call again."
 	}
 	return text
+}
+
+// escapeKeepingTabs is trust.Escape for a line of a command, whose tabs
+// stay tabs.
+func escapeKeepingTabs(line string) string {
+	parts := strings.Split(line, "\t")
+	for i, p := range parts {
+		parts[i] = trust.Escape(p)
+	}
+	return strings.Join(parts, "\t")
+}
+
+// answersChanged says a hook's rewrite of a question call gave it answers
+// the model's call did not have.
+func answersChanged(model, hook json.RawMessage) bool {
+	var a, b struct {
+		Answers json.RawMessage `json:"answers"`
+	}
+	if json.Unmarshal(hook, &b) != nil || len(b.Answers) == 0 || string(b.Answers) == "null" {
+		return false
+	}
+	_ = json.Unmarshal(model, &a)
+	var ca, cb bytes.Buffer
+	if json.Compact(&cb, b.Answers) != nil {
+		return true
+	}
+	return json.Compact(&ca, a.Answers) != nil || !bytes.Equal(ca.Bytes(), cb.Bytes())
+}
+
+// hookPathKeys are the arguments of the file tools that name a path.
+var hookPathKeys = map[string]string{"Read": "file_path", "Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path",
+	"NotebookEdit": "notebook_path", "Glob": "path", "Grep": "path"}
+
+// hookToolInput is a call's arguments as hooks are given them: the path a
+// file tool is given made absolute and clean, from the call's folder and
+// with ~ the home folder, as Claude Code gives them. A hook that guards
+// $CLAUDE_PROJECT_DIR/secrets sees "secrets/key" and "~/x" for the files
+// they are. (The tool reads the same file from the path as written.)
+func hookToolInput(call core.ToolCall, cwd, home string) json.RawMessage {
+	key, ok := hookPathKeys[call.Name]
+	if !ok {
+		return call.Input
+	}
+	var m map[string]json.RawMessage
+	var p string
+	if json.Unmarshal(call.Input, &m) != nil || json.Unmarshal(m[key], &p) != nil || p == "" {
+		return call.Input
+	}
+	abs := p
+	switch {
+	case home != "" && p == "~":
+		abs = home
+	case home != "" && strings.HasPrefix(p, "~/"):
+		abs = filepath.Join(home, p[2:])
+	case !filepath.IsAbs(p) && filepath.IsAbs(cwd) && !strings.HasPrefix(p, "~"):
+		abs = filepath.Join(cwd, p)
+	}
+	if !filepath.IsAbs(abs) || filepath.Clean(abs) == p {
+		return call.Input
+	}
+	m[key], _ = json.Marshal(filepath.Clean(abs))
+	out, err := json.Marshal(m)
+	if err != nil {
+		return call.Input
+	}
+	return out
 }
 
 // permissionQuestion writes the question about one call: exactly what
@@ -496,8 +626,19 @@ func (l *live) permissionQuestion(call core.ToolCall, action core.Action, d perm
 	}
 	switch {
 	case action.Command != "":
-		for _, line := range strings.Split(action.Command, "\n") {
-			b.WriteString("  $ " + trust.Escape(line) + "\n")
+		// The command as it is written: the prompt mark on each line where
+		// the shell starts reading a command, and the text of a
+		// here-document, a line that goes on, or what stands inside quotes
+		// across lines set under it; tabs stay tabs (the interface sets
+		// them out as spaces), and every other control character is
+		// escaped.
+		starts := shellquote.CommandStarts(action.Command)
+		for i, line := range strings.Split(action.Command, "\n") {
+			lead := "    "
+			if starts[i] {
+				lead = "  $ "
+			}
+			b.WriteString(lead + escapeKeepingTabs(line) + "\n")
 		}
 	case len(action.Paths) > 0:
 		for i, p := range action.Paths {
@@ -530,12 +671,29 @@ func (l *live) permissionQuestion(call core.ToolCall, action core.Action, d perm
 		choices = append(choices, agent.Choice{Key: "always:" + strconv.Itoa(i), Label: label})
 	}
 	choices = append(choices, agent.Choice{Key: "no", Label: "No (alone it stops the turn; with words after it, the model reads them and carries on)"})
+	// (An MCP tool by the name its call has on the screen; the rules keep
+	// the tool's own name.)
+	name := call.Name
+	if server, tool, ok := MCPToolParts(call.Name); ok {
+		name = server + " - " + tool + " (MCP)"
+	}
 	return agent.Question{
 		Kind:    "permission",
-		Title:   "Allow " + call.Name + "?",
+		Title:   "Allow " + name + "?",
 		Text:    strings.TrimRight(b.String(), "\n"),
 		Choices: choices,
 	}
+}
+
+// MCPToolParts splits an MCP tool's name, mcp__server__tool, into the
+// server's and the tool's.
+func MCPToolParts(name string) (server, tool string, ok bool) {
+	rest, ok := strings.CutPrefix(name, "mcp__")
+	if !ok {
+		return "", "", false
+	}
+	server, tool, ok = strings.Cut(rest, "__")
+	return server, tool, ok && server != "" && tool != ""
 }
 
 // planQuestion is the question ExitPlanMode puts: the plan, and whether to
@@ -550,17 +708,28 @@ func (l *live) planQuestion(call core.ToolCall, d permission.Decision) agent.Que
 	if plan == "" {
 		plan = "(The model gave no plan.)"
 	}
-	choices := []agent.Choice{{Key: "yes", Label: "Yes, carry it out, asking about each edit"}}
+	// What each yes switches the session to, said in the choice (the plan
+	// review of 2026-11-19: the second one switched it to acceptEdits for
+	// good, and said neither).
+	choices := []agent.Choice{{Key: "yes", Label: "Yes, carry it out in the default mode, asking about each edit"}}
 	for i, s := range d.Suggestions {
 		if s.Mode == permission.ModeAcceptEdits {
-			choices = append(choices, agent.Choice{Key: "always:" + strconv.Itoa(i), Label: "Yes, carry it out, and accept its edits without asking"})
+			choices = append(choices, agent.Choice{Key: "always:" + strconv.Itoa(i), Label: "Yes, and switch the session to acceptEdits: edits, and commands that make, move or remove files in the working folders, run without asking until you change the mode"})
 		}
 	}
 	choices = append(choices, agent.Choice{Key: "no", Label: "No, keep planning (say what to change after it; alone it stops the turn)"})
+	// The plan as the model wrote it, each line set apart from the choices
+	// below it (a plan ending "2. No, keep planning" passed for one); the
+	// screen makes each line safe, and tabs and backslashes stay as they
+	// are (they were shown as \x09 and \\).
+	lines := strings.Split(plan, "\n")
+	for i, line := range lines {
+		lines[i] = "│ " + line
+	}
 	return agent.Question{
 		Kind:    "permission",
 		Title:   "Carry out this plan?",
-		Text:    showLines(plan),
+		Text:    strings.Join(lines, "\n"),
 		Choices: choices,
 	}
 }
@@ -599,6 +768,12 @@ func (l *live) keepApproval(s permission.Suggestion) {
 		return
 	}
 	if err := l.saveRules(kept); err != nil {
+		// Held for the session alone: the rules kept for the project are
+		// what its file holds, which a later reading of it puts back.
+		for _, rule := range kept {
+			l.engine.Unkeep(rule, permission.ListAllow)
+			_ = l.engine.Grant(rule, permission.GrantSession)
+		}
 		l.notice(agent.LevelWarning, "permission", fmt.Sprintf("The approval holds for this session, but it could not be written down (%v), so gnosh will ask again next time.", err))
 	}
 }
@@ -669,6 +844,16 @@ func (l *live) editLocalRules(change func(lists map[string][]string)) error {
 func (l *live) editLocalSettings(change func(doc map[string]json.RawMessage) error) error {
 	path := l.cfg.Paths.LocalSettings
 	dir := filepath.Dir(path)
+	// Never through a link: a repository's .gnosh, or its settings file,
+	// linked to the person's own gnosh.json had a copy of it, keys and
+	// all, written into the repository (the settings-commands review of
+	// 2026-11-20).
+	if target := dataDirLeadsOut(l.cfg); target != "" {
+		return fmt.Errorf("the project's data folder %s is a link to %s, outside the project, so gnosh does not write there; remove the link", dir, target)
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a link, and the file gnosh keeps your saved approvals in never is one, so nothing was written; remove the link", path)
+	}
 	_, statErr := os.Stat(dir)
 	fresh := errors.Is(statErr, os.ErrNotExist)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -685,11 +870,16 @@ func (l *live) editLocalSettings(change func(doc map[string]json.RawMessage) err
 		return fmt.Errorf("the settings file is being written by another gnosh: %w", err)
 	}
 	defer release()
+	before := stampOf(path)
 
 	doc := map[string]json.RawMessage{}
 	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) > 0 {
 		plain, err := config.StandardJSON(data)
 		if err == nil {
+			if dup := config.DuplicateKey(plain); dup != "" {
+				// (Read last-wins, the first of the two would be lost.)
+				return fmt.Errorf("%s holds %q twice, which gnosh does not load, so it was left as it is; take one out", path, dup)
+			}
 			err = json.Unmarshal(plain, &doc)
 		}
 		if err != nil {
@@ -712,9 +902,82 @@ func (l *live) editLocalSettings(change func(doc map[string]json.RawMessage) err
 	if err := config.WriteFileAtomic(path, content, 0o600); err != nil {
 		return err
 	}
-	// (What gnosh writes it has put in force already.)
-	l.sawOwnWrite(path)
+	if err := config.NoteLocalWrite(l.cfg.Paths.StateDir, path, content); err != nil {
+		l.flog.logf("config", "%v", err)
+	}
+	keepOutOfGit(path)
+	// (What gnosh writes it has put in force already, unless the file
+	// held a change of the person's that was not yet taken in.)
+	l.sawOwnWrite(path, before)
 	return nil
+}
+
+// keepOutOfGit has git pass over the settings file gnosh writes, by a line
+// in the repository's info/exclude, which git keeps for this clone and
+// never commits, unless the data folder's own .gitignore already does. The
+// .gitignore was written only when gnosh made the folder, and a folder a
+// work tree or the repository's own agents made first left the file to be
+// committed with the person's saved approvals (the settings-commands
+// review of 2026-11-20). Claude Code puts its own file in git's excludes
+// the same way, on first write.
+func keepOutOfGit(path string) {
+	if data, err := os.ReadFile(filepath.Join(filepath.Dir(path), ".gitignore")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if l := strings.TrimSpace(line); l == "*" || l == filepath.Base(path) || l == "/"+filepath.Base(path) {
+				return
+			}
+		}
+	}
+	top := ""
+	for d := filepath.Dir(path); ; d = filepath.Dir(d) {
+		if _, err := os.Lstat(filepath.Join(d, ".git")); err == nil {
+			top = d
+			break
+		}
+		if d == filepath.Dir(d) {
+			return
+		}
+	}
+	gd := repoGitDir(top)
+	if gd == "" {
+		return
+	}
+	if data, err := os.ReadFile(filepath.Join(gd, "commondir")); err == nil {
+		// A linked work tree's excludes are the repository's.
+		common := strings.TrimSpace(string(data))
+		if !filepath.IsAbs(common) {
+			common = filepath.Join(gd, common)
+		}
+		gd = filepath.Clean(common)
+	}
+	rel, err := filepath.Rel(top, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return
+	}
+	line := "/" + filepath.ToSlash(rel)
+	exclude := filepath.Join(gd, "info", "exclude")
+	if info, err := os.Lstat(exclude); err == nil && !info.Mode().IsRegular() {
+		return
+	}
+	data, _ := os.ReadFile(exclude)
+	for _, l := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(l) == line {
+			return
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(exclude), 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(exclude, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	lead := ""
+	if len(data) > 0 && !strings.HasSuffix(string(data), "\n") {
+		lead = "\n"
+	}
+	_, _ = f.WriteString(lead + "# gnosh keeps this clone's saved approvals here\n" + line + "\n")
 }
 
 // outsideTree says why a session or sub-agent with the work tree t may not change
@@ -727,6 +990,9 @@ func outsideTree(t core.WorkTree, cwd string, paths []string) string {
 			p = filepath.Join(cwd, p)
 		}
 		p = filepath.Clean(p)
+		if dotGit(p) {
+			return dotGitRefusal(t, p)
+		}
 		repo, real := checkoutOf(t, p)
 		if repo == "" {
 			if hardLinked(real) {
@@ -848,7 +1114,14 @@ func (l *live) commandOutsideTree(t core.WorkTree, cwd, command string) string {
 	// Nor does it write into the checkout by the files it names: a
 	// redirection's target, cp's last word, sed -i's files and the like,
 	// as far as they can be told.
-	for _, p := range l.engine.CommandWrites(cwd, command) {
+	writes, unknown := l.engine.CommandWrites(cwd, command)
+	if unknown != "" {
+		return fmt.Sprintf("You work in a git work tree of your own, at %s, and gnosh cannot tell where this command writes: %s. It could be in %s. Write the file's path out.", t.Path, unknown, checkoutName(t, resolved(t.Repo)))
+	}
+	for _, p := range writes {
+		if dotGit(p) {
+			return dotGitRefusal(t, p)
+		}
 		repo, real := checkoutOf(t, p)
 		if repo == "" {
 			if hardLinked(real) {
@@ -872,6 +1145,12 @@ func (l *live) commandOutsideTree(t core.WorkTree, cwd, command string) string {
 		if repo, _ := checkoutOf(t, p); repo != "" {
 			return fmt.Sprintf("You work in a git work tree of your own, at %s, and this command points git at %s, in %s. Run git in your work tree, without -C, --git-dir, --work-tree or GIT_DIR: the work tree is a checkout of its own.", t.Path, p, checkoutName(t, repo))
 		}
+	}
+	// Nor does its git change what the work tree shares with the checkout:
+	// the branches and other refs, the git settings, the list of work
+	// trees (Claude Code 2.1.326 refuses the like for its sub-agents).
+	if what := l.engine.SharedGitChange(cwd, command, treeGit(t)); what != "" {
+		return fmt.Sprintf("You work in a git work tree of your own, at %s, and this command may change what your work tree shares with %s: %s. The branches, tags, git settings and list of work trees are the same in both. Make your changes as commits on your own branch, and leave other branches, tags and settings to the person.", t.Path, checkoutName(t, resolved(t.Repo)), what)
 	}
 	return ""
 }

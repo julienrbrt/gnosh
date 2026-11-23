@@ -1,6 +1,7 @@
 package permission
 
 import (
+	"cmp"
 	"errors"
 	"path"
 	"slices"
@@ -90,8 +91,15 @@ func (e *Engine) judgeLooped(v *bashView, i int, c *simpleCmd, st *lineState) pa
 			pv.exact, pv.prefix = "", ""
 			return pv
 		}
-		if k == 0 {
+		switch {
+		case k == 0:
 			first = pv
+		case first.rule == nil && pv.rule != nil:
+			// A value an allow rule let through, after values that only
+			// read: the loop runs because of the rule, and says so
+			// (oracle seed 115: "for f in a.txt <outside>/secret.txt; do
+			// strings "$f"; done" was put down to only reading).
+			first.rule = pv.rule
 		}
 	}
 	return first
@@ -203,8 +211,21 @@ func (e *Engine) lineDirs(v *bashView) (dirs []string) {
 }
 
 func (e *Engine) lineDirsKnown(v *bashView) (dirs []string, unknown bool) {
+	return e.dirsOf(v, true)
+}
+
+// dirsOf is lineDirsKnown; withFlags counts the folders programs go to by
+// flags of their own (env -C, git -C), where the shell itself never is.
+func (e *Engine) dirsOf(v *bashView, withFlags bool) (dirs []string, unknown bool) {
 	dirs = []string{e.cur}
-	for _, u := range v.units {
+	// In the order the line runs them: a cd found inside a command ("command
+	// cd sub", eval 'cd sub') where that command stands (oracle seed 137).
+	units := slices.Clone(v.units)
+	slices.SortStableFunc(units, func(a, b *unit) int { return cmp.Compare(a.origin, b.origin) })
+	for _, u := range units {
+		if u.cmd.flagCd && !withFlags {
+			continue
+		}
 		ws := u.cmd.words
 		if len(ws) == 0 || !ws[0].static() {
 			continue
@@ -358,6 +379,15 @@ func (e *Engine) dotMatches(pattern string) (out []string, ok bool) {
 	for i, seg := range segs {
 		if !strings.HasPrefix(seg, ".") || !hasPathMagic(seg) {
 			continue
+		}
+		if hasPathMagic(strings.Join(segs[:i], "/")) {
+			// "*/..*": each match of what comes before is a name of its
+			// own, which the text would take out with the "..": a match
+			// may begin with a dash and reach the command as a flag
+			// ("-R/.."), and through a link its ".." is the directory
+			// above where the link leads (oracle seed 166). It is not
+			// worked out: the caller asks.
+			return nil, false
 		}
 		for _, name := range []string{".", ".."} {
 			if !segMatch(seg, name) {
@@ -748,8 +778,13 @@ func (e *Engine) shellPaths(req *request) {
 			// ~+ is the directory the shell is in, ~- the one it was in
 			// before and ~2 one that pushd put by: each is one of those
 			// the line may be in.
-			if w.joined() != "~+"+rest && !v.moves {
-				return // no cd on the line: the word stays as it is written
+			if !v.moves && !stackTop(w) {
+				// No cd on the line: ~- is OLDPWD, which the shell is not
+				// given, and ~2 a place the stack does not have, so the
+				// word stays as it is written. (~+, ~0, ~+0 and ~-0 are
+				// the directory the shell is in, the one place the stack
+				// always holds: oracle seed 172.)
+				return
 			}
 			for _, d := range dirs {
 				part := litOf(d + rest)
@@ -771,6 +806,11 @@ func (e *Engine) shellPaths(req *request) {
 					*into = append(*into, a)
 				}
 			}
+		}
+		if into == &writes && !w.static() && req.writeOpaque == "" && !e.closedWord(v, w, at) {
+			// Whatever is made of the text the line computes, the file
+			// written cannot be told.
+			req.writeOpaque = "it writes to a file named by text computed when it runs (" + w.raw + ")"
 		}
 		abs, pattern, ok := e.absAll(w, dirs)
 		switch {
@@ -883,6 +923,12 @@ func (e *Engine) shellPaths(req *request) {
 		if !u.derived {
 			at = v.place(u.cmd)
 		}
+		if flag := listFlag(u.cmd.words); flag != "" && req.pathOpaque == "" {
+			req.pathOpaque = "it reads the files a list names (" + flag + "), and the list is only read when it runs"
+		}
+		if why := hiddenWrites(u.cmd.words); why != "" && req.pathOpaque == "" {
+			req.pathOpaque = why + ", which are only known when it runs"
+		}
 		if len(u.cmd.words) > 0 {
 			w0 := u.cmd.words[0]
 			if _, known := e.progName(w0); !known || progIsPattern(w0) {
@@ -911,6 +957,24 @@ func (e *Engine) shellPaths(req *request) {
 		}
 		for _, w := range f.writes {
 			add(w, &writes)
+		}
+		for _, ld := range f.lands {
+			add(ld.into, &writes)
+			if !ld.into.glob || ld.remote || !ld.dir.static() || !ld.src.static() {
+				continue
+			}
+			// A pattern copied into a folder lands under the names of what
+			// it matches, which are not there yet: "cp * build/" writes
+			// build/a.txt, which build/* matched nothing of, and a deny rule
+			// on *.txt was passed by (oracle seed 176). Each match's name,
+			// in each folder the copy lands in, is held to the rules.
+			var folders, names []string
+			add(ld.dir, &folders)
+			add(ld.src, &names)
+			writes = append(writes, landedNames(folders, names)...)
+		}
+		if trees, copies := treeOps(u.cmd.words); len(trees)+len(copies) > 0 {
+			e.treeGuards(trees, copies, dirs, req, &writes)
 		}
 		// A file written onto a flag, in a word that is not all written
 		// out: "awk -f${X:-.env}", "sort -o$X.env", "tool --config=${X:-.env}".
@@ -1189,6 +1253,22 @@ func dirTilde(w word) (rest string, ok bool) {
 	return l[i:], true
 }
 
+// stackTop reports whether a word dirTilde takes is the directory the
+// shell is in on a line that has not moved: ~+ is that directory, and ~0,
+// ~+0 and ~-0 (any count of zeros) are the first and the last of the
+// directory stack, which is that directory alone until a pushd.
+func stackTop(w word) bool {
+	head, _, _ := strings.Cut(w.joined(), "/")
+	digits := strings.TrimPrefix(head, "~")
+	if digits == "+" {
+		return true
+	}
+	if strings.HasPrefix(digits, "+") || strings.HasPrefix(digits, "-") {
+		digits = digits[1:]
+	}
+	return digits != "" && strings.Trim(digits, "0") == ""
+}
+
 // allLit reports whether a word is made of literal text alone.
 func allLit(w word) bool {
 	for _, p := range w.parts {
@@ -1200,15 +1280,17 @@ func allLit(w word) bool {
 }
 
 // braceAlts returns the words bash's braces make of a word that also
-// holds variables: "{$F,x}" is $F and x, and the braces are taken apart
-// before any variable is looked at. Only a word written with nothing but
-// names, $name and the braces themselves is taken apart (a quote or a
-// ${...} holds commas and braces that count for nothing).
+// holds variables: "{$F,x}" is $F and x, "$@"{,x} is "$@" and "$@"x, and
+// ${HOME}{,.old} is ${HOME} and ${HOME}.old, the braces taken apart before
+// any variable is looked at. A word whose braces and commas all stand
+// outside quotes, with no command or arithmetic in it, is taken apart as
+// bash reads it as written (braceExpandRaw): an escaped brace, and those
+// of a ${...}, count for nothing.
 func braceAlts(w word) ([]word, bool) {
-	if !w.brace || w.static() || w.quoted || strings.ContainsAny(w.raw, "'\"\\`(") || strings.Contains(w.raw, "${") {
+	if !w.brace || w.static() || strings.ContainsAny(w.raw, "`(") || bracesQuoted(w.raw) {
 		return nil, false
 	}
-	alts, ok := braceExpand(w.raw)
+	alts, ok := braceExpandRaw(w.raw)
 	if !ok || len(alts) == 1 && alts[0] == w.raw {
 		return nil, false
 	}
@@ -1224,6 +1306,36 @@ func braceAlts(w word) ([]word, bool) {
 		out = append(out, part)
 	}
 	return out, len(out) > 0
+}
+
+// bracesQuoted reports whether a brace or a comma stands inside quotes in
+// raw, where it counts for nothing to bash's braces, or a quote is left
+// open.
+func bracesQuoted(raw string) bool {
+	var q byte
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		switch {
+		case c == '\\' && q != '\'':
+			i++ // (escaped, outside quotes or inside double ones)
+		case c == '$' && q != '\'' && i+1 < len(raw) && raw[i+1] == '{':
+			// A ${...}: its braces are the parameter's, quoted or not.
+			close := closingBrace(raw, i+1, true)
+			if close < 0 {
+				return true
+			}
+			i = close
+		case q != 0 && c == q:
+			q = 0
+		case q != 0:
+			if c == '{' || c == '}' || c == ',' {
+				return true
+			}
+		case c == '\'' || c == '"':
+			q = c
+		}
+	}
+	return q != 0
 }
 
 // isFdTarget reports whether a redirection target is a descriptor number
@@ -1427,9 +1539,15 @@ func (e *Engine) judgePart(c *simpleCmd, st *lineState) partVerdict {
 	words := c.words
 	why := ""
 	viaXargs := false
+	// inShell: every wrapper the command was reached through runs it in
+	// the shell itself (builtin, command, bash's keyword time), so that a
+	// cd there moves the shell. Behind any other (stdbuf, env, nohup,
+	// timeout...) a cd is a program of its own, which moves nothing
+	// (oracle seed 117).
+	inShell := true
 	var first cmdFacts
 	for depth := 0; ; depth++ {
-		f := facts(words)
+		f := facts(gitHere(words, st))
 		if depth == 0 {
 			first = f
 		}
@@ -1449,13 +1567,13 @@ func (e *Engine) judgePart(c *simpleCmd, st *lineState) partVerdict {
 		relProg := strings.Contains(prog, "/") && !strings.HasPrefix(prog, "/")
 		if !plan && !((st.moved || st.unknown) && relProg) {
 			if r := e.allowCommand(words, viaXargs); r != nil {
-				e.afterPart(f, words, st, depth == 0 && c.sep != sepPipe && c.sep != sepOr && !c.neg)
+				e.afterPartIn(f, words, st, depth == 0 && c.sep != sepPipe && c.sep != sepOr && !c.neg && !c.cond, inShell)
 				return partVerdict{ok: true, rule: r, state: state}
 			}
 		}
 		if !viaXargs {
 			if w := e.partRuns(c, f, st, depth, staticInput); w == "" {
-				e.afterPart(f, words, st, depth == 0 && c.sep != sepPipe && c.sep != sepOr && !c.neg)
+				e.afterPartIn(f, words, st, depth == 0 && c.sep != sepPipe && c.sep != sepOr && !c.neg && !c.cond, inShell)
 				return partVerdict{ok: true}
 			} else if why == "" {
 				why = w
@@ -1473,14 +1591,30 @@ func (e *Engine) judgePart(c *simpleCmd, st *lineState) partVerdict {
 			break
 		}
 		viaXargs = viaXargs || words[0].joined() == "xargs"
+		if n := words[0].joined(); words[0].quoted || n != "builtin" && n != "command" && n != "time" {
+			inShell = false
+		}
 		words = inner
 	}
-	e.afterPart(first, c.words, st, c.sep != sepPipe && c.sep != sepOr && !c.neg)
+	e.afterPart(first, c.words, st, c.sep != sepPipe && c.sep != sepOr && !c.neg && !c.cond)
 	pv := partVerdict{why: why}
 	if plainName(c.words[0]) {
 		pv.exact, pv.prefix = e.suggestRules(c, first, st)
 	}
 	return pv
+}
+
+// afterPartIn is afterPart for a command reached through wrappers: one that
+// does not run it in the shell itself leaves the shell where it is, whatever
+// the command, so a cd there moves nothing.
+func (e *Engine) afterPartIn(f cmdFacts, words []word, st *lineState, own, inShell bool) {
+	switch f.name {
+	case "cd", "pushd", "popd":
+		if !inShell {
+			return
+		}
+	}
+	e.afterPart(f, words, st, own)
 }
 
 // afterPart notes what a part that is going to run does to the shell's
@@ -1557,6 +1691,33 @@ func (e *Engine) allowCommand(words []word, viaXargs bool) *crule {
 		}
 	}
 	return nil
+}
+
+// gitHere is a git command's words without a -C that names the folder
+// the line is in, where git would run anyway: "git -C /their/own/folder
+// diff --stat", as models often write, reads the same repository with the
+// same settings as "git diff --stat". Only the folder itself, written out
+// (absolute, or relative to where the line is) with no .. and no pattern,
+// counts: a folder under it may hold a repository of its own, and a link
+// or a ~ is not followed.
+func gitHere(words []word, st *lineState) []word {
+	if len(words) < 3 || st.unknown || len(st.dirs) == 0 || !words[0].static() || words[0].joined() != "git" ||
+		!words[1].static() || words[1].joined() != "-C" || !words[2].static() || words[2].tilde || words[2].glob || words[2].brace {
+		return words
+	}
+	// A .. is not taken off as text: git's -C goes into each part as the
+	// system does, through a link first, so "git -C lnk/.." runs where lnk
+	// points, and above it (a review found it; the shell's patterns are
+	// left out for the same reason: what they match is not the text).
+	if strings.Contains("/"+words[2].joined()+"/", "/../") {
+		return words
+	}
+	for _, d := range st.dirs {
+		if abs, ok := cleanAbs(words[2].joined(), d); !ok || abs != path.Clean(d) {
+			return words
+		}
+	}
+	return append([]word{words[0]}, words[3:]...)
 }
 
 // partRuns says why the command does not run on the mode alone, or ""
@@ -1784,7 +1945,7 @@ func (e *Engine) decideShell(req *request) Decision {
 		if plan {
 			reason = "Plan mode: " + reason
 		}
-		return Decision{Behavior: Ask, Stage: StageMode, Reason: reason, hookAllow: !plan}
+		return Decision{Behavior: Ask, Stage: StageMode, Reason: reason, hookAllow: !plan, PersonOnly: plan}
 	}
 	if !plan {
 		if c := e.match(ListAllow, req); c != nil {
@@ -1848,10 +2009,18 @@ func (e *Engine) decideShell(req *request) Decision {
 			st.leave(saved[len(saved)-1])
 			saved = saved[:len(saved)-1]
 		}
+		// Where the shell is is settled first, and that is what a
+		// subshell starting here starts from and what is put back after
+		// it. Kept before it was settled, a cd still pending before the
+		// subshell came back after it as if it had just run: in "cd nope
+		// <newline> (cd sub) && cat x", the && then read as cd nope's
+		// success, and cat was judged in nope alone, where the shell,
+		// cd nope having failed, was where the line began (oracle seed
+		// 129).
+		st.enter(c)
 		for n := opens[i]; n > 0; n-- {
 			saved = append(saved, st.copyPlace())
 		}
-		st.enter(c)
 		pv := e.judgeLooped(v, i, c, st)
 		if pv.ok && pv.state != "" && parts > 1 {
 			whys = append(whys, pv.state+" changes the shell that runs the rest of the line, so the rest cannot be judged ahead of time")
@@ -1925,7 +2094,12 @@ var noPrefix = map[string]bool{
 // that directory.
 func (e *Engine) suggestRules(c *simpleCmd, f cmdFacts, st *lineState) (exact, prefix string) {
 	if f.name == "cd" && f.cd != nil {
-		if abs, _, ok := e.absAll(*f.cd, st.dirs); ok && len(abs) == 1 {
+		// Not for a folder the Read tool would offer no such rule for
+		// either: the root, a top-level folder, the home, a folder that
+		// holds the project. "cd .. && ls" from the project's root offered
+		// Read(//<all the person's projects>/**), kept on disk (the
+		// approvals review of 2026-11-19).
+		if abs, _, ok := e.absAll(*f.cd, st.dirs); ok && len(abs) == 1 && abs[0] != "/" && e.criticalDir(abs[0]) == "" {
 			return "Read(/" + EscapePath(abs[0]) + "/**)", ""
 		}
 		return "", ""
@@ -1949,7 +2123,11 @@ func (e *Engine) suggestRules(c *simpleCmd, f cmdFacts, st *lineState) (exact, p
 		return "", ""
 	}
 	name := c.words[0].joined()
-	if noPrefix[baseName(name)] || strings.Contains(name, "/") || prefixOnlyExact(c.words) || len(c.words) == 1 {
+	// The program as a system that does not tell capitals apart finds
+	// it: PYTHON3 runs python3 on a Mac, and Bash(PYTHON3 *) would let
+	// any script run (the approvals review of 2026-11-19).
+	key := progKey(baseName(name))
+	if noPrefix[key] || strings.Contains(name, "/") || prefixOnlyExact(c.words) || len(c.words) == 1 {
 		return exact, ""
 	}
 	head := name
@@ -1958,7 +2136,7 @@ func (e *Engine) suggestRules(c *simpleCmd, f cmdFacts, st *lineState) (exact, p
 		if len(c.words) == 2 {
 			return exact, ""
 		}
-	} else if needsSubcommand[name] {
+	} else if needsSubcommand[key] {
 		return exact, ""
 	}
 	if prefix = "Bash(" + head + " *)"; !covers(prefix) {
@@ -1984,4 +2162,18 @@ func subcommandLike(w word) bool {
 		}
 	}
 	return true
+}
+
+// landedNames are the paths a copy makes in folders: each name's last
+// piece in each folder.
+func landedNames(folders, names []string) []string {
+	var out []string
+	for _, f := range folders {
+		for _, n := range names {
+			if b := path.Base(n); b != "." && b != ".." && b != "/" {
+				out = append(out, path.Join(f, b))
+			}
+		}
+	}
+	return out
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/gnosh-ai/gnosh/internal/agent"
 	"github.com/gnosh-ai/gnosh/internal/app"
+	"github.com/gnosh-ai/gnosh/internal/text"
 )
 
 // Under a prompt, the interface says what each path it mentioned with @
@@ -63,5 +64,104 @@ func TestCompleteAgent(t *testing.T) {
 	}
 	if got := (&session{}).completeAgent("a", 0); got != nil {
 		t.Errorf("controls that cannot name kinds: %+v", got)
+	}
+}
+
+// A command named partway through a prompt, as Claude Code completes it:
+// the commands and skills whose names begin with what follows the slash,
+// a bare slash for every one, and a path when no name begins that way or
+// the word goes on past a second slash. A line that is itself a command
+// keeps its words for the command.
+func TestCompleteCommandMidPrompt(t *testing.T) {
+	s := &session{cwd: "/proj", info: app.SessionInfo{
+		Commands:    []string{"help", "review", "recap", "status"},
+		CommandList: []app.CommandInfo{{Name: "exit", Aliases: []string{"quit"}}},
+		Skills:      []app.CommandInfo{{Name: "release-notes"}},
+	}, listDir: func(dir string) []fileEntry {
+		if dir == "/" {
+			return []fileEntry{{name: "tmp", dir: true}, {name: "srv", dir: true}}
+		}
+		return nil
+	}}
+	offered := func(text string) string {
+		var out []string
+		for _, c := range s.complete(text, len(text)) {
+			if !strings.HasPrefix(c.Text, text[c.Start:]) {
+				t.Errorf("%q: candidate %+v", text, c)
+			}
+			out = append(out, c.Text)
+		}
+		return strings.Join(out, " ")
+	}
+	for text, want := range map[string]string{
+		"run the tests, then /re": "/review /recap /release-notes",
+		"then /st":                "/status",
+		"then /":                  "/help /review /recap /status /release-notes",
+		"then /qu":                "/quit",
+		"look in /tm":             "/tmp/",
+		"look in /srv/x":          "",
+		"/re":                     "/review /recap /release-notes",
+		"/loop 5m /re":            "",
+	} {
+		if got := offered(text); got != want {
+			t.Errorf("%q: offered %q, want %q", text, got, want)
+		}
+	}
+}
+
+// A slash in the middle of a prompt opens no list by itself, so Enter
+// sends what was typed (a route such as /st stays /st); Tab opens it.
+func TestMidPromptSlashWaitsForTab(t *testing.T) {
+	g := newRig(t, 80, 24, text.NoColor)
+	g.keys(`"show GET /st"`)
+	g.liveLacks("/status")
+	g.keys(`<Enter>`)
+	if got := g.c.sent(); len(got) != 1 || got[0] != "show GET /st" {
+		t.Fatalf("sent %q", got)
+	}
+	g.keys(`"then /st" <Tab>`)
+	if g.box() != "then /status" {
+		t.Fatalf("Tab gave %q", g.box())
+	}
+	// At the start of the box the slash still opens the list of commands.
+	g.keys(`<Ctrl+U> "/st"`)
+	g.liveHas("/status")
+}
+
+// What is typed after /cd and /add-dir is a folder, slash or no slash:
+// only folders are offered for it, from the folder the session is in. A
+// folder typed in full is offered as typed first, so that Enter runs the
+// command with it rather than taking the name with a slash.
+func TestCompleteFolder(t *testing.T) {
+	s := &session{cwd: "/proj", home: "/home/u", listDir: func(dir string) []fileEntry {
+		switch dir {
+		case "/proj":
+			return []fileEntry{{name: "docs", dir: true}, {name: "doctor.go"}, {name: "src", dir: true}}
+		case "/home/u":
+			return []fileEntry{{name: "code", dir: true}, {name: "notes.txt"}}
+		}
+		return nil
+	}}
+	labels := func(text string) string {
+		var out []string
+		for _, c := range s.complete(text, len(text)) {
+			out = append(out, c.Text)
+		}
+		return strings.Join(out, " ")
+	}
+	for text, want := range map[string]string{
+		"/cd do":       "docs/",
+		"/cd docs":     "docs docs/",
+		"/cd ":         "docs/ src/",
+		"/add-dir s":   "src/",
+		"/cd ~/":       "~/code/",
+		"/cd docs x":   "",
+		"/cdx do":      "",
+		"tell me do":   "",
+		"look at src/": "",
+	} {
+		if got := labels(text); got != want {
+			t.Errorf("%q: offered %q, want %q", text, got, want)
+		}
 	}
 }

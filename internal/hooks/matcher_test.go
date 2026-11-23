@@ -1,6 +1,9 @@
 package hooks
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -157,6 +160,7 @@ func TestToolMatchersChooseTheHooks(t *testing.T) {
 		{"Download", []string{"(none)", "*", "Download", "Edit|Write (guard)", "WebFetch (guard)"}},
 		{"CodeSearch", []string{"(none)", "*", "WebSearch (guard)"}},
 		{"Spawn", []string{"(none)", "*", "Task (guard)"}},
+		{"Monitor", []string{"(none)", "*", "Bash (guard)"}},
 	}
 	for _, tt := range tests {
 		in := input(PreToolUse)
@@ -190,6 +194,9 @@ func TestValueMatchersChooseTheHooks(t *testing.T) {
 	all = append(all, hooks(Stop, "", "*")...)
 	all = append(all, hooks(UserPromptSubmit, "")...)
 	all = append(all, hooks(SubagentStop, "*")...)
+	all = append(all, hooks(PreModelSwitch, "test-model", "local/test-model", "other-model|big")...)
+	all = append(all, hooks(PostModelSwitch, "test-model")...)
+	all = append(all, hooks(ConfigChange, "project_settings|local_settings", "user_settings", "")...)
 	r := newRunner(t, options(t), all...)
 
 	tests := []struct {
@@ -219,6 +226,14 @@ func TestValueMatchersChooseTheHooks(t *testing.T) {
 		{"the end of a turn", func(in *Input) {}, Stop, []string{"(none)", "*"}},
 		{"a prompt", func(in *Input) { in.Prompt = "Bash Stop startup" }, UserPromptSubmit, []string{"(none)"}},
 		{"the end of a sub-agent", func(in *Input) { in.AgentType = "Explore" }, SubagentStop, []string{"*"}},
+		// A model is matched as provider/model and by its own name.
+		{"a switch", func(in *Input) { in.ToModel = "local/test-model" }, PreModelSwitch, []string{"local/test-model", "test-model"}},
+		{"a switch to a model named like it", func(in *Input) { in.ToModel = "local/test-model-2" }, PreModelSwitch, []string{"local/test-model"}},
+		{"a switch to another provider's model", func(in *Input) { in.ToModel = "remote/big" }, PreModelSwitch, []string{"other-model|big"}},
+		{"a model with no provider", func(in *Input) { in.ToModel = "test-model" }, PreModelSwitch, []string{"test-model"}},
+		{"after a switch", func(in *Input) { in.ToModel = "remote/test-model" }, PostModelSwitch, []string{"test-model"}},
+		{"the project's settings changed", func(in *Input) { in.Source = "project_settings" }, ConfigChange, []string{"(none)", "project_settings|local_settings"}},
+		{"the person's settings changed", func(in *Input) { in.Source = "user_settings" }, ConfigChange, []string{"(none)", "user_settings"}},
 	}
 	for _, tt := range tests {
 		in := input(tt.ev)
@@ -249,5 +264,45 @@ func TestIdenticalCommandsRunOnce(t *testing.T) {
 	}
 	if got := strings.Count(waitFor(t, dir+"/count"), "ran"); got != 2 {
 		t.Errorf("the commands ran %d times, want 2", got)
+	}
+}
+
+// A Bash hook guards the commands Monitor starts, as in Claude Code: before
+// they run, seeing each as a Bash call, and its changed input counts for
+// nothing; after them (PostToolUse) it does not run for them.
+func TestBashHooksGuardMonitorCommands(t *testing.T) {
+	seen := filepath.Join(t.TempDir(), "seen.json")
+	rewrite := prints(t, `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {"command": "echo rewritten"}}}`)
+	r := newRunner(t, options(t),
+		Hook{Event: PreToolUse, Matcher: "Bash", Command: "cat > " + shq(seen) + "; " + rewrite},
+		Hook{Event: PostToolUse, Matcher: "Bash", Command: "true"})
+	in := input(PreToolUse)
+	in.ToolName, in.ToolInput = "Monitor", json.RawMessage(`{"command":"tail -f log","description":"the log","timeout_ms":1000}`)
+	out := run(t, r, in)
+	if out.UpdatedInput != nil {
+		t.Errorf("a Bash hook's changed input was applied to a Monitor call: %s", out.UpdatedInput)
+	}
+	data, err := os.ReadFile(seen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		ToolName  string         `json:"tool_name"`
+		ToolInput map[string]any `json:"tool_input"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	// As the Bash call that runs it: in the background, with its time
+	// (the hosts review of 2026-11-19).
+	if got.ToolName != "Bash" || got.ToolInput["command"] != "tail -f log" || got.ToolInput["timeout_ms"] != nil ||
+		got.ToolInput["run_in_background"] != true || got.ToolInput["timeout"] != float64(1000) {
+		t.Errorf("the Bash hook was given %s", data)
+	}
+
+	post := input(PostToolUse)
+	post.ToolName, post.ToolInput = "Monitor", json.RawMessage(`{"command":"tail -f log"}`)
+	if names := ran(run(t, r, post)); len(names) != 0 {
+		t.Errorf("after a Monitor call, the hooks %v ran", names)
 	}
 }

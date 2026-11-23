@@ -134,6 +134,22 @@
 // Status is then the one the error names, if it names one, and zero
 // otherwise.
 //
+// A server that cannot take images refuses the whole request: llama.cpp's
+// server started without its vision part says "image input is not
+// supported" (HTTP 500), and others serving a model for text alone say
+// it in their own words (images.go, refusals). A provider told that sends
+// the request again at once with each image as a line that says it was
+// left out, and from then on never sends one, in a stream or a count of
+// tokens. A server that takes images but could not read one says so for
+// the whole request too: llama.cpp's says "Failed to load image or audio
+// file" (HTTP 400) of a WebP, which its loader does not read, or of a
+// broken file. Then the images of the request it has not taken before are
+// each sent as a line saying it could not read them, from then on, and the
+// request goes again (all of them, when it had taken every one before).
+// Without that, a picture a tool read would fail every later request of
+// the session the same way, since the conversation keeps it. The caller's
+// request is not changed.
+//
 // When does a stream that ends without a stop reason still count? Only if
 // the server sent its own last word ("[DONE]", or "message_stop") and some
 // answer arrived. The server plainly meant to stop there, so the reason is
@@ -238,8 +254,12 @@
 //	                    of the top-level field. Both go to the model's chat
 //	                    template: a model that thinks or does not (Qwen)
 //	                    reads the first, one with levels (gpt-oss) the
-//	                    second. BudgetTokens is ignored: the server's
-//	                    budget is a start-up flag
+//	                    second
+//	Thinking.BudgetTokens reasoning_budget_tokens, with BudgetNote as
+//	                    reasoning_budget_message, unless Mode is "off": the
+//	                    server ends the thinking there and puts the note at
+//	                    its end (server builds from b9982 on; an older one
+//	                    ignores both)
 //	Request.Tools       parallel_tool_calls: true when there are tools; the
 //	                    server allows one call per answer otherwise
 //	MaxTokens           max_tokens

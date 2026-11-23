@@ -282,3 +282,25 @@ func TestVimVisualDraws(t *testing.T) {
 		checkView(t, g.e, w, "a VISUAL selection")
 	}
 }
+
+// A put with a count adds at most about vimPutMax of text, and at least
+// the register once: 9999p of a long line built gigabytes (the TUI review
+// of 2026-11-19).
+func TestVimPutCountIsBounded(t *testing.T) {
+	g := vimRig(t, Options{})
+	long := strings.Repeat("x", 1<<20)
+	g.e.Insert(long)
+	g.do(`<Esc> "yy9999p"`)
+	if n := len(g.e.Text()); n > vimPutMax+2*len(long)+2 {
+		t.Fatalf("9999p of a 1 MiB line made %d bytes", n)
+	}
+	if lines := strings.Count(g.e.Text(), "\n"); lines < 1 {
+		t.Fatalf("the line was not put at all: %d line breaks", lines)
+	}
+	// A short line is put as many times as asked.
+	g = vimRig(t, Options{})
+	g.do(`"ab" <Esc> "yy9999p"`)
+	if lines := strings.Count(g.e.Text(), "ab"); lines != 10000 {
+		t.Errorf("a short line stands %d times, want 10000", lines)
+	}
+}

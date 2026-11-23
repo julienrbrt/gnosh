@@ -3,6 +3,7 @@ package permission
 import (
 	"errors"
 	"path"
+	"slices"
 	"strings"
 )
 
@@ -14,6 +15,9 @@ type pathPattern struct {
 	// segs are the pattern's segments from the filesystem root; "**"
 	// stands for any number of directories, none included.
 	segs []string
+	// orig are segs as written, before fold made them keys: the path a
+	// rule names, for the sandbox's lists (SandboxPaths).
+	orig []string
 	// relative is set for patterns anchored at the current directory by
 	// being written as "path" or "./path". These are the rules a "!"
 	// pattern can reopen.
@@ -38,11 +42,29 @@ type pathPattern struct {
 //	./path   the working directory
 //	path     the working directory; a bare file name at any depth below it
 func (e *Engine) parsePathPattern(spec string, list List, ly *layer, negate bool) (pathPattern, error) {
-	p := pathPattern{below: list != ListAllow, fold: list != ListAllow}
+	return e.parsePattern(spec, list, ly, negate, false)
+}
+
+// parseDirPattern reads a Cd rule's pattern, as Claude Code does: the
+// anchors of Read and Edit rules, but matched against the whole of a
+// folder's path, not as gitignore matches. * is one segment and ** any
+// number of them, so a trailing /** takes in the folder it names too, and
+// a pattern without an anchor starts at the working directory. A slash at
+// the end changes nothing.
+func (e *Engine) parseDirPattern(spec string, list List, ly *layer) (pathPattern, error) {
+	for len(spec) > 1 && spec != "//" && strings.HasSuffix(spec, "/") && !strings.HasSuffix(spec, "\\/") {
+		spec = spec[:len(spec)-1]
+	}
+	return e.parsePattern(spec, list, ly, false, true)
+}
+
+// parsePattern is parsePathPattern, or with whole parseDirPattern.
+func (e *Engine) parsePattern(spec string, list List, ly *layer, negate, whole bool) (pathPattern, error) {
+	p := pathPattern{below: list != ListAllow && !whole, fold: list != ListAllow}
 	if spec == "" {
 		return p, errors.New("the path pattern is empty")
 	}
-	dirOnly := strings.HasSuffix(spec, "/") && !strings.HasSuffix(spec, "\\/")
+	dirOnly := strings.HasSuffix(spec, "/") && !strings.HasSuffix(spec, "\\/") && !whole
 	var base string
 	rest := spec
 	switch {
@@ -90,7 +112,7 @@ func (e *Engine) parsePathPattern(spec string, list List, ly *layer, negate bool
 	}
 
 	// Depth, for patterns written relative to the working directory.
-	bare := p.relative && !strings.HasPrefix(spec, "./") && !strings.HasPrefix(spec, "!./")
+	bare := p.relative && !strings.HasPrefix(spec, "./") && !strings.HasPrefix(spec, "!./") && !whole
 	switch {
 	case bare && len(segs) == 1 && !dirOnly:
 		// A bare file name matches at any depth.
@@ -113,6 +135,7 @@ func (e *Engine) parsePathPattern(spec string, list List, ly *layer, negate bool
 		head = append(head, EscapePath(s))
 	}
 	p.segs = append(head, segs...)
+	p.orig = slices.Clone(p.segs)
 	if p.fold {
 		for i, s := range p.segs {
 			p.segs[i] = guardPattern(s)
@@ -122,11 +145,11 @@ func (e *Engine) parsePathPattern(spec string, list List, ly *layer, negate bool
 		for {
 			switch {
 			case len(p.segs) >= 3 && p.segs[0] == "system" && p.segs[1] == "volumes" && p.segs[2] == "data":
-				p.segs = p.segs[3:]
+				p.segs, p.orig = p.segs[3:], p.orig[3:]
 			case len(p.segs) >= 1 && p.segs[0] == ".nofollow":
-				p.segs = p.segs[1:]
+				p.segs, p.orig = p.segs[1:], p.orig[1:]
 			case len(p.segs) >= 2 && p.segs[0] == ".resolve" && isDigits(p.segs[1]):
-				p.segs = p.segs[2:]
+				p.segs, p.orig = p.segs[2:], p.orig[2:]
 			default:
 				return p, nil
 			}

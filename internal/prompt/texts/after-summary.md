@@ -1,1 +1,1 @@
-Carry on with the task from where the summary leaves it. Do not ask the user to repeat anything, and do not ask whether to go on.[[ The conversation as it was is in {{path}}: read from it only what you need.]]
+Carry on with the task from where the summary leaves it. Keep every stop the user set: where they asked to be told or asked before a step, stop there and do that first. Do not ask the user to repeat anything, and otherwise do not ask whether to go on.[[ The conversation as it was is in {{path}}: read from it only what you need.]]

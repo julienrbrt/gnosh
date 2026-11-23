@@ -1,7 +1,6 @@
 package gnochain
 
 import (
-	"crypto/rand"
 	"errors"
 
 	"github.com/gnolang/gno/tm2/pkg/crypto"
@@ -20,15 +19,6 @@ type KeySigner struct {
 }
 
 var _ Signer = (*KeySigner)(nil)
-
-// NewKeySigner signs with a fresh random key.
-func NewKeySigner() (*KeySigner, error) {
-	var seed [32]byte
-	if _, err := rand.Read(seed[:]); err != nil {
-		return nil, err
-	}
-	return KeySignerFromSeed(seed[:])
-}
 
 // KeySignerFromSeed signs with the key derived from seed, so a demo can
 // make the same worker keys again (and fund them at genesis).

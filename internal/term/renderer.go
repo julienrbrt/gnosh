@@ -21,6 +21,18 @@ import (
 // room at the bottom of the screen when needed), and never names a row by
 // number, because the screen is not gnosh's.
 //
+// It may also be told which row of the screen the cursor is on, as the
+// terminal reports it (AskedCursor, CursorAnswer); it then follows that row
+// through its own writes. Knowing it, the renderer keeps the live region
+// on the bottom rows of the screen, as the input box of a program that
+// owns the screen stays put: from the first frame on, when the region is
+// shorter than the rows from its top to the screen's last, blank rows
+// above it make up the difference, instead of the rows below it being left
+// empty, and the next committed lines fill those blank rows first (Jae, 22
+// November 2026: "the text field is not fixed on bottom of screen"). A
+// resize, or the screen lent to another program, loses the row until the
+// terminal is asked again (WantsCursor).
+//
 // Lines given to the renderer are already styled and already wrapped. Each
 // must stand on its own: its colours end with it, and it takes exactly one
 // row. The renderer enforces the second: it lets through only text, SGR
@@ -60,9 +72,26 @@ type Renderer struct {
 	// drawn: the terminal may have rearranged it.
 	stale bool
 
+	// at is the row of the screen the cursor is on, counted from 0 at
+	// the top, while known is true. owed counts the cursor position
+	// questions the terminal has not answered yet, and void how many of
+	// those no longer count (they were asked before a resize or a Reset).
+	// moved is what the renderer did to the cursor since the last question
+	// was asked, for its answer to be brought up to date: rows up as
+	// negative numbers, line feeds as positive ones.
+	at    int
+	known bool
+	owed  int
+	void  int
+	moved []int
+
 	body []byte
 	buf  []byte
 }
+
+// maxMoved is how many moves of the cursor are kept for an answer that
+// is on its way. A terminal that has not answered by then is asked again.
+const maxMoved = 4096
 
 // NewRenderer makes a renderer that writes to out for a terminal of cols
 // by rows cells. width says how many cells a piece of text takes; it is
@@ -118,6 +147,15 @@ func (r *Renderer) SetReflow(on bool) {
 func (r *Renderer) Commit(lines ...string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	commit := r.prepareCommit(lines)
+	if len(commit) == 0 {
+		return nil
+	}
+	return r.paint(commit)
+}
+
+// prepareCommit makes lines to commit safe, a row a line.
+func (r *Renderer) prepareCommit(lines []string) []rline {
 	var commit []rline
 	for _, l := range lines {
 		if !strings.Contains(l, "\n") {
@@ -128,10 +166,7 @@ func (r *Renderer) Commit(lines ...string) error {
 			commit = append(commit, r.prepare(strings.TrimSuffix(part, "\r")))
 		}
 	}
-	if len(commit) == 0 {
-		return nil
-	}
-	return r.paint(commit)
+	return commit
 }
 
 // SetLive replaces the live region with lines and says where to leave the
@@ -140,14 +175,120 @@ func (r *Renderer) Commit(lines ...string) error {
 // and nothing at all is written when nothing did.
 //
 // When there are more lines than the terminal has rows, the last rows are
-// shown; the rest wait until there is room.
+// shown; the rest wait until there is room. When the renderer knows the
+// cursor's row (see Renderer), blank rows above lines that do not reach the
+// screen's last row take the rest, so that the region's last line is the
+// screen's.
 func (r *Renderer) SetLive(lines []string, cursorRow, cursorCol int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.setLive(lines, cursorRow, cursorCol)
+	return r.paint(nil)
+}
+
+func (r *Renderer) setLive(lines []string, cursorRow, cursorCol int) {
 	r.lines = r.prepareAll(lines)
 	r.wantShown = cursorRow >= 0
 	r.wantRow, r.wantCol = max(cursorRow, 0), max(cursorCol, 0)
-	return r.paint(nil)
+}
+
+// CommitLive is Commit and then SetLive, in one write. It is how lines
+// move from the live region to the scrollback: Commit alone draws the
+// old live region again under the lines it commits, so lines that were in
+// that region would be on the screen twice, and at the bottom of the
+// screen the terminal would scroll to make room for them, only for the
+// region to shrink a moment later and leave the rows below it empty.
+func (r *Renderer) CommitLive(commit, lines []string, cursorRow, cursorCol int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.setLive(lines, cursorRow, cursorCol)
+	return r.paint(r.prepareCommit(commit))
+}
+
+// WantsCursor reports whether the renderer has lost track of the row the
+// cursor is on and no question that would tell it is on its way. The
+// caller may then ask the terminal (Terminal.QueryCursorPosition) and say
+// so with AskedCursor.
+func (r *Renderer) WantsCursor() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return !r.known && r.owed == r.void
+}
+
+// AskedCursor tells the renderer that a cursor position question has just
+// been sent to the terminal, after everything the renderer wrote so far.
+// The answer goes to CursorAnswer.
+func (r *Renderer) AskedCursor() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.owed++
+	r.moved = r.moved[:0]
+}
+
+// CursorAnswer takes in the terminal's answer to a cursor position
+// question: the row, counted from 1. Only the answer to the last question
+// counts, brought up to date with what the renderer drew since it was
+// asked, and only when the terminal was not resized and the screen not
+// lent to another program in between. An answer to no question is
+// ignored.
+func (r *Renderer) CursorAnswer(row int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.owed == 0 {
+		return
+	}
+	r.owed--
+	if r.void > 0 {
+		r.void--
+		return
+	}
+	if r.owed > 0 {
+		// An answer to an earlier question: the last one's is to come.
+		return
+	}
+	moved := r.moved
+	r.moved = r.moved[:0]
+	if row < 1 || row > r.rows {
+		return
+	}
+	r.at, r.known = row-1, true
+	for _, d := range moved {
+		r.at = r.step(r.at, d)
+	}
+}
+
+// follow keeps account of a move of the cursor the renderer is about to
+// write: d rows up when d is negative, d line feeds when it is positive.
+func (r *Renderer) follow(d int) {
+	switch {
+	case r.known:
+		r.at = r.step(r.at, d)
+	case r.owed > r.void:
+		if len(r.moved) >= maxMoved {
+			// Too long without an answer: the questions on their way
+			// no longer count, and the terminal is asked again.
+			r.void, r.moved = r.owed, r.moved[:0]
+			return
+		}
+		r.moved = append(r.moved, d)
+	}
+}
+
+// step is row at after the move d: the cursor stops at the top of the
+// screen going up, and a line feed on the last row scrolls the screen
+// and leaves the cursor where it is.
+func (r *Renderer) step(at, d int) int {
+	if d < 0 {
+		return max(at+d, 0)
+	}
+	return min(at+d, r.rows-1)
+}
+
+// lose forgets the row of the cursor, and the answers on their way.
+func (r *Renderer) lose() {
+	r.known = false
+	r.void = r.owed
+	r.moved = r.moved[:0]
 }
 
 // prepareAll makes lines safe, reusing the work done for lines that were
@@ -216,6 +357,10 @@ func (r *Renderer) Resize(cols, rows int) error {
 		}
 	}
 	r.stale = true
+	// Where the cursor now is on the screen is the terminal's own
+	// business; the region is drawn from its top again, without the
+	// blank rows that kept it down, until the terminal says.
+	r.lose()
 	return r.paint(nil)
 }
 
@@ -223,14 +368,15 @@ func (r *Renderer) Resize(cols, rows int) error {
 // live region began. Call it before gnosh exits and before handing the
 // terminal to another program. The renderer then knows of nothing on the
 // screen; the next Commit or SetLive starts at the cursor, which must
-// again be at the start of an empty line.
+// again be at the start of an empty line. It still knows which row the
+// cursor is on, until Reset says another program has had the screen.
 func (r *Renderer) Clear() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.lines = nil
 	r.wantShown, r.wantRow, r.wantCol = true, 0, 0
 	err := r.paint(nil)
-	r.reset()
+	r.forget()
 	return err
 }
 
@@ -239,13 +385,16 @@ func (r *Renderer) Clear() error {
 // was stopped and continued, or another program wrote to the terminal):
 // the next update draws the live region afresh at the cursor, which must
 // be at the start of an empty line, and whatever is above is left alone.
+// Which row the cursor is on is forgotten too (see WantsCursor).
 func (r *Renderer) Reset() {
 	r.mu.Lock()
-	r.reset()
+	r.forget()
+	r.lose()
 	r.mu.Unlock()
 }
 
-func (r *Renderer) reset() {
+// forget forgets what the renderer drew.
+func (r *Renderer) forget() {
 	r.screen = nil
 	r.row, r.col = 0, 0
 	r.stale = false
@@ -277,16 +426,35 @@ func (r *Renderer) rowsAboveCursor() int {
 	return up + within
 }
 
+// padding is how many blank rows go between n committed lines and a live
+// region of h rows, so that the region's last row is the screen's last row
+// (see Renderer).
+func (r *Renderer) padding(n, h int) int {
+	if !r.known || r.stale || h == 0 {
+		return 0
+	}
+	top := r.at - r.row
+	if top < 0 {
+		return 0
+	}
+	return max(r.rows-top-n-h, 0)
+}
+
 // paint makes the terminal show the lines of commit followed by the live
 // region, starting at the row where the live region began, and then moves
 // the top of the live region below the committed lines.
 func (r *Renderer) paint(commit []rline) error {
 	vis := r.window()
 	n := len(commit)
+	pad := r.padding(n, len(vis))
 	desired := vis
-	if n > 0 {
-		desired = make([]rline, 0, n+len(vis))
-		desired = append(append(desired, commit...), vis...)
+	if n > 0 || pad > 0 {
+		desired = make([]rline, 0, n+pad+len(vis))
+		desired = append(desired, commit...)
+		for range pad {
+			desired = append(desired, rline{})
+		}
+		desired = append(desired, vis...)
 	}
 	old := r.screen
 	b := r.body[:0]
@@ -295,12 +463,23 @@ func (r *Renderer) paint(commit []rline) error {
 	// erased is true when every row from the top of the live region
 	// down has just been erased.
 	erased := false
+	// up and lf move the cursor, and keep account of where it goes.
+	up := func(k int) {
+		if k > 0 {
+			b = append(b, CursorUp(k)...)
+			r.follow(-k)
+		}
+	}
+	lf := func() {
+		b = append(b, '\n')
+		r.follow(1)
+	}
 
 	if r.stale {
 		// The terminal was resized: go to the top of what was the
 		// live region, erase every row from there to the bottom of
 		// the screen, and start over.
-		b = append(b, CursorUp(r.rowsAboveCursor())...)
+		up(r.rowsAboveCursor())
 		b = append(b, SaveCursor...)
 		for i := 0; i < r.rows; i++ {
 			if i > 0 {
@@ -319,10 +498,10 @@ func (r *Renderer) paint(commit []rline) error {
 	// moveTo puts the cursor on row k, which exists.
 	moveTo := func(k int) {
 		if k < pos {
-			b = append(b, CursorUp(pos-k)...)
+			up(pos - k)
 		}
 		for ; pos < k; pos++ {
-			b = append(b, '\n')
+			lf()
 		}
 		pos = k
 	}
@@ -330,7 +509,8 @@ func (r *Renderer) paint(commit []rline) error {
 	// its start. At the bottom of the screen the terminal scrolls.
 	newRow := func() {
 		moveTo(have - 1)
-		b = append(b, '\r', '\n')
+		b = append(b, '\r')
+		lf()
 		pos = have
 		have++
 	}
@@ -365,10 +545,11 @@ func (r *Renderer) paint(commit []rline) error {
 	}
 
 	// Where the cursor goes: where it was asked for, or the top left of
-	// the live region when it is hidden or there is no live region.
+	// the live region (its blank rows included) when it is hidden or
+	// there is no live region.
 	row, to := n, 0
 	if r.wantShown && len(vis) > 0 {
-		row += min(max(r.wantRow-(len(r.lines)-len(vis)), 0), len(vis)-1)
+		row += pad + min(max(r.wantRow-(len(r.lines)-len(vis)), 0), len(vis)-1)
 		to = min(r.wantCol, r.cols-1)
 	}
 	if row >= have {
@@ -389,7 +570,7 @@ func (r *Renderer) paint(commit []rline) error {
 	}
 
 	r.body = b
-	r.screen = append(r.screen[:0], vis...)
+	r.screen = append(r.screen[:0], desired[n:]...)
 	r.row, r.col = pos-n, col
 	wasShown := r.shown
 	r.shown = r.wantShown

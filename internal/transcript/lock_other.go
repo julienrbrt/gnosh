@@ -10,5 +10,8 @@ func lockFile(f *os.File) (bool, error) {
 	return true, nil
 }
 
+// Hold cannot lock without flock: it reports true.
+func Hold(f *os.File) bool { return true }
+
 // InUse cannot be told without flock: it reports false.
 func InUse(path string) bool { return false }

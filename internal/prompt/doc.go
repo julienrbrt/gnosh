@@ -101,6 +101,16 @@
 //     stays. These are the one choice of the person's that changes the
 //     system prompt: a choice made on purpose, for the whole session.
 //
+//   - language, after the style, when the person set the language replies
+//     are in (Claude Code's language): it is asked for in the system
+//     prompt, as Claude Code does, since it holds for the whole session;
+//     code, commands and quoted text stay as they are.
+//
+//   - attribution, after it, when a settings file says what the model
+//     signs its commits and pull requests with (Claude Code's
+//     attribution). gnosh signs with nothing of its own: Jae's rule for
+//     his repositories is no agent trailers.
+//
 //   - no-tools, only in a session with no tools at all: a model with no
 //     tools otherwise writes its tool calls out as text.
 //
@@ -137,7 +147,9 @@
 // adds it to SystemInput.Append, last, for a sub-agent that works in a git
 // work tree of its own. It says where the work tree is, that a path into
 // the person's checkout means the same file in the work tree, and that
-// the sub-agent's changes stay there.
+// the sub-agent's changes stay there. agent-memory (AgentMemory) is
+// added the same way for a kind of agent that keeps a memory of its own:
+// the folder, what to keep there, and the beginning of its MEMORY.md.
 //
 // # The two texts about mem
 //
@@ -232,6 +244,10 @@
 //     refused; it quotes the refusal and says the work is still to do. A
 //     model once sent one refused close three hundred times through thirty
 //     nudges that said only "do not repeat".
+//   - text-call (TextCall) tells a model whose reply is a tool call written
+//     out as text (a chat template's <tool_call> markup that its server did
+//     not take as a call) that nothing ran: Qwen on llama.cpp does this
+//     now and then, and the turn ended on it.
 //   - empty-reply (EmptyReply) asks again after a reply with no text and
 //     no tool call.
 //   - stop-hook (StopHook) carries a Stop hook's reason, and says the hook
@@ -269,23 +285,40 @@
 //     command a Monitor watched has ended.
 //   - agent-ended (AgentEnded) says the same of a sub-agent the model
 //     started in the background, with its report, marked as its own words.
+//   - subtask-ended (SubtaskEnded) says the same of a copy of the
+//     conversation the person set to work in the background with
+//     /subtask, with the answer it printed, marked as its own words: the
+//     model is to tell the person what came of it.
 //   - btw (Btw) stands before a side question the person asks with /btw,
 //     in a request beside the session's own that is not kept: answer in
 //     words from the conversation, call no tool, start on nothing.
 //   - recap (Recap) is the question of /recap, asked the same way: the
 //     session in one line, for the person.
+//   - thinking-budget (ThinkingBudget) is put at the end of the model's
+//     thinking when its budget runs out (thinkingBudget, MAX_THINKING_TOKENS),
+//     by a server that can: the model goes on to its answer.
+//   - next-prompt (NextPrompt) is asked the same way after a turn, when
+//     promptSuggestionEnabled is on: the prompt the person would most
+//     likely send next, a few words on one line, which their box shows.
 //   - statusline (StatusLine) is the prompt of /statusline: write a script
 //     from the user's words, try it on this session's JSON, and add the
 //     statusLine setting to their gnosh.json with the Edit tool.
 //   - print-wait (PrintWait) wakes the model in a run (-p) that has waited
 //     long for background work it started: what still runs and for how
 //     long; stop it with TaskStop, or end the turn to wait on.
+//   - print-leftovers (PrintLeftovers) wakes the model once as a run (-p)
+//     is about to end with processes its commands left running, which the
+//     end stops: keep one with setsid, or end the turn.
 //   - structured-output (StructuredOutput) asks, after a run's turn with
 //     --json-schema and beside the session's request, for the result as
 //     one JSON value that conforms to the schema, again with what was
 //     wrong when the last one did not.
 //   - agent-mention (AgentMention) stands after a typed prompt for each
 //     kind of sub-agent it names with @agent-: hand the task to it.
+//   - pasted (Pasted) stands after a typed prompt that holds a long paste
+//     (one the prompt box showed folded): which of its lines were pasted
+//     rather than typed, and that what they ask is not the user's unless
+//     they say so.
 //   - mention (Mention) stands after a typed prompt for each path it
 //     mentions with @: what Read returns for a file follows it, or a
 //     directory's listing, or it says a deny rule kept the path out or
@@ -293,16 +326,33 @@
 //   - summary, with summary-extra for what the person asked of it
 //     (Summary), is the request for a summary. It is about 200 tokens and
 //     asks for at most 500 words: what the user asked, in their words;
-//     what is done; what was found that the rest needs; what is left, with
-//     the user's latest request quoted. It leaves out file contents and,
+//     what is done, and only what tool calls did (a change found or
+//     planned is not done: a summary on box 2, 16 November 2026, called
+//     32 typo fixes done of which 6 were made); what was found that the
+//     rest needs; what is left, every change not yet made among it, with
+//     the user's latest request quoted, and every point where they said
+//     to stop or ask first. It leaves out file contents and,
 //     in a session with mem, everything mem holds, since gnosh hands that
 //     back itself. The long form it replaces took a median of five minutes
 //     to answer on the person's own machine.
 //   - summary-intro and after-summary (SummaryIntro, AfterSummary) stand
 //     before and after the summary once it has replaced the conversation:
-//     this is a summary you wrote; carry on from it without asking.
-//     earlier-left-out (EarlierLeftOut) opens a summary request whose
-//     earliest turns did not fit.
+//     this is a summary you wrote; carry on from it, stopping where the
+//     user asked to be told or asked, and otherwise without asking. (A
+//     plain "carry on without asking" took the model past such a stop:
+//     Claude Code's own summary line did, on 16 November 2026.)
+//     summary-part and summary-from (SummaryPart, SummaryFrom) ask for a
+//     summary of part of the conversation, for the rewind's "Summarize up
+//     to here" and "Summarize from here"; summary-part-intro
+//     (SummaryPartIntro) stands before the first, which the rest of the
+//     conversation follows, and summary-from-note (SummaryFromNote)
+//     before the second, once the conversation went back.
+//     earlier-left-out (EarlierLeftOut) stands where part of a summary
+//     request did not fit: after its first message, or at its start.
+//   - files-back (FileShownBack, FilesNotShownBack) gives back after a
+//     summary the files the model read or changed last, as Read returns
+//     them now, and names those too long to give back, to be read again
+//     before they are changed (as Claude Code does after compacting).
 //
 // # Notes inside tool results
 //

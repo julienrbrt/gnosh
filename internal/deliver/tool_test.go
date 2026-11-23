@@ -294,6 +294,9 @@ func TestDeliverRefusals(t *testing.T) {
 		{"an address of another kind", map[string]any{"label": "x", "target": "s3://bucket/ad.mp4"}, []string{"s3://bucket/ad.mp4 is neither", "http:// or https://"}},
 		{"an address with no host", map[string]any{"label": "x", "target": "https:///landing"}, []string{"cannot be read as an address"}},
 		{"a target with a line break", map[string]any{"label": "x", "target": "a\nb"}, []string{"holds a line break"}},
+		{"a link that turns its text around", map[string]any{"label": "x", "target": "https://example.com/\u202egpj.exe"}, []string{"holds a line break or another character that cannot be seen"}},
+		{"a path with a zero-width space", map[string]any{"label": "x", "target": "notes\u200b.md"}, []string{"cannot be seen"}},
+		{"a host with a hidden character", map[string]any{"label": "x", "target": "a.mp4", "host": "ren\u200bder"}, []string{"the host holds a character that cannot be seen"}},
 		{"a machine that is not declared", map[string]any{"label": "x", "target": "a.mp4", "host": "elsewhere"},
 			[]string{`the host "elsewhere" is not a machine declared for this session`, "render (root@203.0.113.7), web (deploy@203.0.113.8)", "Leave host out"}},
 		{"a file that is not there on a host", map[string]any{"label": "x", "target": "renders/missing.mp4", "host": "render"},
@@ -607,5 +610,39 @@ func TestLabels(t *testing.T) {
 	}
 	if d, ok := l.get("DEMO VIDEO"); !ok || d.Path != "/out/demo.mp4" {
 		t.Errorf("an entry by its label: %+v, %v", d, ok)
+	}
+}
+
+// A call is held to the file it was judged for: a link changed between
+// the question and the run makes its target name another file, which is
+// not delivered (the deliverables review of 2026-11-19).
+func TestDeliverIsHeldToTheFileItWasJudgedFor(t *testing.T) {
+	b := newBench(t, "127.0.0.1:0", 0)
+	b.w.Write("one.md", "one")
+	b.w.Write("two.md", "two")
+	if err := os.Symlink("one.md", b.w.Path("report.md")); err != nil {
+		t.Skip("no links here:", err)
+	}
+	input, err := json.Marshal(map[string]any{"label": "report", "target": "report.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := core.ToolCall{ID: "call-judged", Name: app.DeliverToolName, Input: input}
+	if _, err := b.tool.Describe(c, b.env); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(b.w.Path("report.md"))
+	if err := os.Symlink("two.md", b.w.Path("report.md")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := b.tool.Run(t.Context(), c, b.env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := core.TextOf(res.Content); !res.IsError || !strings.Contains(got, "the call was judged for the file "+b.w.Path("one.md")) {
+		t.Errorf("a call whose link changed after the question: %v %q", res.IsError, got)
+	}
+	if got := b.list(); got != "" {
+		t.Errorf("the list holds %q", got)
 	}
 }

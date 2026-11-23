@@ -128,7 +128,7 @@ effect with `-p`.
 | Flag | Value | Meaning | Pri |
 | :- | :- | :- | :- |
 | `--model` | alias or full model name | Model for this session. Overrides the `model` setting and the `ANTHROPIC_MODEL` environment variable. | P0 (gnosh model names) |
-| `--fallback-model` | comma-separated list | Models to fall back to, in order, when the primary is overloaded or unavailable; the primary is retried at the start of each user turn. Overrides the `fallbackModel` setting. | P2 |
+| `--fallback-model` | comma-separated list | Models to fall back to, in order, when the primary is overloaded or unavailable; the primary is retried at the start of each user turn. Overrides the `fallbackModel` setting. | P2 (built: DECISIONS 140) |
 | `--effort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | Reasoning effort for the session; available levels depend on the model. Not persisted. (`ultracode` is an extra Anthropic value: not adopted.) | P2 |
 | `--betas` | list | Anthropic API beta headers. | not adopted |
 
@@ -207,12 +207,14 @@ Combination rules (all four text flags work in interactive and print mode):
 | `--bg`, `--background` | — | Start as a background session and return at once. Cannot be combined with `-p`. | P2 (own design) |
 
 Anthropic-only flags, listed so nobody re-adds them by accident: `--advisor`,
-`--brief`, `--channels`, `--chrome`/`--no-chrome`, `--cloud`/`--remote`,
+`--brief`, `--chrome`/`--no-chrome`, `--cloud`/`--remote`,
 `--desktop`, `--environment`, `--ref`, `--file`, `--ide`, `--remote-control`
 (`--rc`), `--remote-control-session-name-prefix`, `--restricted`,
-`--teleport`, `--teammate-mode`, `--tmux`, `--exec`,
-`--dangerously-load-development-channels`. (`--enable-auto-mode` was removed
-in v2.1.111.)
+`--teleport`, `--teammate-mode`, `--tmux`, `--exec`. (`--enable-auto-mode`
+was removed in v2.1.111.) `--channels` and
+`--dangerously-load-development-channels` were on this list; gnosh has them
+since spec/DECISIONS.md 82, for channels that are MCP servers of one's own
+(`server:<name>`).
 
 ## 4. Print mode in detail
 
@@ -384,7 +386,7 @@ names above (Jae's call; see `settings.md`).
 - Accounts and login: `auth`, `setup-token`, `--betas`, OAuth, keychain.
 - Anthropic cloud and apps: `--cloud`, `--remote`, `--teleport`,
   `--environment`, `--ref`, `--desktop`, `--chrome`, `--ide`,
-  `--remote-control`, `--channels`, `gateway`, `self-hosted-runner`,
+  `--remote-control`, `gateway`, `self-hosted-runner`,
   `ultrareview`, `--from-pr`, `--file` (file IDs from Anthropic's API).
 - Plugins and their marketplace: `plugin`, `--plugin-dir`, `--plugin-url`.
 - `--advisor`, `--brief`, `--prompt-suggestions`, `--teammate-mode`,

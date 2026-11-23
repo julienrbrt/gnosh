@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -49,7 +50,7 @@ var keyActions = map[string]keyAction{
 	"history:previous":         {namedKey(term.KeyUp, 0)},
 	"history:next":             {namedKey(term.KeyDown, 0)},
 	"chat:cancel":              {namedKey(term.KeyEscape, 0)},
-	"chat:clearInput":          {ctrlKey('l')},
+	"chat:clearInput":          {}, // no key of gnosh's: doKeyAction clears the box
 	"chat:killAgents":          {ctrlKey('x'), ctrlKey('k')},
 	"chat:cycleMode":           {namedKey(term.KeyTab, term.ModShift)},
 	"chat:modelPicker":         {altKey('p')},
@@ -267,7 +268,7 @@ func (s *session) keysNow() {
 		return
 	}
 	f.mod, f.size = info.ModTime(), info.Size()
-	data, err := os.ReadFile(path)
+	data, err := readKeyFile(path, info)
 	if err != nil {
 		s.keys = f
 		return
@@ -284,7 +285,8 @@ func (s *session) keysNow() {
 // whether it did: the action's own keys go to where they are taken, past
 // the bindings, and a key taken away does nothing.
 func (s *session) rebound(k term.Key) bool {
-	if s.q != nil {
+	if s.q != nil || s.agents != nil {
+		// (The agent view's keys are its own.)
 		return false
 	}
 	s.keysNow()
@@ -310,21 +312,30 @@ func (s *session) rebound(k term.Key) bool {
 			s.doKeyAction(action)
 			return true
 		}
-		// No chord of the person's: the first key goes where it would
-		// have gone, and this one after it.
-		s.passKey(*held)
-	} else {
-		for _, cx := range []string{ctx, "Global"} {
-			for pair := range b.chords[cx] {
-				if pair[0] == c {
-					held := k
-					s.keyHeld, s.keyHeldAt = &held, s.now()
-					s.flash(k.String() + " … (the next key ends the chord)")
-					return true
-				}
+		// No chord of the person's: the first key does what it does on
+		// its own (its binding, nothing when it was taken away, or what
+		// gnosh does with it), and this one after it.
+		if !s.boundKey(ctx, canonKey(*held)) {
+			s.passKey(*held)
+		}
+	}
+	for _, cx := range []string{ctx, "Global"} {
+		for pair := range b.chords[cx] {
+			if pair[0] == c {
+				held := k
+				s.keyHeld, s.keyHeldAt = &held, s.now()
+				s.flash(keyLabel(k) + " … (the next key ends the chord)")
+				return true
 			}
 		}
 	}
+	return s.boundKey(ctx, c)
+}
+
+// boundKey carries out the action the keybindings give the key c on its
+// own, in the context or Global, and reports whether they give one.
+func (s *session) boundKey(ctx string, c term.Key) bool {
+	b := s.keys.b
 	action, ok := b.byCtx[ctx][c]
 	if !ok {
 		action, ok = b.byCtx["Global"][c]
@@ -336,8 +347,19 @@ func (s *session) rebound(k term.Key) bool {
 	return true
 }
 
+// dropHeldKey forgets the first key of a chord when something other than
+// a key comes (a paste, the mouse) or a question opens: what comes next
+// is not the chord's second key.
+func (s *session) dropHeldKey() {
+	s.keyHeld = nil
+}
+
 // passKey hands a key on past the bindings, to where it is taken.
 func (s *session) passKey(k term.Key) {
+	if s.agents != nil {
+		s.agentsInput(k)
+		return
+	}
 	if s.view != nil {
 		s.viewInput(k)
 	} else {
@@ -359,8 +381,12 @@ func (s *session) doKeyAction(action string) {
 	switch name, command := strings.CutPrefix(action, "command:"); {
 	case action == "":
 		// Taken away.
+	case action == "chat:clearInput":
+		if s.view == nil && s.agents == nil {
+			s.ed.Clear()
+		}
 	case command:
-		if s.view == nil {
+		if s.view == nil && s.agents == nil {
 			s.command(editor.Draft{Text: "/" + name})
 		}
 	default:
@@ -377,6 +403,25 @@ var keybindingsWords = map[string]bool{"/keybindings": true}
 // openKeybindings is /keybindings typed alone: the person's keybindings
 // file, made with nothing bound when it is not there, opens in their
 // editor, and is read again as they leave it.
+// keyFileMost is the most of the keybindings file that is read.
+const keyFileMost = 1 << 20
+
+// readKeyFile reads the keybindings file, which info describes: only a
+// regular file, and at most keyFileMost of it. It is read as keys come,
+// and a named pipe in its place stopped the keys (the status line review
+// of 2026-11-19).
+func readKeyFile(path string, info os.FileInfo) ([]byte, error) {
+	if !info.Mode().IsRegular() {
+		return nil, errors.New(path + " is not a file")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, keyFileMost))
+}
+
 func (s *session) openKeybindings(line string) bool {
 	path := s.info.Keybindings
 	if path == "" {
@@ -386,7 +431,15 @@ func (s *session) openKeybindings(line string) bool {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return false
 		}
-		if err := os.WriteFile(path, []byte(app.KeybindingsTemplate), 0o600); err != nil {
+		// Made new or not at all: a link left where the file was is not
+		// followed to write the template somewhere else (the status line
+		// review of 2026-11-19).
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return false
+		}
+		_, werr := f.WriteString(app.KeybindingsTemplate)
+		if cerr := f.Close(); werr != nil || cerr != nil {
 			return false
 		}
 	}
@@ -396,4 +449,164 @@ func (s *session) openKeybindings(line string) bool {
 		s.keysNow()
 	}
 	return true
+}
+
+// keyActionWords say what each action does, in the words of the list of
+// keys (help).
+var keyActionWords = map[string]string{
+	"app:redraw":               "draw the bottom of the screen again",
+	"app:toggleTodos":          "hide or show the task list",
+	"app:toggleTranscript":     "the whole transcript: every thought, call and result",
+	"history:search":           "search the history",
+	"history:previous":         "the history, back",
+	"history:next":             "the history, forward",
+	"chat:cancel":              "stop the turn",
+	"chat:clearInput":          "clear the box",
+	"chat:killAgents":          "twice within 3 seconds: stop the background sub-agents",
+	"chat:cycleMode":           "the next permission mode",
+	"chat:modelPicker":         "switch the model, keeping what is typed",
+	"chat:thinkingToggle":      "thinking on or off (or the next level)",
+	"chat:submit":              "send",
+	"chat:sendNow":             "while a turn runs: send, and have it read now, not after the turn",
+	"chat:newline":             "new line",
+	"chat:undo":                "undo in the box",
+	"chat:externalEditor":      "edit the prompt in your editor",
+	"chat:stash":               "put the prompt aside, and bring it back",
+	"task:background":          "move the running command to the background",
+	"transcript:exit":          "leave the transcript",
+	"transcript:toggleShowAll": "in the transcript: all of each long part",
+}
+
+// ownKeys are the rows of the list of keys for what the keybindings file
+// binds, as gnosh takes it now: each key or chord, and what it does.
+func (s *session) ownKeys() [][2]string {
+	s.keysNow()
+	if s.keys == nil {
+		return nil
+	}
+	b := s.keys.b
+	words := func(action, ctx string) string {
+		w := ""
+		switch name, command := strings.CutPrefix(action, "command:"); {
+		case action == "":
+			w = "taken away: it does nothing"
+		case command:
+			w = "runs /" + name
+		default:
+			w = keyActionWords[action]
+			if w == "" {
+				w = action
+			}
+		}
+		if ctx == "Transcript" {
+			w += " (in the transcript)"
+		}
+		return w
+	}
+	var rows [][2]string
+	for _, ctx := range []string{"Global", "Chat", "Transcript"} {
+		var one [][2]string
+		for k, action := range b.byCtx[ctx] {
+			one = append(one, [2]string{keyLabel(k), words(action, ctx)})
+		}
+		for pair, action := range b.chords[ctx] {
+			one = append(one, [2]string{keyLabel(pair[0]) + " " + keyLabel(pair[1]), words(action, ctx)})
+		}
+		slices.SortFunc(one, func(a, b [2]string) int { return strings.Compare(a[0], b[0]) })
+		rows = append(rows, one...)
+	}
+	return rows
+}
+
+// keyLabel writes a key as the list of keys writes one: Ctrl+Y, Alt+P,
+// Shift+Tab, Ctrl+Enter, Esc, F5, Space.
+func keyLabel(k term.Key) string {
+	var parts []string
+	for _, m := range []struct {
+		bit  term.Mod
+		name string
+	}{{term.ModCtrl, "Ctrl"}, {term.ModAlt, "Alt"}, {term.ModShift, "Shift"}, {term.ModSuper, "Super"}, {term.ModHyper, "Hyper"}, {term.ModMeta, "Meta"}} {
+		if k.Mod&m.bit != 0 {
+			parts = append(parts, m.name)
+		}
+	}
+	name := ""
+	switch {
+	case k.Code == term.KeyRune && k.Rune == ' ':
+		name = "Space"
+	case k.Code == term.KeyRune && k.Rune != 0:
+		name = string(k.Rune)
+		if len(parts) > 0 {
+			name = strings.ToUpper(name)
+		}
+	case k.Code == term.KeyRune:
+		name = k.Text
+	default:
+		name = k.Code.String()
+		if name != "" {
+			name = strings.ToUpper(name[:1]) + name[1:]
+		}
+	}
+	return strings.Join(append(parts, name), "+")
+}
+
+// keyHint is the key a hint names for action: the one the person bound to
+// it in the keybindings file (a key of its own before a chord), else
+// gnosh's own, dflt; "" when the file gives gnosh's key, or chord, to
+// something else or takes it away, and binds no other, so that no hint
+// names a key that does not do it. Claude Code's hints follow the file so
+// (2.1.329).
+func (s *session) keyHint(action, dflt string) string {
+	s.keysNow()
+	if s.keys == nil {
+		return dflt
+	}
+	b := s.keys.b
+	ctxs := []string{"Chat", "Global"}
+	if strings.HasPrefix(action, "transcript:") {
+		ctxs = []string{"Transcript", "Global"}
+	}
+	own := keyActions[action]
+	var keys, chords []string
+	lost := false
+	for _, ctx := range ctxs {
+		for k, a := range b.byCtx[ctx] {
+			switch {
+			case a == action:
+				keys = append(keys, keyLabel(k))
+			case len(own) == 1 && canonKey(own[0]) == k:
+				lost = true
+			}
+		}
+		for p, a := range b.chords[ctx] {
+			switch {
+			case a == action:
+				chords = append(chords, keyLabel(p[0])+" "+keyLabel(p[1]))
+			case len(own) == 2 && canonKey(own[0]) == p[0] && canonKey(own[1]) == p[1]:
+				lost = true
+			}
+		}
+	}
+	slices.Sort(keys)
+	slices.Sort(chords)
+	switch {
+	case len(keys) > 0:
+		return keys[0]
+	case len(chords) > 0:
+		return chords[0]
+	case lost:
+		return ""
+	}
+	return dflt
+}
+
+// transcriptHint is what names the key that opens the transcript view in
+// a hint: sep, the key and what follows ("shows all of it"), or "" when
+// no key opens it.
+func (s *session) transcriptHint(sep, what string) string {
+	k := s.keyHint("app:toggleTranscript", "Ctrl+O")
+	if k == "" {
+		return ""
+	}
+	return sep + k + " " + what
 }

@@ -20,7 +20,7 @@ import (
 //
 // mem says the session has mem, so that a summary leaves out what mem
 // hands back by itself.
-func loopTexts(set *prompt.Set, mem bool) (agent.Texts, error) {
+func loopTexts(set *prompt.Set, mem bool, path string) (agent.Texts, error) {
 	var t agent.Texts
 	var firstErr error
 	format := func(dst *string, name string, holes map[string]string) {
@@ -36,11 +36,15 @@ func loopTexts(set *prompt.Set, mem bool) (agent.Texts, error) {
 	yes := "yes"
 
 	format(&t.EmptyNudge, "empty-reply", nil)
+	format(&t.TextCallNudge, "text-call", nil)
 	// The loop gives: how many rounds were the same, how many were looked
 	// at, and the calls.
 	format(&t.RepeatNudge, "repeat", map[string]string{"calls": "%[3]s"})
 	// The loop gives: how many rounds were looked at, and the two calls.
 	format(&t.RepeatPair, "repeat", map[string]string{"calls": "%[2]s"})
+	// The loop gives: how many rounds were looked at, how many make the
+	// cycle, and its rounds.
+	format(&t.RepeatCycle, "repeat", map[string]string{"calls": "%[3]s"})
 	// The loop gives: the marker, and how many times in a row.
 	format(&t.Checkpoint, "checkpoint", map[string]string{"marker": "%[1]s", "count": "%[2]d"})
 	// The loop gives: the check's name, and the error.
@@ -61,7 +65,9 @@ func loopTexts(set *prompt.Set, mem bool) (agent.Texts, error) {
 	format(&t.SummaryRequest, "summary", summary)
 	format(&t.SummaryExtra, "summary-extra", map[string]string{"instructions": "%[1]s"})
 	format(&t.SummaryIntro, "summary-intro", nil)
-	format(&t.SummaryAfter, "after-summary", nil)
+	// The session's file, which holds the conversation as it was, for
+	// what the summary left out (as Claude Code names its transcript).
+	format(&t.SummaryAfter, "after-summary", map[string]string{"path": path})
 	format(&t.TrimNote, "earlier-left-out", nil)
 
 	format(&t.LoopContinue, "loop", map[string]string{"marker": prompt.LoopDone})
@@ -84,7 +90,8 @@ func loopTexts(set *prompt.Set, mem bool) (agent.Texts, error) {
 
 // maxResultBytes is the most text one tool result may carry to the model,
 // whatever the tool itself let through. Every tool of gnosh's own has a
-// smaller limit; this one is the net under them all.
+// smaller limit (Read's, even with allow_large, is a tenth under it:
+// readResultMost); this one is the net under them all.
 const maxResultBytes = 400_000
 
 // markEscape is the mark written as a JSON escape, which is how a model
@@ -97,7 +104,7 @@ const markEscape = `\` + `u200b`
 // that made text harmless on its way to the model are taken out of every
 // string the model wrote, so that the tool acts on the text as it was.
 func cleanInput(call core.ToolCall) json.RawMessage {
-	out, ok := rewriteJSONStrings(call.Input, prompt.Undefuse, func(raw []byte) bool {
+	out, ok := prompt.RewriteJSONStrings(call.Input, prompt.Undefuse, func(raw []byte) bool {
 		return bytes.Contains(raw, []byte(prompt.Mark)) || containsFold(raw, markEscape)
 	})
 	if !ok {
@@ -178,9 +185,7 @@ func defuseBlocks(blocks []core.Block, own bool) {
 				b.Text = prompt.Defuse(b.Text)
 			}
 		case core.BlockToolUse:
-			if out, ok := rewriteJSONStrings(b.Input, prompt.Defuse, func(raw []byte) bool {
-				return bytes.IndexByte(raw, '<') >= 0 || containsFold(raw, `<`)
-			}); ok {
+			if out, ok := prompt.RewriteJSONStrings(b.Input, prompt.Defuse, prompt.MayHoldControl); ok {
 				b.Input = out
 			}
 		case core.BlockToolResult:
@@ -193,110 +198,4 @@ func defuseBlocks(blocks []core.Block, own bool) {
 // and plain.
 func containsFold(raw []byte, s string) bool {
 	return bytes.Contains(bytes.ToLower(raw), []byte(strings.ToLower(s)))
-}
-
-// rewriteJSONStrings returns raw, one JSON value, with f applied to every
-// string in it, keys included. The value is written again token by token,
-// so that an object that names a key twice still names it twice: the
-// loop's own check for that comes afterwards and must see it. needed is
-// asked first whether raw can hold anything f would change; when it says
-// no, or raw cannot be read, ok is false and raw is to be used as it is.
-func rewriteJSONStrings(raw json.RawMessage, f func(string) string, needed func([]byte) bool) (json.RawMessage, bool) {
-	if len(raw) == 0 || !needed(raw) {
-		return nil, false
-	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var out bytes.Buffer
-	enc := json.NewEncoder(&out)
-	enc.SetEscapeHTML(false)
-	str := func(s string) error {
-		if err := enc.Encode(s); err != nil {
-			return err
-		}
-		out.Truncate(out.Len() - 1) // the line break Encode adds
-		return nil
-	}
-	type frame struct {
-		object bool
-		n      int  // how many members or items have been started
-		key    bool // the next string is a key
-	}
-	var stack []*frame
-	// value is called before a value is written: it writes the comma that
-	// parts the items of a list, and notes that an object's next string
-	// is a key again.
-	value := func() {
-		if len(stack) == 0 {
-			return
-		}
-		top := stack[len(stack)-1]
-		if top.object {
-			top.key = true
-			return
-		}
-		if top.n > 0 {
-			out.WriteByte(',')
-		}
-		top.n++
-	}
-	changed := false
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			break
-		}
-		switch v := tok.(type) {
-		case json.Delim:
-			switch v {
-			case '{', '[':
-				value()
-				out.WriteByte(byte(v))
-				stack = append(stack, &frame{object: v == '{', key: v == '{'})
-			default:
-				if len(stack) == 0 {
-					return nil, false
-				}
-				stack = stack[:len(stack)-1]
-				out.WriteByte(byte(v))
-			}
-		case string:
-			s := f(v)
-			changed = changed || s != v
-			if n := len(stack); n > 0 && stack[n-1].object && stack[n-1].key {
-				top := stack[n-1]
-				if top.n > 0 {
-					out.WriteByte(',')
-				}
-				top.n++
-				top.key = false
-				if err := str(s); err != nil {
-					return nil, false
-				}
-				out.WriteByte(':')
-				continue
-			}
-			value()
-			if err := str(s); err != nil {
-				return nil, false
-			}
-		case json.Number:
-			value()
-			out.WriteString(v.String())
-		case bool:
-			value()
-			if v {
-				out.WriteString("true")
-			} else {
-				out.WriteString("false")
-			}
-		case nil:
-			value()
-			out.WriteString("null")
-		}
-	}
-	if len(stack) != 0 || !changed || !json.Valid(out.Bytes()) {
-		return nil, false
-	}
-	return out.Bytes(), true
 }

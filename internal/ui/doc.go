@@ -39,10 +39,8 @@
 //	                       person wants gone: it is shown nowhere and kept
 //	                       in no history)
 //
-// Blocks stand under each other with no blank line between them: each
-// begins with a mark of its own (the prompt's >, a thought's ~, a
-// command's $). The only empty lines on the screen are the answer's own,
-// between its paragraphs.
+// Blocks stand a blank line apart, except one-line tool calls and
+// notices, which stand under each other.
 //
 // A tool call's block is headed by what the call does, not by a name and a
 // spinner: a command line behind "$" (behind the machine's name, when it
@@ -72,16 +70,32 @@
 // Below the committed text are a few rows that are redrawn in place
 // (term.Renderer.SetLive). From its first row to its last:
 //
+//	a blank row
 //	what is still being written: the lines of the answer that may still
 //	  change, the last rows of the reasoning while it is folded, and each
 //	  call that is being written or is running, with the last rows of its
 //	  output
+//	a blank row
 //	one line that says what gnosh is doing or waiting for, while it is busy
+//	the session's task list, unless Ctrl+T has put it out of sight
 //	the prompts and commands that wait for their turn
 //	the question, when one is put; otherwise the prompt box
-//	the session's task list, unless Ctrl+T has put it out of sight
 //	the status line
 //	a short notice that a key called for, for a few seconds, wrapped
+//
+// The prompt box and the lines that go with it are the last rows, and the
+// task list stands above them, as in Claude Code (Jae, 21 November 2026,
+// over ssh to the Mac Studio: "the txt field (and attached lines ...) do
+// not stay on the bottom of the screen... and the todos should be above
+// the prompt not below it... things like that. vs claude code"). The
+// region stands on the bottom rows of the screen from the first frame,
+// whatever is above it (Jae, 22 November 2026: "the text field is not
+// fixed on bottom of screen"): the renderer is told which row the cursor
+// is on (the terminal is asked when gnosh starts, and again after a resize
+// or after the screen was lent to the shell or an editor), and keeps the
+// region's last row on the screen's last row, with blank rows above it
+// that the next committed lines fill. The conversation fills the screen
+// from the top down to the region, as in a chat.
 //
 // The line that says what gnosh is doing is always the truth as the
 // session reports it, in plain words with the time that state has lasted:
@@ -89,11 +103,31 @@
 // has to read), the model is thinking, is writing, is writing a call;
 // running a command, by its own words, or several tools, by their names;
 // waiting for the person; waiting so many seconds to try a failed request
-// again; writing a summary; stopping. Its mark moves while gnosh works: a
-// small comet of sparkle marks in the palette's colours, one step about
-// every tenth of a second (Jae, 14 November 2026: "i don't like that
-// there's no spinner now"). With no colour, and while a question waits for
-// the person, the mark stands still.
+// again; writing a summary; stopping. With colour the line moves while
+// gnosh works (Jae, 14 November 2026: "i don't like that there's no
+// spinner now"), in two parts (fall.go). Before the words stands one mark,
+// a spark that swells and dwindles in its one cell. The words themselves
+// stand in a grey, and colour falls through them to the right as if
+// gravity ran sideways: a drop of it starts at the first letter, slowly,
+// gathers speed all the way along the line and leaves at its end, its
+// tail stretching as it goes; the letters stay the letters. The fall says
+// how long the model has been in one thought. At first, and whenever the
+// model is not thinking, one pale drop at a time crosses the words. From
+// three seconds of one unbroken thought on it deepens: first the drops
+// take colours of their own, then more of them fall under a stronger
+// pull, until at fifteen seconds three run through the line at once in
+// the blue-green, the purple, the hot pink and the gold, with glints
+// among them, and the line's words are "is deep in thought". When the
+// thought is over the fall grows calm again within a second and a half.
+// (Jae, 18 November 2026: "start with more boring bland even colors first
+// ... dropping rightward, as if accelerating to the right, like gravity
+// goes sideways, and when 'deep in thought', more things drop faster with
+// higher acceleration", and then: "the first part is like claude, i think
+// a single letter, and then the second part is the text that starts
+// non-white and the whole text is animated. the thing that moves rightward
+// is a different color of the text, but the text is always the same".)
+// With no colour, and while a question waits for the person, the plain
+// mark stands still before plain words.
 // It is there only while the session is busy: there is never a "working"
 // line with nothing in flight, and should the event that says the session
 // went idle ever be missed, the session's own word is asked. When it is
@@ -113,7 +147,8 @@
 // one by one, the least needed first and the permission mode last.
 //
 // The task list is the session's own (app.TasksEvent: what mem holds as
-// the frame's tasks). It stands under the prompt box, a row a task:
+// the frame's tasks). It stands above the prompt box, under the row that
+// says what gnosh is doing, a row a task, as Claude Code shows its list:
 // "[x]" for one that is done, "[>]" for the one in hand, in the words it
 // has while it is being done, "[ ]" for one still to do. It takes eight
 // rows at most; a longer list shows the tasks around the one in hand and
@@ -127,7 +162,8 @@
 //
 // Something moves from the live region to the scrollback in one step: the
 // lines are committed and the next live region no longer holds them, in
-// the same frame. Nothing is in both, and nothing is in neither.
+// the same frame and the same write (term.Renderer.CommitLive). Nothing is
+// in both, and nothing is in neither, not even for a moment on the screen.
 //
 // # Typing while the model works
 //
@@ -204,6 +240,8 @@
 //	                       comes back into the box with a line that says so (cc 2.6)
 //	?                      in an empty box: write the keys into the scrollback (cc 2.2)
 //	Ctrl+G, Ctrl+X Ctrl+E  edit the box's text in the person's own editor (cc 2.3)
+//	Ctrl+V                 the picture on this machine's clipboard into the box, as @image-N
+//	                       (cc 2.7); a paste of picture files' paths becomes @ mentions of them
 //	Ctrl+X Ctrl+K          twice within three seconds: stop every sub-agent that runs in the
 //	                       background; the background commands go on (cc 3)
 //	every other key        as in the editor: see its table
@@ -280,7 +318,7 @@
 // box, the questions, Markdown and diffs inside it, all made from one
 // Palette. The default is gnosh's own: prose and output in the terminal's
 // own colour, purple for the marks gnosh draws itself, the blue-green of
-// gnosh.ai for the prompt mark, the pointer and the head of the spinner,
+// gnosh.ai for the prompt mark, the pointer and the working mark,
 // hot pink as the one accent on what is chosen, grey for what is not the
 // text itself, and nothing filled in, blurred or dimmed into a background.
 // The text colours are middle tones that read on a dark and on a light
@@ -306,7 +344,7 @@
 //     the session's first prompt, from app.FrontendInfo's field Prompt.
 //   - shell lines ("!"): a method Shell(command string) error.
 //   - Ctrl+B, and the part of Ctrl+Enter that moves commands aside: a
-//     method Background(callID string) bool.
+//     method Background(callID, tool string) bool.
 //   - the prompts of earlier sessions in the history: a method
 //     History() []string (oldest first). Without it, Up and Ctrl+R reach
 //     this session's prompts only.
@@ -322,6 +360,9 @@
 //   - /mcp with nothing after it, the picker: a method MCPChoices()
 //     []app.MCPChoice; what is done to a server is the command /mcp
 //     reconnect, disable or enable and its name.
+//   - /hooks with nothing after it, a read-only browser: a method
+//     HookChoices() ([]app.HookChoice, string), the hooks in force and a
+//     note on those that are not.
 //   - /memory with nothing after it, the picker: a method MemoryFiles()
 //     []app.MemoryFile; the one picked opens in the editor (host.editFile).
 //   - /model with nothing after it, the picker: a method

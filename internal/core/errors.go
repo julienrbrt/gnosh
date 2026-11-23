@@ -52,6 +52,12 @@ type ProviderError struct {
 	Timeout string
 	// Body is the start of the raw response, kept for the log.
 	Body string
+	// Tokens and Window are, for ErrContextTooLong, what the provider
+	// said of the refused request when it said: how many tokens it
+	// counted in it, and how many its model holds (llama.cpp's
+	// n_prompt_tokens and n_ctx; the numbers in vLLM's, OpenAI's and
+	// Anthropic's messages). Zero when it did not say.
+	Tokens, Window int
 	// Err is the underlying error, if there was one.
 	Err error
 }

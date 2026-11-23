@@ -596,3 +596,56 @@ func FuzzStyle(f *testing.F) {
 		}
 	})
 }
+
+func TestBlend(t *testing.T) {
+	red, blue := RGB(255, 0, 0), RGB(0, 0, 255)
+	black, white := RGB(0, 0, 0), RGB(255, 255, 255)
+	tests := []struct {
+		name     string
+		from, to Color
+		t        float64
+		want     Color
+	}{
+		{"the start", red, blue, 0, red},
+		{"before the start", red, blue, -3, red},
+		{"the end", red, blue, 1, blue},
+		{"past the end", red, blue, 7, blue},
+		{"not a number", red, blue, math.NaN(), red},
+		// The same colours a gradient of the two has there: in Oklab, where
+		// the middle of black and white is a middle grey.
+		{"half way, in Oklab", black, white, 0.5, RGB(99, 99, 99)},
+		{"a third", red, blue, 1.0 / 3, RGB(179, 79, 128)},
+		{"two thirds", red, blue, 2.0 / 3, RGB(101, 78, 194)},
+		{"a colour with itself", red, red, 0.4, red},
+		{"ansi and palette colours by their xterm values", BrightRed, Indexed(21), 1.0 / 3, RGB(179, 79, 128)},
+		{"the ends are given back as they were", BrightRed, Indexed(21), 1, Indexed(21)},
+		// The terminal's own colour has no place to blend from.
+		{"from the default, early", Default, blue, 0.49, Default},
+		{"from the default, late", Default, blue, 0.5, blue},
+		{"to the default, early", red, Default, 0.2, red},
+		{"to the default, late", red, Default, 0.8, Default},
+		{"a colour no constructor made", Color(0xFF000000), blue, 0.2, Default},
+	}
+	for _, tt := range tests {
+		if got := Blend(tt.from, tt.to, tt.t); got != tt.want {
+			t.Errorf("%s: Blend(%v, %v, %v) = %v, want %v", tt.name, tt.from, tt.to, tt.t, got, tt.want)
+		}
+	}
+	// Along the way the lightness only rises, as a gradient's does (the
+	// darkest steps round to the same eight bits).
+	last, rises := 0.0, 0
+	for i := 0; i <= 20; i++ {
+		r, g, b, _ := Blend(black, white, float64(i)/20).rgb()
+		l := toLab(r, g, b).l
+		switch {
+		case l < last:
+			t.Fatalf("at %d/20 from black to white the lightness is %v, after %v", i, l, last)
+		case l > last:
+			rises++
+		}
+		last = l
+	}
+	if rises < 15 || last < 0.999 {
+		t.Errorf("from black to white the lightness rose %d times in 20 steps, to %v", rises, last)
+	}
+}

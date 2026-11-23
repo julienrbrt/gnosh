@@ -1,0 +1,21 @@
+gnosh mcp login
+
+  Sign in to a server at a URL that wants it. gnosh says the address to sign
+  in at, and opens a browser there when it runs at a desktop (not over ssh,
+  and never with --no-browser). When the browser cannot come back to this
+  machine, paste the address it tried to open, and Enter. The sign-in is kept
+  for every session.
+
+  Not built yet in this build of gnosh: typing it stops with a message that
+  says so.
+
+Usage
+  gnosh mcp login [flags] <name>
+
+Flags
+  --no-browser
+      Open no browser: only say the address to sign in at. (Not built yet.)
+  --cwd <dir>
+      Work in this folder instead of the current one.
+  -h, --help
+      Show help: gnosh's, or after a command's name that command's.

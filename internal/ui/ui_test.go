@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -656,7 +657,7 @@ func TestAskBefore(t *testing.T) {
 			{Key: "yes", Label: "Yes: use this folder's settings"},
 		},
 	}
-	ask := func(keys string) (agent.Answer, error, *loop) {
+	ask := func(keys string) (agent.Answer, *loop, error) {
 		at := &clock{at: stamp}
 		l := &loop{t: t, ft: newFakeTerm(80, 30, vtest.AllAnswers), c: newControls(), now: at.Now}
 		l.u = l.make()
@@ -680,14 +681,14 @@ func TestAskBefore(t *testing.T) {
 		l.keys(keys)
 		select {
 		case r := <-got:
-			return r.ans, r.err, l
+			return r.ans, l, r.err
 		case <-time.After(20 * time.Second):
 			t.Fatal("the question was not answered")
 		}
-		return agent.Answer{}, nil, l
+		return agent.Answer{}, l, nil
 	}
 
-	ans, err, l := ask(`<Enter>`)
+	ans, l, err := ask(`<Enter>`)
 	if err != nil || ans.Choice != "no" {
 		t.Fatalf("Enter answered %+v, %v: no must be first", ans, err)
 	}
@@ -697,13 +698,13 @@ func TestAskBefore(t *testing.T) {
 	if text := l.ft.text(); !strings.Contains(text, "? Trust this folder? No: start with my own settings only") || strings.Contains(text, "Enter choose") {
 		t.Errorf("after the question the terminal holds:\n%s", text)
 	}
-	if ans, err, _ = ask(`<Down> <Enter>`); err != nil || ans.Choice != "yes" {
+	if ans, _, err = ask(`<Down> <Enter>`); err != nil || ans.Choice != "yes" {
 		t.Fatalf("Down Enter answered %+v, %v", ans, err)
 	}
-	if ans, err, _ = ask(`<Esc>`); err != nil || ans.Choice != "no" {
+	if ans, _, err = ask(`<Esc>`); err != nil || ans.Choice != "no" {
 		t.Fatalf("Esc answered %+v, %v", ans, err)
 	}
-	if _, err, l = ask(`<Ctrl+C>`); err == nil {
+	if _, l, err = ask(`<Ctrl+C>`); err == nil {
 		t.Fatal("Ctrl+C answered the question")
 	}
 	if l.ft.closed != 1 {
@@ -717,6 +718,68 @@ func TestAskBefore(t *testing.T) {
 	l.done = make(chan int, 1)
 	go func() { l.done <- l.u.Run(context.Background(), l.c) }()
 	l.has("manual mode", "> 2")
+	l.keys(`<Ctrl+U> <Ctrl+D> <Ctrl+D>`)
+	if code := l.end(); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+}
+
+// Someone still typing their first prompt as the trust question comes up
+// goes on typing it: no key answers until they stop, however long the
+// question has been up. A 2 in "fix the 2 failing tests" picked "Yes" and
+// trusted the folder unread (the TUI review of 2026-11-19). What they
+// typed is in the prompt box when the session starts.
+func TestAskBeforeWaitsForAPause(t *testing.T) {
+	trust := agent.Question{
+		Kind: "trust", Title: "Trust this folder?", Text: "Do you trust the files in this folder?",
+		Choices: []agent.Choice{
+			{Key: "no", Label: "No: start with my own settings only"},
+			{Key: "yes", Label: "Yes: use this folder's settings"},
+		},
+	}
+	at := &clock{at: stamp}
+	l := &loop{t: t, ft: newFakeTerm(80, 30, vtest.AllAnswers), c: newControls(), now: at.Now}
+	l.u = l.make()
+	type result struct {
+		ans agent.Answer
+		err error
+	}
+	got := make(chan result, 1)
+	go func() {
+		ans, err := l.u.AskBefore(trust)
+		got <- result{ans, err}
+	}()
+	l.has("Trust this folder?", "> 1. No: start with my own settings only")
+	answered := func(wait time.Duration) {
+		t.Helper()
+		select {
+		case r := <-got:
+			t.Fatalf("a key typed in the middle of a sentence answered the question: %+v, %v", r.ans, r.err)
+		case <-time.After(wait):
+		}
+	}
+	for _, r := range "fix the 2 failing tests" {
+		l.keys(strconv.Quote(string(r)))
+		for len(l.ft.events) > 0 {
+			answered(time.Millisecond)
+		}
+		at.add(100 * time.Millisecond)
+	}
+	answered(200 * time.Millisecond)
+	at.add(time.Second)
+	l.keys(`<Esc>`)
+	select {
+	case r := <-got:
+		if r.err != nil || r.ans.Choice != "no" {
+			t.Fatalf("Esc after a pause answered %+v, %v", r.ans, r.err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the question was not answered after a pause")
+	}
+	l.c = newControls()
+	l.done = make(chan int, 1)
+	go func() { l.done <- l.u.Run(context.Background(), l.c) }()
+	l.has("manual mode", "> fix the 2 failing tests")
 	l.keys(`<Ctrl+U> <Ctrl+D> <Ctrl+D>`)
 	if code := l.end(); code != 0 {
 		t.Fatalf("exit code %d", code)

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/gnosh-ai/gnosh/internal/core"
 	"github.com/gnosh-ai/gnosh/internal/shellquote"
@@ -293,7 +294,10 @@ func readCopy(spool, dst string, most int64) (copyRead, error) {
 		return got, nil
 	}
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// (Never through a link: the file is the one the caller made for the
+	// copy, and a link put in its place since would have the copy written
+	// wherever it leads.)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return got, err
 	}

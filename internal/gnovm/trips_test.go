@@ -267,3 +267,23 @@ var tasks = []task{{1, "a", false}}`)
 println(t0.ID)`)
 	require.Contains(t, res.Notes, "task has no field ID; its fields are id, desc, done")
 }
+
+// Code that uses mem in another VM than mem's is told where mem is, in
+// each of the words the GnoVM has for a name it does not know (box 1, 18
+// November: "name mem not defined in fileset" came with no note, and the
+// model went looking for mem in the shell).
+func TestHintSaysWhereMemIs(t *testing.T) {
+	t.Parallel()
+	h := newTestHost(t, t.TempDir())
+	for _, code := range []string{
+		`mem.Show()`,
+		`n, ok := mem.Read("selfloop-count")
+if !ok {
+	n = 0
+}
+println(n)`,
+	} {
+		res := runErr(t, h, "", code)
+		require.Contains(t, strings.Join(res.Notes, "\n"), `mem is your memory, kept by gnosh: run this with name "mem"`, "for %q, the error %v", code, res.Err)
+	}
+}

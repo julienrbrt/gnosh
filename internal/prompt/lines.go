@@ -50,6 +50,9 @@ type Environment struct {
 	AddedDirs []string
 	// Hosts are the other machines declared for commands.
 	Hosts []Host
+	// Summary says the block is given again after a summary, which took
+	// the place of the first prompt it went with: it says so.
+	Summary bool
 }
 
 // GitState says what gnosh knows of git in the working directory.
@@ -91,7 +94,7 @@ type Host struct {
 }
 
 // Environment returns the block that goes with a session's first prompt,
-// ahead of the prompt's own text. It holds what differs from session to
+// ahead of the prompt's own text, and again after a summary. It holds what differs from session to
 // session, which is why none of it is in the system prompt.
 func (s *Set) Environment(e Environment) string {
 	vals := values{
@@ -103,6 +106,8 @@ func (s *Set) Environment(e Environment) string {
 		vals["date"] = e.Now.Format("2006-01-02")
 		vals["weekday"] = e.Now.Weekday().String()
 	}
+	vals.flag("began", !e.Summary)
+	vals.flag("summed", e.Summary)
 	vals["user"] = oneLine(e.User, maxName)
 	vals["machine"] = oneLine(e.Machine, maxName)
 	vals.flag("user_only", vals["machine"] == "")
@@ -156,6 +161,9 @@ type Slide struct {
 	// Before set, the rounds that came before it was entered.
 	Frame  string
 	Before bool
+	// Files are the files the rounds that went had edited, as the model
+	// is told of them, so that it does not go back to work it has done.
+	Files []string
 }
 
 // FrameLine returns the line that follows the mem line while the session
@@ -199,6 +207,13 @@ func (s *Set) slides(list []Slide) string {
 			continue
 		}
 		vals := values{"show": id}
+		if len(sl.Files) > 0 {
+			files := make([]string, len(sl.Files))
+			for i, f := range sl.Files {
+				files[i] = oneLine(f, maxName)
+			}
+			vals["files"] = strings.Join(files, ", ")
+		}
 		if sl.Before {
 			vals["before"] = id
 		} else {
@@ -278,6 +293,12 @@ func (s *Set) RepeatRefusedClose(refusal string) string {
 // no tool call.
 func (s *Set) EmptyReply() string {
 	return s.fill(textEmptyReply, nil)
+}
+
+// TextCall returns what a model is told after a reply whose text is a tool
+// call written out as text, which runs nothing.
+func (s *Set) TextCall() string {
+	return s.fill(textTextCall, nil)
 }
 
 // StopHook returns what the model reads when a Stop hook, or a
@@ -541,6 +562,39 @@ func (s *Set) AgentEnded(a AgentEnd) string {
 	return s.fill(textAgentEnded, vals)
 }
 
+// SubtaskEnd is how a run the person started with /subtask ended: a copy
+// of the conversation that worked on a task in the background.
+type SubtaskEnd struct {
+	// ID is the copy's session, and Task what the person set it to do.
+	ID, Task string
+	// State says how it ended, and Why says more of a failure.
+	State AgentState
+	Why   string
+	// Report is the answer it printed, which is its own words: Defuse has
+	// been applied to it.
+	Report string
+}
+
+// SubtaskEnded returns the notice that a run started with /subtask has
+// ended, with its answer. Nobody typed it, and it says so.
+func (s *Set) SubtaskEnded(e SubtaskEnd) string {
+	vals := values{
+		"task":   oneLine(e.Task, maxQuote),
+		"id":     oneLine(e.ID, maxName),
+		"report": strings.TrimSpace(e.Report),
+		"why":    strings.TrimRight(oneLine(e.Why, maxQuote), ". "),
+	}
+	switch e.State {
+	case AgentFailed:
+		vals.flag("failed", true)
+	case AgentStopped:
+		vals.flag("stopped", true)
+	default:
+		vals.flag("finished", true)
+	}
+	return s.fill(textSubtaskEnded, vals)
+}
+
 // Btw returns the line that stands before a side question the person asks
 // with /btw: answer from the conversation, call no tool, keep nothing.
 // The question follows it, in the person's own words.
@@ -603,10 +657,30 @@ func (s *Set) AgentMention(name string) string {
 	return s.fill(textAgentMention, values{"name": oneLine(name, maxName)})
 }
 
+// Pasted returns the line after a prompt that holds a long paste: which
+// of its lines were pasted (where, such as "lines 3 to 122"), and that
+// they are material the user brought.
+func (s *Set) Pasted(where string) string {
+	return s.fill(textPasted, values{"where": oneLine(where, maxQuote)})
+}
+
 // Recap returns the question of /recap: the session in one line, for the
 // person, in a request beside the session's that is not kept.
 func (s *Set) Recap() string {
 	return s.fill(textRecap, nil)
+}
+
+// ThinkingBudget returns the words put at the end of a model's thinking
+// when its budget for thinking runs out.
+func (s *Set) ThinkingBudget() string {
+	return s.fill(textThinkingBudget, nil)
+}
+
+// NextPrompt returns the question asked after a turn when prompt
+// suggestions are on: the person's likely next prompt, in their words, in
+// a request beside the session's that is not kept.
+func (s *Set) NextPrompt() string {
+	return s.fill(textNextPrompt, nil)
 }
 
 // StatusLine returns the prompt of /statusline: what the user wants the
@@ -622,6 +696,13 @@ func (s *Set) PrintWait(waited, work string) string {
 	return s.fill(textPrintWait, values{"waited": oneLine(waited, maxName), "work": oneLine(work, maxQuote)})
 }
 
+// PrintLeftovers returns the line that tells the model, once, as a run is
+// about to end, what its commands left running, which the end stops: left
+// is the process groups, as the commands' results named them.
+func (s *Set) PrintLeftovers(left string) string {
+	return s.fill(textPrintLeftovers, values{"left": oneLine(left, maxQuote)})
+}
+
 // SummaryIntro returns the line that stands just before a summary, where
 // the summary takes the place of the conversation it replaced. The summary
 // itself follows it, outside the marker: it is the model's own text.
@@ -629,11 +710,42 @@ func (s *Set) SummaryIntro() string {
 	return s.fill(textSummaryIntro, nil)
 }
 
+// SummaryPartIntro returns the line that stands just before a summary of
+// the part of the conversation before one of the person's prompts, which
+// what came after follows as it was.
+func (s *Set) SummaryPartIntro() string {
+	return s.fill(textSummaryPartIntro, nil)
+}
+
+// SummaryFromNote returns the line that stands before the summary of what
+// followed the person's prompt that begins with prompt, once the
+// conversation went back to before it; the summary follows, outside the
+// marker.
+func (s *Set) SummaryFromNote(prompt string) string {
+	return s.fill(textSummaryFromNote, values{"prompt": oneLine(prompt, maxQuote)})
+}
+
 // AfterSummary returns what the model is told right after a summary: carry
 // on from it, without asking. path is the file the replaced conversation
 // was written to, if it was.
 func (s *Set) AfterSummary(path string) string {
 	return s.fill(textAfterSummary, values{"path": oneLine(path, maxName)})
+}
+
+// FileShownBack returns the line before a file given back after a summary,
+// which what Read returns for it follows.
+func (s *Set) FileShownBack(path string) string {
+	vals := values{"path": oneLine(path, maxName)}
+	vals.flag("shown", true)
+	return s.fill(textFilesBack, vals)
+}
+
+// FilesNotShownBack returns the line that names the files read or changed
+// before a summary that are not given back after it.
+func (s *Set) FilesNotShownBack(paths []string) string {
+	vals := values{"path": oneLine(strings.Join(paths, ", "), maxQuote)}
+	vals.flag("named", true)
+	return s.fill(textFilesBack, vals)
 }
 
 // EarlierLeftOut returns the note that opens a summary request whose

@@ -53,6 +53,10 @@ func TestThinkSplitter(t *testing.T) {
 		{"a tag in the middle of the answer is text", []string{"Use the <think> tag like so: <think>x</think>."}, "", "Use the <think> tag like so: <think>x</think>."},
 		{"a tag after the answer began, in another piece", []string{"Well. ", "<think>", "no", "</think>"}, "", "Well. <think>no</think>"},
 		{"a lone closing tag is text", []string{"reasoning</think>answer"}, "", "reasoning</think>answer"},
+		{"a closing tag before the answer closes the template's block", []string{"</think>\n\nRed."}, "", "Red."},
+		{"so after white space", []string{"\n  </think>  Red."}, "", "Red."},
+		{"so cut in two", []string{"</thi", "nk> Red"}, "", "Red"},
+		{"half a closing tag at the very end", []string{"</thi"}, "", "</thi"},
 		{"a block that never closes", []string{"<think>still going", " on"}, "still going on", ""},
 		{"a block that never closes, ending in half a tag", []string{"<think>abc</thi"}, "abc</thi", ""},
 		{"an empty block", []string{"<think></think>hi"}, "", "hi"},
@@ -129,6 +133,13 @@ func referenceSplit(s string) (thinking, text string) {
 	after := false
 	for {
 		t := strings.TrimLeft(rest, thinkSpace)
+		if strings.HasPrefix(t, thinkClose) {
+			// A closing tag before the answer's first word: the end of a
+			// block the template opened.
+			rest = t[len(thinkClose):]
+			after = true
+			continue
+		}
 		if !strings.HasPrefix(t, thinkOpen) {
 			if after {
 				text = t
@@ -198,8 +209,9 @@ func FuzzThinkSplitter(f *testing.F) {
 				t.Fatalf("input %q cut as %q: thinking came after text (%s)", s, cut, order)
 			}
 		}
-		// Text with no block at its start passes through untouched.
-		if !strings.HasPrefix(strings.TrimLeft(s, thinkSpace), thinkOpen) && wantText != s {
+		// Text with no block, and no closing tag, at its start passes
+		// through untouched.
+		if lead := strings.TrimLeft(s, thinkSpace); !strings.HasPrefix(lead, thinkOpen) && !strings.HasPrefix(lead, thinkClose) && wantText != s {
 			t.Fatalf("input %q has no block at its start and came out as %q", s, wantText)
 		}
 	})

@@ -23,6 +23,11 @@ type unit struct {
 	cmd *simpleCmd
 	// derived is set for commands found inside another command.
 	derived bool
+	// origin is the place among the line's own commands of the one the
+	// command is, or was found inside: where it runs, in the order of the
+	// line (the cd that "command cd sub" runs comes before a cd written
+	// after it).
+	origin int
 	// texts caches denyTexts for the command.
 	texts []string
 }
@@ -33,6 +38,9 @@ type bashView struct {
 	sc   *script
 	// units are every command to check against deny and ask rules.
 	units []*unit
+	// origin is the place of the line's own command being read, which the
+	// units found inside it are given (unit.origin).
+	origin int
 	// opaque is not empty when something will run that could not be read:
 	// a program name computed at run time, a script built by eval. It
 	// says what.
@@ -187,6 +195,36 @@ var wrappers = map[string]wrapSpec{
 
 // viewBash reads a command line and finds every command in it.
 func (e *Engine) viewBash(text string) *bashView {
+	v := e.readSettled(text)
+	// dash has no $'...': it keeps the $, and reads what follows as a
+	// string in single quotes. Wherever that text is read again (an
+	// alias, eval, sh -c, a trap), the $ is an expansion: "sh -c
+	// $'1rm -rf ~'" runs $1rm, which is rm when $1 is empty, and "alias
+	// zz=$'1rm'" makes zz stand for it (oracle seed 131). So the line is
+	// read once more as dash reads it, every $' written \$', and what
+	// that reading runs is held against the rules and the removal check
+	// as well, as derived commands, which let nothing through.
+	if strings.Contains(text, "$'") {
+		dv := e.readSettled(strings.ReplaceAll(text, "$'", "\\$'"))
+		for _, u := range dv.units {
+			d := *u
+			d.derived = true
+			v.units = append(v.units, &d)
+		}
+		v.frags = append(v.frags, dv.frags...)
+		switch {
+		case !dv.sc.ok:
+			v.setOpaque("dash reads a $'...' as a $ and a string in quotes, and so read the line cannot be followed (" + dv.sc.why + ")")
+		case dv.opaque != "":
+			v.setOpaque(dv.opaque)
+		}
+	}
+	return v
+}
+
+// readSettled is readBash until what the line's scripts give its
+// variables is known.
+func (e *Engine) readSettled(text string) *bashView {
 	v := e.readBash(text, nil)
 	// What a line gives its variables inside a script it runs ("eval
 	// f=.env; cat $f") is known only once that script is read. The line
@@ -221,14 +259,17 @@ func (e *Engine) readBash(text string, before *bashView) *bashView {
 	v.grew = false
 	// The line's own commands always count; what is dug out of them is
 	// bounded.
-	for _, c := range v.sc.cmds {
-		v.units = append(v.units, &unit{cmd: c})
+	for i, c := range v.sc.cmds {
+		v.units = append(v.units, &unit{cmd: c, origin: i})
 	}
 	var prev *simpleCmd
-	for _, c := range v.sc.cmds {
+	for i, c := range v.sc.cmds {
+		v.origin = i
 		e.derive(v, c, prev, 0)
 		prev = c
 	}
+	v.origin = len(v.sc.cmds) // what is found after the line's own commands
+
 	// A shell with no (( )) runs its text as commands.
 	for _, a := range v.sc.arith {
 		e.addScript(v, a, nestSubshell, 0, scriptArith)
@@ -1179,10 +1220,18 @@ func (e *Engine) filledAll(v *bashView, w word) (out []lineVal, strict, ok bool)
 }
 
 // braced reports whether bash's braces may make several words of the
-// word: it holds an unquoted brace, and a { among what is written of it.
-// (A } alone opens nothing: in "${a[*]}x}" it is a character like any.)
+// word: it holds an unquoted brace, and a { among what is written of it
+// with a } somewhere after it. A brace with nothing to close it opens
+// nothing: in "${a[*]}x}" the } is a character like any, and so is the {
+// in "$@"{, which leaves .git standing alone among the words of "f() {
+// mv "$@"{; }; f .git /tmp/g" (oracle seed 117).
 func braced(w word) bool {
-	return w.brace && strings.Contains(w.joined(), "{")
+	if !w.brace {
+		return false
+	}
+	s := w.joined()
+	open := strings.Index(s, "{")
+	return open >= 0 && strings.Contains(s[open+1:], "}")
 }
 
 // filledWith is filledAll with a way to say what a pattern matched.
@@ -1510,6 +1559,38 @@ func (e *Engine) filled(v *bashView, w word) (string, bool) {
 		return "", false
 	}
 	return vals[0].text, true
+}
+
+// varBraces returns a command's words as bash and as dash read a word
+// that holds braces and a variable: bash's with the braces taken apart
+// (braceAlts; nil when they cannot be told), and dash's with the braces
+// left as characters, which the variable is then filled in beside. ok is
+// false when no word is such a word.
+func varBraces(ws []word) (bashWords, dashWords []word, ok bool) {
+	bashKnown := true
+	for _, w := range ws {
+		if !braced(w) || w.static() {
+			bashWords = append(bashWords, w)
+			dashWords = append(dashWords, w)
+			continue
+		}
+		ok = true
+		lit := w
+		lit.brace = false
+		dashWords = append(dashWords, lit)
+		if alts, fine := braceAlts(w); fine {
+			bashWords = append(bashWords, alts...)
+		} else {
+			bashKnown = false
+		}
+	}
+	if !ok {
+		return nil, nil, false
+	}
+	if !bashKnown {
+		bashWords = nil
+	}
+	return bashWords, dashWords, true
 }
 
 // braceWords returns the command's words after bash's brace expansion,
@@ -1936,8 +2017,17 @@ func (e *Engine) addScript(v *bashView, text string, nest nesting, depth int, ho
 	sub := parseScript(text)
 	if !sub.ok {
 		crude := crudeFragments(text)
-		if how == scriptText || how == scriptOperand || how == scriptValue {
+		switch how {
+		case scriptText, scriptOperand, scriptValue:
 			v.setOpaque("a script inside the command could not be read: " + sub.why)
+			v.unread = append(v.unread, crude...)
+		case scriptArith:
+			// A plain sh runs the text of (( )) as commands, and what it
+			// runs cannot be told when that text cannot be read as
+			// commands: "(( <<$X git * ))" ran git under dash, with its
+			// here-document ended by the end of the line (oracle seed
+			// 162). Then the guards cannot be checked against it.
+			v.setOpaque("the text of (( )), which a plain sh runs as commands, could not be read as commands: " + sub.why)
 			v.unread = append(v.unread, crude...)
 		}
 		v.frags = append(v.frags, crude...)
@@ -2291,6 +2381,14 @@ func (e *Engine) commandVar(v *bashView, w word, nest nesting, depth int) {
 			}
 		}
 		return
+	case "BASH_ENV":
+		// The file bash runs before anything else, as by source:
+		// "BASH_ENV=e.sh bash -c true" runs e.sh, and BASH_ENV=.env reads
+		// .env. It is read as that.
+		if file, ok := afterPrefix(w, name+"="); ok && file.raw != "" {
+			e.addDerived(v, &simpleCmd{words: []word{litOf("."), file}, nest: nest}, nil, depth)
+		}
+		return
 	}
 	if !commandVars[name] || !w.static() {
 		return
@@ -2371,9 +2469,14 @@ func (e *Engine) addWordText(v *bashView, text string, nest nesting, depth int) 
 func (e *Engine) addDerived(v *bashView, c *simpleCmd, prev *simpleCmd, depth int) {
 	// "time ! cmd" and "! cmd" run cmd, and so does "X=1 cmd" wherever a
 	// shell reads those words as a command of their own. ("time X=1" is
-	// an assignment to bash: the value may be the variable's.)
-	for len(c.words) > 0 && (c.words[0].raw == "!" && len(c.words) > 1 || isAssignWord(c.words[0].raw)) {
+	// an assignment to bash: the value may be the variable's.) A "!" is
+	// the shell's own word only before the assignments: after one it is a
+	// command's name, which "X=1 !" runs (the permission oracle, seed
+	// 174).
+	assigned := len(c.assigns) > 0
+	for len(c.words) > 0 && (!assigned && c.words[0].raw == "!" && len(c.words) > 1 || isAssignWord(c.words[0].raw)) {
 		if name, ok := assignName(c.words[0].raw); ok {
+			assigned = true
 			if strings.HasPrefix(c.words[0].raw, name+"=") {
 				e.noteWord(v, name, c.words[0], true, false, noPlace)
 			}
@@ -2384,7 +2487,7 @@ func (e *Engine) addDerived(v *bashView, c *simpleCmd, prev *simpleCmd, depth in
 		}
 		c.words = c.words[1:]
 	}
-	if len(c.words) == 1 && c.words[0].raw == "!" {
+	if !assigned && len(c.words) == 1 && c.words[0].raw == "!" {
 		c.words = nil
 	}
 	if len(v.units) >= maxUnits+len(v.sc.cmds) {
@@ -2397,7 +2500,7 @@ func (e *Engine) addDerived(v *bashView, c *simpleCmd, prev *simpleCmd, depth in
 		}
 		return
 	}
-	v.units = append(v.units, &unit{cmd: c, derived: true})
+	v.units = append(v.units, &unit{cmd: c, derived: true, origin: v.origin})
 	e.noteVars(v, c, noPlace)
 	e.derive(v, c, prev, depth+1)
 }
@@ -2614,7 +2717,13 @@ func (e *Engine) derive(v *bashView, c *simpleCmd, prev *simpleCmd, depth int) {
 		// the first expansion leaves of such a word is read as text the
 		// shell evaluates; any other target that holds the text of a
 		// substitution is read as one that may be.
-		if l := r.target.joined(); r.op == ">&" && !isFdTarget(r.target) && strings.ContainsAny(l, "$`<>") {
+		if r.op == ">&" && !isFdTarget(r.target) && !r.target.static() {
+			// What the first expansion of a computed word leaves is not
+			// known, and it may be the text of a substitution that the
+			// second runs: Y='$(rm x)'; ls >&"$Y" (oracle seed 124).
+			v.setOpaque("bash expands the word after >& a second time, and what a word computed when the line runs leaves of it may run a command")
+			e.scanWord(v, r.target, nest, depth)
+		} else if l := r.target.joined(); r.op == ">&" && !isFdTarget(r.target) && strings.ContainsAny(l, "$`<>") {
 			e.addWordText(v, l, nest, depth)
 		} else {
 			e.scanWord(v, r.target, nest, depth)
@@ -2628,7 +2737,7 @@ func (e *Engine) derive(v *bashView, c *simpleCmd, prev *simpleCmd, depth int) {
 			e.addDerived(v, &simpleCmd{words: piece, nest: nest}, nil, depth)
 		}
 		if len(alt) > 0 && len(v.units) < maxUnits+len(v.sc.cmds) {
-			v.units = append(v.units, &unit{cmd: &simpleCmd{redirs: alt, nest: nest}, derived: true})
+			v.units = append(v.units, &unit{cmd: &simpleCmd{redirs: alt, nest: nest}, derived: true, origin: v.origin})
 		}
 		c.pieces, c.altRedirs = pieces, alt
 	}
@@ -2661,6 +2770,17 @@ func (e *Engine) derive(v *bashView, c *simpleCmd, prev *simpleCmd, depth int) {
 			v.setOpaque("braces with quoted text in them make words gnosh cannot tell for sure")
 		}
 		e.addDerived(v, &simpleCmd{words: alt, redirs: c.redirs, sep: c.sep, nest: c.nest}, prev, depth)
+	}
+	// Braces in a word with a variable in it: bash takes the braces apart
+	// before it fills the variable, and dash takes nothing apart, the
+	// braces being characters beside the variable. "f() { mv "$@"{,x};
+	// }; f .git /tmp/g" moves .git either way: bash runs mv .git /tmp/g
+	// .gitx /tmp/gx, and dash mv .git '/tmp/g{,x}'. Each reading is judged.
+	if bashWords, dashWords, ok := varBraces(c.words); ok {
+		if bashWords != nil {
+			e.addDerived(v, &simpleCmd{words: bashWords, redirs: c.redirs, sep: c.sep, nest: c.nest}, prev, depth)
+		}
+		e.addDerived(v, &simpleCmd{words: dashWords, redirs: c.redirs, sep: c.sep, nest: c.nest}, prev, depth)
 	}
 	full, ok := e.progName(c.words[0])
 	if !ok || progIsPattern(c.words[0]) {
@@ -2788,6 +2908,24 @@ func (e *Engine) derive(v *bashView, c *simpleCmd, prev *simpleCmd, depth int) {
 	// xargs, where the file system takes no notice of case.
 	name := progKey(baseName(full))
 	args := c.words[1:]
+	// A program that a flag of its own sends to another folder (env -C,
+	// sudo -D, tar -C, make -C, go -C) works there: each folder it may be
+	// sent to is read as a cd the line may take, so that the words it is
+	// handed are judged from there too ("env --chdir=/ rm -rf usr" removes
+	// /usr). A folder only known when the line runs is a place nobody
+	// knows, as after cd "$X".
+	// So does git with its own -C: "git -C sub diff --no-index ../.env
+	// /dev/null" prints the .env beside sub.
+	dirs := chdirValues(name, args)
+	if name == "git" {
+		dirs = gitChdirs(args)
+		for _, text := range gitRuns(args) {
+			e.addScript(v, text, nest, depth, scriptMaybe)
+		}
+	}
+	for _, dir := range dirs {
+		e.addDerived(v, &simpleCmd{words: []word{litOf("cd"), dir}, nest: nest, flagCd: true}, prev, depth)
+	}
 
 	isScript := true
 	switch {
@@ -2854,25 +2992,15 @@ func (e *Engine) derive(v *bashView, c *simpleCmd, prev *simpleCmd, depth int) {
 		}
 	case name == "source" || name == ".":
 		// A file that is sourced is a program of its own, which no rule
-		// reads. Text the line itself supplies is read.
-		switch {
-		case len(args) == 0:
-		case args[0].hasSubst():
-			v.setOpaque("a script that a command prints is run in this shell")
-		case !args[0].static() || args[0].glob || args[0].brace:
-			// A name that is not known ahead of time (a variable, a
-			// pattern, braces) may be /dev/stdin: what is fed to the
-			// command is then its script.
-			e.fedScript(v, c, prev, nest, depth, true)
-		default:
-			f := args[0].joined()
-			if strings.HasPrefix(f, "/") {
-				f = oneDisk(cleanPath(f))
-			}
-			if f == "/dev/stdin" || strings.HasPrefix(f, "/dev/fd/") || strings.HasPrefix(f, "/proc/self/fd/") || strings.HasPrefix(f, "/proc/thread-self/fd/") {
-				if !e.fedScript(v, c, prev, nest, depth, true) {
-					v.bareShell = true
-				}
+		// reads. Text the line itself supplies is read. The file is the
+		// first word that stays: a word that may come to nothing (an
+		// unquoted $* or ${X}, a "$@" with no words) leaves the next one
+		// to be the file, so each such next one is judged as it too
+		// ("source $* ${X} <(cmd)" runs what cmd prints; oracle seed 122).
+		for _, w := range args {
+			e.sourcedArg(v, c, prev, nest, depth, w)
+			if !mayVanish(w) {
+				break
 			}
 		}
 	case name == "eval":
@@ -2884,6 +3012,23 @@ func (e *Engine) derive(v *bashView, c *simpleCmd, prev *simpleCmd, depth int) {
 		} else {
 			v.setOpaque("eval runs text that is computed when the command runs")
 			e.addScript(v, maybeText(args), nest, depth, scriptMaybe)
+		}
+	case name == "history":
+		// What history -s puts in the shell's history runs when fc runs it
+		// again: "set -o history; history -s 'rm -rf ~'; fc -s" runs rm
+		// -rf ~ in bash -c. It is read as text that may run. (What history
+		// -r reads from a file is the file's, as a sourced file is.)
+		for i, a := range args {
+			if a.lit() != "-s" {
+				continue
+			}
+			if rest := args[i+1:]; allKnown(rest) {
+				e.addScript(v, strings.Join(litsOf(rest), " "), nest, depth, scriptMaybe)
+			} else {
+				v.setOpaque("history -s is given text computed when the command runs, which fc may run")
+				e.addScript(v, maybeText(rest), nest, depth, scriptMaybe)
+			}
+			break
 		}
 	case name == "alias":
 		// What an alias stands for runs wherever its name is written
@@ -2954,21 +3099,45 @@ func (e *Engine) derive(v *bashView, c *simpleCmd, prev *simpleCmd, depth int) {
 				v.setOpaque("hash -p names a program computed when the command runs")
 			}
 		})
-		// The names after the file run that file from here on, with
+		// The names after the options run the file from here on, with
 		// whatever words follow them: "hash -p /bin/rm ls; ls -rf x" is
-		// rm -rf x. They are read like aliases (useAlias).
-		for i, a := range args {
-			if l := a.lit(); !a.static() || len(l) < 2 || l[0] != '-' || l[1] == '-' || !strings.Contains(l, "p") {
+		// rm -rf x. The options are read as bash's getopts reads them,
+		// and each -p's file is taken for the names, as bash takes the
+		// last: "hash -p h -p /bin/mv zz" made zz mv, while only the first
+		// was read (oracle seed 168). A word computed when the command
+		// runs may be such an option. They are read like aliases
+		// (useAlias).
+		var files []string
+		i := 0
+		for ; i < len(args); i++ {
+			a := args[i]
+			l := a.lit()
+			if !a.static() {
+				v.setOpaque("hash is given a word computed when the command runs, which may name the program a later name runs")
+				break
+			}
+			if len(l) < 2 || l[0] != '-' {
+				break
+			}
+			if l == "--" {
+				i++
+				break
+			}
+			if k := strings.IndexByte(l, 'p'); k > 0 {
+				if k+1 < len(l) {
+					files = append(files, l[k+1:])
+				} else if i+1 < len(args) {
+					i++
+					files = append(files, e.unsetValue(args[i]))
+				}
+			}
+		}
+		for _, n := range args[min(i, len(args)):] {
+			if !n.static() || strings.HasPrefix(n.joined(), "-") {
 				continue
 			}
-			file, names := "", args[min(i+1, len(args)):]
-			if k := strings.IndexByte(a.lit(), 'p'); k+1 < len(a.lit()) {
-				file = a.lit()[k+1:]
-			} else if len(names) > 0 {
-				file, names = e.unsetValue(names[0]), names[1:]
-			}
-			for _, n := range names {
-				if file == "" || !n.static() || strings.HasPrefix(n.joined(), "-") {
+			for _, file := range files {
+				if file == "" {
 					continue
 				}
 				if v.aliases == nil {
@@ -2976,7 +3145,6 @@ func (e *Engine) derive(v *bashView, c *simpleCmd, prev *simpleCmd, depth int) {
 				}
 				v.aliases[n.joined()] = append(v.aliases[n.joined()], file)
 			}
-			break
 		}
 		for _, a := range args {
 			if !a.static() || a.glob {
@@ -3021,6 +3189,11 @@ func (e *Engine) derive(v *bashView, c *simpleCmd, prev *simpleCmd, depth int) {
 		for _, a := range args {
 			if l := a.joined(); strings.Contains(l, "$(") || strings.Contains(l, "`") {
 				e.addScript(v, l, nest, depth, scriptOperand)
+			}
+			if declares[name] {
+				// export PAGER='rm x' sets what git runs as its pager, as
+				// PAGER='rm x' git does.
+				e.commandVar(v, a, nest, depth)
 			}
 		}
 	case name == "trap":
@@ -3111,6 +3284,12 @@ func (e *Engine) derive(v *bashView, c *simpleCmd, prev *simpleCmd, depth int) {
 			// bash runs what follows the redirection, a "-p" included; a
 			// plain sh's time reads the words as its own. Both are read.
 			e.addDerived(v, &simpleCmd{words: c.words[c.timeCut:], redirs: c.redirs, sep: c.sep, nest: nest}, prev, depth)
+		} else if at := bashTimeStart(c.words); name == "time" && at > 0 && at < len(c.words) && strings.HasPrefix(c.words[at].joined(), "-") {
+			// bash's time takes one -p and one -- for its own, so bash runs
+			// a dash word after them as the program ("time -p -p cat x" runs
+			// -p), where a plain sh's time takes it for an option. Both are
+			// read.
+			e.addDerived(v, &simpleCmd{words: c.words[at:], redirs: c.redirs, sep: c.sep, nest: nest}, prev, depth)
 		}
 		for _, start := range e.wrappedAt(v, spec, args, nest, depth) {
 			inner := args[start:]
@@ -3255,6 +3434,18 @@ func (e *Engine) couldBeShell(w word) bool {
 	head = foldHead(head)
 	for name := range shellNames {
 		if couldMatch(head, appendLit(nil, name)) || couldMatch(head, appendLit(appendHole(nil), "/"+name)) {
+			return true
+		}
+	}
+	// So may a name that names a program by the process that runs it or
+	// by a number (magicProg): /proc/self$x/exe and /proc/$$/exe are the
+	// shell that reads the line (oracle seed 141), /dev/fd/$n a file
+	// opened earlier.
+	for _, magic := range [][]tok{
+		appendLit(appendHole(appendLit(appendHole(nil), "/proc/")), "/exe"),
+		appendHole(appendLit(appendHole(nil), "/dev/fd/")),
+	} {
+		if couldMatch(head, magic) {
 			return true
 		}
 	}
@@ -3439,10 +3630,24 @@ func (e *Engine) wrappedAt(v *bashView, spec wrapSpec, args []word, nest nesting
 						spliced = true
 					}
 				}
-				// next hands over the word after the flag.
+				// next hands over the word after the flag. A word that may
+				// come to nothing (an unquoted $X that is empty) is not
+				// there for the wrapper: the word after it is then the
+				// value, and the command starts one further on ("nice -n
+				// $X 5 git push" runs git push; oracle seed 174), which is
+				// read too.
 				next := func(k byte) {
 					if i+1 < len(args) {
 						hand(k, args[i+1], args[i+2:])
+						if mayVanish(args[i+1]) && i+2 < len(args) {
+							switch k {
+							case 's':
+								hand(k, args[i+2], args[i+3:])
+							case 'a':
+								v.setOpaque("a wrapper is given arguments computed when the command runs")
+							}
+							work = append(work, state{i + 3, pos})
+						}
 					}
 					i++
 				}
@@ -3946,7 +4151,7 @@ func prefixOnlyExact(ws []word) bool {
 	if len(ws) == 0 {
 		return false
 	}
-	switch baseName(ws[0].lit()) {
+	switch progKey(baseName(ws[0].lit())) {
 	case "watch", "setsid", "ionice", "flock":
 		return true
 	case "find":
@@ -3961,4 +4166,46 @@ func prefixOnlyExact(ws []word) bool {
 		}
 	}
 	return false
+}
+
+// sourcedArg judges w as the file source or . runs.
+func (e *Engine) sourcedArg(v *bashView, c *simpleCmd, prev *simpleCmd, nest nesting, depth int, w word) {
+	switch {
+	case w.hasSubst():
+		v.setOpaque("a script that a command prints is run in this shell")
+	case !w.static() || w.glob || w.brace:
+		// A name that is not known ahead of time (a variable, a pattern,
+		// braces) may be /dev/stdin: what is fed to the command is then
+		// its script.
+		e.fedScript(v, c, prev, nest, depth, true)
+	default:
+		f := w.joined()
+		if strings.HasPrefix(f, "/") {
+			f = oneDisk(cleanPath(f))
+		}
+		if f == "/dev/stdin" || strings.HasPrefix(f, "/dev/fd/") || strings.HasPrefix(f, "/proc/self/fd/") || strings.HasPrefix(f, "/proc/thread-self/fd/") {
+			if !e.fedScript(v, c, prev, nest, depth, true) {
+				v.bareShell = true
+			}
+		}
+	}
+}
+
+// mayVanish reports whether a word may come to no word at all when the
+// line runs: nothing in it but what is expanded, outside quotes (an empty
+// value is then no word), or every word of a list ("$@", "${a[@]}"), which
+// may hold none.
+func mayVanish(w word) bool {
+	if w.static() || w.joined() != "" {
+		return false
+	}
+	if !w.quoted {
+		return true
+	}
+	for _, p := range w.parts {
+		if !(p.kind == partVar && p.all) {
+			return false
+		}
+	}
+	return true
 }

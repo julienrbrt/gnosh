@@ -94,6 +94,7 @@ func (o *openAI) chatBody(req *core.Request, stream bool) (obj, error) {
 	}
 	if o.kind == TypeLlamaCpp {
 		o.llamaFields(body, req)
+		breakControlIn(body)
 	}
 	return body, nil
 }

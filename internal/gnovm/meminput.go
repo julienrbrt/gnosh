@@ -201,7 +201,7 @@ func memHint(code, msg string) string {
 
 var (
 	memMissingRe    = regexp.MustCompile(`missing field (\w+) in \*?klash/gnomem/v2\.(Mem|Frame)\b`)
-	memUndeclaredRe = regexp.MustCompile(`name (\w+) not declared`)
+	memUndeclaredRe = regexp.MustCompile(`name (\w+) not (?:declared|defined)`)
 	memAssignRe     = regexp.MustCompile(`(^|[^.\w])mem\s*:?=[^=]`)
 )
 

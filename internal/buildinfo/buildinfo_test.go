@@ -108,3 +108,32 @@ func TestBuildIDIsSetAtStart(t *testing.T) {
 		t.Fatal("BuildID is empty")
 	}
 }
+
+// A build's list of changes, and what of it is newer than another build.
+func TestChanges(t *testing.T) {
+	t.Parallel()
+	all := parseChanges("1be72ee /status says the thinking budget\nfd3e5e3 DECISIONS 74 and 75\n\n93da8ee Print mode to a terminal\n")
+	if len(all) != 3 || all[1] != (Change{ID: "fd3e5e3", Subject: "DECISIONS 74 and 75"}) {
+		t.Fatalf("parseChanges = %+v", all)
+	}
+	for _, tc := range []struct {
+		old   string
+		n     int
+		found bool
+	}{
+		{"93da8ee", 2, true},
+		{"93da8ee4c1d2", 2, true},
+		{"1be72ee", 0, true},
+		{"fd3e5e3+dirty", 1, true},
+		{"0000000", 3, false},
+		{"", 3, false},
+	} {
+		got, found := since(all, tc.old)
+		if len(got) != tc.n || found != tc.found {
+			t.Errorf("since(%q) = %d changes, found %v; want %d, %v", tc.old, len(got), found, tc.n, tc.found)
+		}
+	}
+	if len(parseChanges("")) != 0 {
+		t.Errorf("an empty list holds changes")
+	}
+}

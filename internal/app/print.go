@@ -7,11 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/gnosh-ai/gnosh/internal/text"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -47,12 +50,22 @@ type printer struct {
 	inv     cli.Invocation
 	format  string
 	verbose bool
+	// retrySaid is the failure whose retries standard error was last told
+	// of: the next tries of the same failure go unsaid without --verbose
+	// (a model server down said the same paragraph every 15 seconds).
+	retrySaid string
 	// live says standard output is a terminal, where a person watches the
-	// words arrive.
+	// words arrive. safe is what of the reply may be written there: its
+	// styles, and no other escape sequence (text.SafeStream).
 	live bool
+	safe text.SafeStream
 
 	mu sync.Mutex
 	c  Controls
+
+	// asking are the permission questions put to the agent view (a run in
+	// the background, runasks.go), each with what ends its wait.
+	asking map[string]context.CancelFunc
 
 	// The state of text output.
 	buf       strings.Builder // the text of the reply being written
@@ -79,6 +92,8 @@ type printer struct {
 	structuredErr string
 
 	capped bool
+	// cappedTurn is the turn that reached the cap.
+	cappedTurn string
 	// resultsOut says each turn's result line was written as its turn
 	// ended (stream-json output with background work, printwait.go): the
 	// last is not written again.
@@ -99,6 +114,8 @@ type printer struct {
 	// show (ToolName.NoLogArgs).
 	noArgs  map[string]bool
 	results chan agent.TurnResult
+	// inboxed counts the prompts the run's inbox handed it (runasks.go).
+	inboxed atomic.Int64
 }
 
 // newPrinter makes the front end of a run.
@@ -126,7 +143,11 @@ func (f *printer) Run(ctx context.Context, c Controls) int {
 		return f.runStream(ctx, c)
 	}
 
-	text, err := f.readPrompt(ctx)
+	var text string
+	var err error
+	if sig := f.guarded(ctx, c, func(ctx context.Context) { text, err = f.readPrompt(ctx) }); sig != nil {
+		return f.stoppedBySignal(c, "", sig, c.State())
+	}
 	first := agent.Prompt{Text: text}
 	if errors.Is(err, errNoPrompt) {
 		// Nothing was typed and nothing was piped in. A feature may still
@@ -141,7 +162,11 @@ func (f *printer) Run(ctx context.Context, c Controls) int {
 	}
 	id := ""
 	if strings.HasPrefix(strings.TrimSpace(text), "/") {
-		res, err := c.Command(ctx, strings.TrimSpace(text))
+		var res CommandResult
+		var err error
+		if sig := f.guarded(ctx, c, func(ctx context.Context) { res, err = c.Command(ctx, strings.TrimSpace(text)) }); sig != nil {
+			return f.stoppedBySignal(c, "", sig, c.State())
+		}
 		if (res.Handled && res.Prompt == "") || err != nil {
 			return f.reportCommand(c, res, err)
 		}
@@ -155,6 +180,23 @@ func (f *printer) Run(ctx context.Context, c Controls) int {
 			return cli.ExitFailure
 		}
 	}
+	stopInbox := func() {}
+	if f.p.runAsks != "" {
+		// A run in the background reads the words sent to it from the
+		// agent view as it works (runasks.go), once its prompt is in, and
+		// until it has nothing left to do: what comes after stays in its
+		// inbox, for the view to send it back to work on.
+		inbox, stop := context.WithCancel(ctx)
+		defer stop()
+		done, _ := readInbox(inbox, f.p.runAsks, func(text string) error {
+			_, err := c.Submit(agent.Prompt{Text: text})
+			if err == nil {
+				f.inboxed.Add(1)
+			}
+			return err
+		})
+		stopInbox = func() { stop(); <-done }
+	}
 	res, sig, st := f.await(ctx, c, id)
 	if sig != nil {
 		return f.stoppedBySignal(c, id, sig, st)
@@ -164,20 +206,66 @@ func (f *printer) Run(ctx context.Context, c Controls) int {
 	}
 	// The background work the turn started is waited for, and the turns
 	// its ends start are the run's too (printwait.go).
-	if res, sig, st = f.awaitBackground(ctx, c, res, false); sig != nil {
+	for {
+		res, sig, st = f.awaitBackground(ctx, c, res, false)
+		// The inbox is read no more; a prompt it handed over as it stopped
+		// is still waited for.
+		took := f.inboxed.Load()
+		stopInbox()
+		if sig != nil || ctx.Err() != nil || f.inboxed.Load() == took {
+			break
+		}
+	}
+	if sig != nil {
 		return f.stoppedBySignal(c, "", sig, st)
 	}
 	if ctx.Err() != nil {
 		return cli.ExitFailure
 	}
 	if f.inv.JSONSchema != "" && (res.Reason == agent.EndCompleted || res.Reason == agent.EndModelStopped) {
-		f.structured, f.structuredErr = f.structuredOutput(ctx, c)
+		if sig := f.guarded(ctx, c, func(ctx context.Context) { f.structured, f.structuredErr = f.structuredOutput(ctx, c) }); sig != nil {
+			return f.stoppedBySignal(c, "", sig, c.State())
+		}
 	}
 	// The features are asked before anything is printed: what they have
 	// to say comes first, and they may raise the exit code.
 	code := c.RunEnd(res, f.exitCode(c, res))
 	f.report(c, res)
 	return code
+}
+
+// guarded runs a part of a run that does not read the signals itself
+// (reading what is piped in, a slash command given as the prompt, the
+// structured output): the first SIGINT, SIGTERM or SIGHUP cancels it and
+// is returned, so that the run ends as one a signal stopped does. Without
+// it a signal waited unread through the part (ten minutes and more), and
+// "producer | timeout 60 gnosh -p" could not be stopped short of SIGKILL.
+func (f *printer) guarded(ctx context.Context, c Controls, part func(ctx context.Context)) os.Signal {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	signals := c.Signals()
+	got := make(chan os.Signal, 1)
+	done := make(chan struct{})
+	var watching sync.WaitGroup
+	watching.Add(1)
+	go func() {
+		defer watching.Done()
+		select {
+		case s := <-signals:
+			got <- s
+			cancel()
+		case <-done:
+		}
+	}()
+	part(ctx)
+	close(done)
+	watching.Wait()
+	select {
+	case s := <-got:
+		return s
+	default:
+		return nil
+	}
 }
 
 // exitCode is the code a run ends with for how its last turn ended: 0
@@ -337,7 +425,8 @@ func (f *printer) stoppedBySignal(c Controls, id string, sig os.Signal, st agent
 	res := agent.TurnResult{Reason: agent.EndStopped}
 	wait := time.NewTimer(signalWait)
 	defer wait.Stop()
-	for waiting := true; waiting; {
+	// (With no turn of the run's own to wait for, no result can come.)
+	for waiting := id != ""; waiting; {
 		select {
 		case r := <-f.results:
 			if slices.Contains(r.Prompts, id) {
@@ -356,6 +445,17 @@ func (f *printer) stoppedBySignal(c Controls, id string, sig os.Signal, st agent
 	}
 	f.encode(obj)
 	f.finished = true
+	// A question still put to the agent view goes with the run.
+	for id, cancel := range f.asking {
+		cancel()
+		delete(f.asking, id)
+	}
+	if f.p.runAsks != "" {
+		paths, _ := filepath.Glob(f.p.runAsks + ".ask-*.json")
+		for _, p := range paths {
+			_ = os.Remove(p)
+		}
+	}
 	return code
 }
 
@@ -375,10 +475,33 @@ func (f *printer) Event(ev any) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.finished {
-		// The result is the last thing a run prints.
+		// The result is the last thing a run prints. A notice of its
+		// closing (a hook's, the memory's) still goes to standard error.
+		if ev, ok := ev.(*agent.NoticeEvent); ok {
+			f.stderr("%s", ev.Text)
+		}
 		return
 	}
 	switch ev := ev.(type) {
+	case *agent.QuestionEvent:
+		// Only a run whose questions the agent view answers is put any
+		// (agent.Options.Relay): it writes the question down and waits.
+		if f.p.runAsks == "" || f.c == nil {
+			return
+		}
+		if f.asking == nil {
+			f.asking = map[string]context.CancelFunc{}
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		f.asking[ev.Question.ID] = cancel
+		q, c := ev.Question, f.c
+		f.stderr("waiting for an answer in gnosh agents: %s", oneLine(firstOf(q.Title, q.Kind), 200))
+		go relayAsk(ctx, f.p.runAsks, q, f.p.now, func(a agent.Answer) error { return c.Answer(q.ID, a) })
+	case *agent.AnswerEvent:
+		if cancel := f.asking[ev.ID]; cancel != nil {
+			cancel()
+			delete(f.asking, ev.ID)
+		}
 	case *agent.TurnStartEvent:
 		f.init()
 		if f.starts != nil && ev.Agent == "" {
@@ -422,14 +545,26 @@ func (f *printer) Event(ev any) {
 			f.partialEnd(ev.StopReason, ev.Usage)
 		}
 	case *agent.RetryEvent:
-		if ev.Discarded {
+		if ev.Discarded && ev.Agent == "" && ev.Purpose == "main" {
 			// What had arrived of the reply is thrown away; the next try
-			// writes it afresh.
+			// writes it afresh. (A sub-agent's reply is not the one held
+			// here: its retry threw away the session's own reply, and its
+			// stream-json message, half written.)
 			f.buf.Reset()
+			if end := f.safe.End(); end != "" {
+				fmt.Fprint(f.p.stdout, end)
+			}
 			f.inMessage = false
 			f.partialEnd(core.StopCancelled, core.Usage{})
 		}
-		f.stderr("%s", ev.Message)
+		// Said once a failure, as its tries go on (each in stream-json's
+		// api_retry lines, and on standard error with --verbose); said
+		// again when it is another, or after the model answered.
+		said := fmt.Sprintf("%s/%s/%s/%d", ev.Agent, ev.Purpose, ev.Kind, ev.Status)
+		if f.verbose || ev.Attempt <= 1 || ev.FellBack != "" || said != f.retrySaid {
+			f.stderr("%s", ev.Message)
+		}
+		f.retrySaid = said
 		f.line(retryLine{Type: "system", Subtype: "api_retry", UUID: newUUID(), SessionID: f.sessionID(),
 			Attempt: ev.Attempt, RetryDelayMS: ev.Wait.Milliseconds(), ErrorStatus: statusOrNil(ev.Status), Error: string(ev.Kind)})
 	case *agent.ToolEndEvent:
@@ -448,6 +583,9 @@ func (f *printer) Event(ev any) {
 				f.stderr("%s%s%s", indent, ev.Name, mark)
 			} else {
 				f.stderr("%s%s (%s)%s", indent, toolLine(ev.Name, ev.Input), resultLine(ev.Result, ev.Denied, ev.Interrupted), mark)
+				for _, n := range ev.Result.Notes {
+					f.stderr("%s  %s", indent, visible(n))
+				}
 			}
 		}
 		if ev.Denied && ev.Unattended && !f.toldUnattended {
@@ -508,8 +646,14 @@ func (f *printer) Event(ev any) {
 			}
 		}
 	case *CapEvent:
-		f.capped = true
+		f.capped, f.cappedTurn = true, ev.Turn
 		f.stderr("the run has had its %d turns of the model (--max-turns) and stops here.", ev.Turns)
+	case *HookLifeEvent:
+		// As Claude Code: the SessionStart hooks' always, the others'
+		// with --include-hook-events (no hook_progress lines).
+		if f.inv.IncludeHookEvents || ev.Life.Event == hooks.SessionStart {
+			f.line(hookLineOf(f, ev.Life))
+		}
 	case *agent.TurnEndEvent:
 		f.offer(ev.Result)
 	case *agent.PromptReturnedEvent:
@@ -529,9 +673,11 @@ func (f *printer) offer(res agent.TurnResult) {
 	}
 }
 
-// stderr prints one line on standard error.
+// stderr prints one line on standard error, where a person reads it: what
+// a model wrote may be in it (a tool's input), so it may only colour
+// itself (text.Safe).
 func (f *printer) stderr(format string, args ...any) {
-	fmt.Fprintln(f.p.stderr, "gnosh: "+strings.TrimRight(fmt.Sprintf(format, args...), "\n"))
+	fmt.Fprintln(f.p.stderr, "gnosh: "+text.Safe(strings.TrimRight(fmt.Sprintf(format, args...), "\n")))
 }
 
 // sessionID is the session's id.
@@ -559,6 +705,12 @@ func (f *printer) text(s string) {
 		}
 		f.separate()
 		f.inMessage = true
+	}
+	// On a terminal, what the model writes may only colour itself: an
+	// escape sequence in it could otherwise move the cursor, set the
+	// title or write the clipboard. (A pipe or a file gets it as it is.)
+	if s = f.safe.Write(s); s == "" {
+		return
 	}
 	fmt.Fprint(f.p.stdout, s)
 	f.wroteAny, f.endsLine = true, strings.HasSuffix(s, "\n")
@@ -625,6 +777,11 @@ func (f *printer) endReply() {
 			f.wroteAny, f.endsLine = true, true
 		}
 		f.buf.Reset()
+	}
+	if end := f.safe.End(); end != "" {
+		// (A style the reply opened is closed: gnosh's own lines and the
+		// person's shell come after it.)
+		fmt.Fprint(f.p.stdout, end)
 	}
 	f.inMessage = false
 }
@@ -740,6 +897,44 @@ type infoLine struct {
 	SessionID string `json:"session_id"`
 	Content   string `json:"content"`
 	Level     string `json:"level"`
+}
+
+// HookLifeEvent is a hook's start or end, for stream-json's hook_started
+// and hook_response lines.
+type HookLifeEvent struct {
+	Life hooks.Life
+}
+
+// hookLine is a system line of a hook's: hook_started, or hook_response
+// with what it wrote and how it ended.
+type hookLine struct {
+	Type      string  `json:"type"`
+	Subtype   string  `json:"subtype"`
+	UUID      string  `json:"uuid"`
+	SessionID string  `json:"session_id"`
+	HookID    string  `json:"hook_id"`
+	HookName  string  `json:"hook_name"`
+	HookEvent string  `json:"hook_event"`
+	Output    *string `json:"output,omitempty"`
+	Stdout    *string `json:"stdout,omitempty"`
+	Stderr    *string `json:"stderr,omitempty"`
+	ExitCode  *int    `json:"exit_code,omitempty"`
+	Outcome   string  `json:"outcome,omitempty"`
+}
+
+// hookLineOf is the line for a hook's start or end.
+func hookLineOf(f *printer, life hooks.Life) hookLine {
+	f.init()
+	l := hookLine{Type: "system", Subtype: "hook_started", UUID: newUUID(), SessionID: f.sessionID(),
+		HookID: life.ID, HookName: life.Name, HookEvent: string(life.Event)}
+	if life.Ended {
+		out := life.Stdout + life.Stderr
+		l.Subtype, l.Output, l.Stdout, l.Stderr, l.Outcome = "hook_response", &out, &life.Stdout, &life.Stderr, life.Outcome
+		if life.ExitCode >= 0 {
+			l.ExitCode = &life.ExitCode
+		}
+	}
+	return l
 }
 
 type retryLine struct {
@@ -1050,11 +1245,16 @@ func (f *printer) result(c Controls, res agent.TurnResult) resultObject {
 			reason = "aborted_tools"
 		}
 		fail("error_during_execution", reason, fmt.Sprintf("the run was stopped by %s after %d turns of the model", signalWord(f.signal), obj.NumTurns))
-	case f.capped:
+	case f.capped && res.Turn == f.cappedTurn:
+		// (The run failed when the turn it reports is the one the cap
+		// stopped. With stream-json input the cap is a turn's own, and a
+		// later message's turn has a fresh count; a turn background work
+		// woke after the answer, stopped by the cap, leaves the answer as
+		// the run's result: cappedWake.)
 		fail("error_max_turns", "max_turns", fmt.Sprintf("the run stopped after its %d turns of the model (--max-turns)", f.inv.MaxTurns))
 	case (res.Reason == agent.EndCompleted || res.Reason == agent.EndModelStopped) && f.structuredErr != "":
 		fail("error_max_structured_output_retries", "structured_output_retry_exhausted", f.structuredErr)
-	case res.Reason == agent.EndCompleted, res.Reason == agent.EndModelStopped:
+	case res.Reason == agent.EndCompleted, res.Reason == agent.EndModelStopped, res.Reason == agent.EndHalted && res.Planned:
 		obj.Subtype, obj.Result, obj.TerminalReason = "success", ptr(dropEchoedLine(res.Text)), "completed"
 		obj.StructuredOutput = f.structured
 	case res.Reason == agent.EndRefused:
@@ -1102,9 +1302,16 @@ func (f *printer) report(c Controls, res agent.TurnResult) int {
 			f.encode(obj)
 		}
 	case f.inv.JSONSchema != "":
-		// The text format prints the structured output alone.
+		// The text format prints the structured output alone: on a
+		// terminal, with what its strings hold (a model's words) unable to
+		// do more than colour themselves, as a command's report is (the
+		// side-request review of 2026-11-19).
 		if f.structured != nil {
-			fmt.Fprintln(f.p.stdout, string(f.structured))
+			out := string(f.structured)
+			if f.live {
+				out = strings.TrimRight(text.Safe(out), "\n")
+			}
+			fmt.Fprintln(f.p.stdout, out)
 		} else if f.structuredErr != "" {
 			f.stderr("%s", f.structuredErr)
 		}
@@ -1114,6 +1321,10 @@ func (f *printer) report(c Controls, res agent.TurnResult) int {
 			fmt.Fprintln(f.p.stdout)
 		}
 	}
+	// What the session's closing says after this goes to standard error
+	// alone: a stream-json line after the result was taken for part of a
+	// next one.
+	f.finished = true
 	return code
 }
 
@@ -1125,16 +1336,22 @@ func (f *printer) reportCommand(c Controls, res CommandResult, err error) int {
 	if err != nil {
 		f.stderr("%v", err)
 	}
-	text := strings.TrimRight(res.Text, "\n")
+	said := strings.TrimRight(res.Text, "\n")
 	if f.format == cli.FormatText {
-		if text != "" {
-			fmt.Fprintln(f.p.stdout, text)
+		if f.live {
+			// What a command says may be a model's words (/btw, /recap)
+			// or notes a model wrote (/mem): on a terminal they may only
+			// colour themselves.
+			said = strings.TrimRight(text.Safe(said), "\n")
+		}
+		if said != "" {
+			fmt.Fprintln(f.p.stdout, said)
 		}
 	} else {
 		info := c.Info()
 		obj := resultObject{
 			Type: "result", Subtype: "success", UUID: newUUID(), SessionID: info.ID,
-			Result:     ptr(text),
+			Result:     ptr(said),
 			DurationMS: f.p.now().Sub(f.p.start).Milliseconds(),
 			ModelUsage: map[string]modelUsage{}, PermissionDenials: []denial{},
 			LocalCommand: res.Name,
@@ -1147,6 +1364,7 @@ func (f *printer) reportCommand(c Controls, res CommandResult, err error) int {
 		}
 		f.encode(obj)
 	}
+	f.finished = true
 	if err != nil {
 		return cli.ExitFailure
 	}

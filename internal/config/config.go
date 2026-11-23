@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/gnosh-ai/gnosh/internal/hooks"
 	"github.com/gnosh-ai/gnosh/internal/shellquote"
 )
 
@@ -37,6 +38,11 @@ type Config struct {
 	// slot whose Model is not set has no choice made for it: Small then
 	// follows Large, and Large is asked for.
 	Large, Small Slot
+	// Fallback are the models a turn goes on with, in order, when the
+	// session's model cannot answer ("fallbackModel", --fallback-model; at
+	// most MaxFallbacks). A model named without its provider by the flag
+	// has an empty Provider, which the app settles as it does for -m.
+	Fallback Value[[]ModelRef]
 
 	// Options are the settings of the "options" object.
 	Options Options
@@ -59,12 +65,41 @@ type Config struct {
 	// HooksOff says why Hooks is empty although AllHooks is not: "safe
 	// mode", or the setting that switched them off. Empty otherwise.
 	HooksOff string
+	// HTTPHookURLs is Claude Code's allowedHttpHookUrls, the lists of all
+	// the files that give it, merged: an http hook runs only when its URL
+	// fits one of the patterns. Nil when no file gives it (any URL), empty
+	// but not nil when the files give only empty lists (no http hook
+	// runs). A project's waits for the folder's trust, as its
+	// disableAllHooks does: it would switch off the person's own hooks.
+	HTTPHookURLs []ListItem
+	// Sandbox is the sandbox settings: whether the shell's commands run in
+	// the operating system's sandbox, and what they may do there.
+	Sandbox Sandbox
+	// HTTPHookEnvVars is Claude Code's httpHookAllowedEnvVars, merged the
+	// same way: an http hook's header takes a variable only when both the
+	// hook's own allowedEnvVars and this list name it. Nil when no file
+	// gives it.
+	HTTPHookEnvVars []ListItem
 	// StatusLine is the command whose output is the status line under the
 	// prompt (Claude Code's statusLine), or nil. It is nil in safe mode
 	// and when disableAllHooks is set, as hooks are; StatusLineOff then
 	// says why.
 	StatusLine    *StatusLine
 	StatusLineOff string
+	// FileSuggestion is the command that offers the paths an @ mention
+	// completes to, in place of gnosh's own search (Claude Code's
+	// fileSuggestion), or nil. It is nil in safe mode and when
+	// disableAllHooks is set, as the status line is; FileSuggestionOff
+	// then says why.
+	FileSuggestion    *FileSuggestion
+	FileSuggestionOff string
+	// LSPServers are the language servers of the lspServers key, by name
+	// (lsp.go): none in safe mode.
+	LSPServers []LSPServer
+	// Attribution is what the model adds to the git commits and pull
+	// requests it makes (Claude Code's attribution). gnosh adds none of
+	// its own: both are empty unless a file sets them.
+	Attribution Attribution
 	// Permissions are the permission rules, the starting mode and the
 	// extra directories.
 	Permissions Permissions
@@ -118,23 +153,27 @@ type Held struct {
 // the same words: its Restricts says which kinds still apply in a folder
 // that is not trusted, and its question says what each could do.
 const (
-	KindProvider    = "provider"
-	KindModel       = "model"
-	KindHost        = "host"
-	KindHook        = "hook"
-	KindHookOff     = "hook-off" // switching all hooks off
-	KindAllowRule   = "allow-rule"
-	KindAskRule     = "ask-rule"
-	KindDenyRule    = "deny-rule"
-	KindMode        = "mode"
-	KindAddDir      = "add-dir"
-	KindEnv         = "env"
-	KindOption      = "option"
-	KindExtraPath   = "extra-path"
-	KindAddress     = "address"
-	KindHiddenSkill = "hidden-skill"
-	KindRemoval     = "removal" // taking away a provider, a model or a host a weaker file declared
-	KindStatusLine  = "status-line"
+	KindProvider     = "provider"
+	KindModel        = "model"
+	KindHost         = "host"
+	KindHook         = "hook"
+	KindHookOff      = "hook-off" // switching all hooks off
+	KindAllowRule    = "allow-rule"
+	KindAskRule      = "ask-rule"
+	KindDenyRule     = "deny-rule"
+	KindMode         = "mode"
+	KindAddDir       = "add-dir"
+	KindEnv          = "env"
+	KindOption       = "option"
+	KindExtraPath    = "extra-path"
+	KindAddress      = "address"
+	KindHiddenSkill  = "hidden-skill"
+	KindRestriction  = "restriction" // a setting that only takes a power away, such as disableBypassPermissionsMode
+	KindRemoval      = "removal"     // taking away a provider, a model or a host a weaker file declared
+	KindStatusLine   = "status-line"
+	KindFileSuggest  = "file-suggestion"
+	KindLSPServer    = "lsp"           // a language server, a program gnosh runs (the trust package's word)
+	KindSandboxWider = "sandbox-wider" // a sandbox setting that lets its commands do more
 )
 
 // StatusLine is a command whose output takes the place of the status line
@@ -148,6 +187,24 @@ type StatusLine struct {
 	// Refresh is how often it is run again besides the moments it runs at
 	// (Claude Code's refreshInterval); zero means at those moments alone.
 	Refresh time.Duration
+	// Origin is the line that sets it.
+	Origin Origin
+}
+
+// Attribution is Claude Code's attribution setting: the lines the model
+// ends a commit's message with, and a pull request's description.
+type Attribution struct {
+	Commit, PR string
+	// Origin is the line that sets it.
+	Origin Origin
+}
+
+// FileSuggestion is a command that offers the paths an @ mention completes
+// to: Claude Code's fileSuggestion setting, of type "command".
+type FileSuggestion struct {
+	// Command is the command line, run by sh with {"query": what was typed
+	// after the @} on its standard input; it prints a path a line.
+	Command string
 	// Origin is the line that sets it.
 	Origin Origin
 }
@@ -258,6 +315,10 @@ type Model struct {
 	// first. Not set means the model's ID decides; set and empty means the
 	// model has no thinking switch.
 	ThinkingLevels Value[[]string]
+	// ThinkingBudget is the most tokens the model may think before a
+	// reply, when it thinks; 0 means no cap. Not set means MAX_THINKING_TOKENS,
+	// or gnosh's own cap for a llama.cpp server, or none.
+	ThinkingBudget Value[int]
 	// Origin is the last place that set the model.
 	Origin Origin
 }
@@ -335,6 +396,15 @@ type Hook struct {
 	// connected MCP server (mcp_tool), with Input as its arguments.
 	Server, Tool string
 	Input        json.RawMessage
+	// Prompt makes the hook a prompt hook: a rule or a condition the model
+	// judges ($ARGUMENTS is the event); Model is the model it names, and
+	// ContinueOnBlock its continueOnBlock (hooks/prompthook.go).
+	Prompt          string
+	Model           string
+	ContinueOnBlock bool
+	// Agent makes the hook an agent hook: Prompt is a task for a sub-agent
+	// that looks with its tools before it answers (hooks/prompthook.go).
+	Agent bool
 	// Timeout is how long the hook may run. Zero means the event's default.
 	Timeout time.Duration
 	// If is the hook's "if" filter: one permission rule. On a tool event
@@ -353,10 +423,16 @@ type Hook struct {
 // quoted where a shell would need it.
 func (h Hook) CommandLine() string {
 	if h.URL != "" {
-		return "POST " + h.URL
+		return "POST " + hooks.ShownURL(h.URL)
 	}
 	if h.Server != "" {
 		return "mcp " + h.Server + "/" + h.Tool
+	}
+	if h.Prompt != "" && h.Agent {
+		return "agent: " + h.Prompt
+	}
+	if h.Prompt != "" {
+		return "prompt: " + h.Prompt
 	}
 	if h.Args == nil {
 		return h.Command
@@ -378,6 +454,18 @@ type Permissions struct {
 	BypassDisabled Value[bool]
 	// DenyInsteadOfPrompting refuses what would ask, and goes on.
 	DenyInsteadOfPrompting Value[bool]
+	// BlockReads and BlockWrites are Claude Code's
+	// blockReadsOutsideWorkingDirectories and
+	// blockWritesOutsideWorkingDirectories: the file tools refuse to read,
+	// or to change, a path outside the working directories, in every
+	// mode. A true in any file holds; false is the same as not set.
+	BlockReads, BlockWrites Value[bool]
+	// ProjectDirs are those of Dirs that a file the project supplied
+	// added (its gnosh.json, or a settings.local.json gnosh did not
+	// write). The blocks do not count them as working directories, as
+	// Claude Code's do not: a repository can turn a block on for itself,
+	// and cannot widen the person's.
+	ProjectDirs []string
 	// Layers are the rules, one layer per file or flag that gave any,
 	// weakest first. Deny rules of every layer count, then ask rules, then
 	// allow rules, so the order matters only for display.
@@ -443,19 +531,27 @@ type ContextFiles struct {
 	// LocalNames are the names of the person's private file about a
 	// project, read after ProjectNames in each directory.
 	LocalNames []string
+	// DotDirs are the folders of a directory that hold its files too
+	// (.claude/CLAUDE.md beside CLAUDE.md) and its rules, in a "rules"
+	// folder inside them (.claude/rules/*.md): gnosh's own and Claude
+	// Code's.
+	DotDirs []string
 	// Cwd and ProjectRoot say where the walk ends and where the project
 	// begins. A directory above ProjectRoot gives only files owned by the
 	// user or by root.
 	Cwd, ProjectRoot string
 	// Global are the user's global files and folders, in the order they
-	// are read: GNOSH.md in the config directory, the AGENTS.md shared
-	// with other programs, then what the userInstructionFiles option
-	// names. A folder gives every Markdown file in it. A file that does
-	// not exist is passed over.
+	// are read: GNOSH.md in the config directory and the rules folder
+	// beside it, the AGENTS.md shared with other programs, then what the
+	// userInstructionFiles option names. A folder gives every Markdown
+	// file in it. A file that does not exist is passed over.
 	Global []ListItem
 	// Extra are more instruction files of the project, from the
 	// projectInstructionFiles option.
 	Extra []ListItem
+	// Exclude are the files never read, by any route, as patterns matched
+	// against their absolute paths (the claudeMdExcludes option).
+	Exclude []ListItem
 	// ImportDepth is how many levels deep an @path line is followed.
 	ImportDepth int
 	// MaxFileBytes is the size past which a file is passed over, with a

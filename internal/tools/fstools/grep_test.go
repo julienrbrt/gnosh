@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/gnosh-ai/gnosh/internal/core"
 )
@@ -186,6 +187,10 @@ func TestGrepMultiline(t *testing.T) {
 		{"only the matches", in{"pattern": `return \d\n\}`, "output_mode": "content", "multiline": true, "-o": true}, p + "\n3:return 1\n4:}\n7:return 2\n8:}\n"},
 		{"a match that ends with a line break", in{"pattern": `middle\n`, "output_mode": "content", "multiline": true}, p + "\n5:middle\n"},
 		{"ignoring case", in{"pattern": `START\nFUNC`, "output_mode": "content", "multiline": true, "-i": true}, p + "\n1:start\n2:func a() {\n"},
+		// Nothing is after the last line break: no empty line is there to
+		// match (the search-tools review of 2026-11-20).
+		{"no empty line after the last", in{"pattern": `^$`, "multiline": true}, "No matches found in " + p + ".\n"},
+		{"no blank line after the last", in{"pattern": `^\s*$`, "output_mode": "count", "multiline": true}, "No matches found in " + p + ".\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -195,6 +200,12 @@ func TestGrepMultiline(t *testing.T) {
 			}
 		})
 	}
+	t.Run("an empty line is found", func(t *testing.T) {
+		q := f.file("gap.txt", "a\n\nb\n")
+		if got, want := f.ok(f.grep, in{"pattern": `^$`, "output_mode": "content", "multiline": true, "path": q}), q+"\n2:\n"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
 	t.Run("CRLF files", func(t *testing.T) {
 		q := f.file("crlf.txt", "one\r\ntwo\r\nthree\r\n")
 		got := f.ok(f.grep, in{"pattern": `one\ntwo`, "output_mode": "content", "multiline": true, "path": q})
@@ -358,6 +369,61 @@ func TestGrepWhatIsLeftOut(t *testing.T) {
 		// Rules from above still hold below a directory that is searched.
 		if got := names(f, in{"pattern": "needle", "path": f.path("sub")}); !reflect.DeepEqual(got, []string{"sub/keep.gen"}) {
 			t.Errorf("below sub: %v", got)
+		}
+		// A glob reaches what it names, hidden or ignored, as ripgrep's
+		// does; .git stays out, and a binary file is still not searched
+		// (the search-tools review of 2026-11-20).
+		for _, c := range []struct {
+			glob string
+			want []string
+		}{
+			{"ignored.txt", []string{"ignored.txt"}},
+			{".hidden*", []string{".hidden.txt"}},
+			{"*.gen", []string{"sub/keep.gen", "sub/made.gen"}},
+			{"build/**", []string{"build/out.txt"}},
+			{".config/*.txt", []string{".config/settings.txt"}},
+			{"HEAD", nil},
+			{"binary.dat", nil},
+		} {
+			if got := names(f, in{"pattern": "needle", "glob": c.glob}); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("glob %q found %v, want %v", c.glob, got, c.want)
+			}
+		}
+	})
+	t.Run("a glob that any directory could hold enters no hidden or ignored one", func(t *testing.T) {
+		f := newFixture(t, Options{})
+		f.file(".gitignore", "node_modules/\n")
+		f.file("src/a.py", "needle\n")
+		f.file(".venv/lib/site.py", "needle\n")
+		f.file("node_modules/pkg/x.py", "needle\n")
+		if got := names(f, in{"pattern": "needle", "glob": "**/*.py"}); !reflect.DeepEqual(got, []string{"src/a.py"}) {
+			t.Errorf("glob **/*.py found %v, want only src/a.py", got)
+		}
+		// Spelled out, they are entered.
+		if got := names(f, in{"pattern": "needle", "glob": "node_modules/**/*.py"}); !reflect.DeepEqual(got, []string{"node_modules/pkg/x.py"}) {
+			t.Errorf("glob node_modules/**/*.py found %v", got)
+		}
+		if got := names(f, in{"pattern": "needle", "glob": ".venv/**"}); !reflect.DeepEqual(got, []string{".venv/lib/site.py"}) {
+			t.Errorf("glob .venv/** found %v", got)
+		}
+	})
+	t.Run("a negated glob leaves out directories too", func(t *testing.T) {
+		f := newFixture(t, Options{})
+		for _, name := range []string{"vendor/lib.go", "src/vendor/x.go", "src/a.go", "app.min.js", "app.js", "vendor.txt"} {
+			f.file(name, "needle\n")
+		}
+		for _, c := range []struct {
+			glob string
+			want []string
+		}{
+			{"!vendor", []string{"app.js", "app.min.js", "src/a.go", "vendor.txt"}},
+			{"!vendor/", []string{"app.js", "app.min.js", "src/a.go", "vendor.txt"}},
+			{"!*.min.js", []string{"app.js", "src/a.go", "src/vendor/x.go", "vendor.txt", "vendor/lib.go"}},
+			{"!src/vendor", []string{"app.js", "app.min.js", "src/a.go", "vendor.txt", "vendor/lib.go"}},
+		} {
+			if got := names(f, in{"pattern": "needle", "glob": c.glob}); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("glob %q found %v, want %v", c.glob, got, c.want)
+			}
 		}
 	})
 	t.Run("ignore rules off", func(t *testing.T) {
@@ -558,6 +624,15 @@ func TestGrepVeryLongLineIsSearchedInPieces(t *testing.T) {
 	got = f.ok(f.grep, in{"pattern": "^third", "output_mode": "content"})
 	if want := p + "\n3:third NEEDLE\n"; got != want {
 		t.Errorf("line numbers after a long line: got %q, want %q", got, want)
+	}
+	// A match in two pieces of one line counts that line once, and shows
+	// it once (the search-tools review of 2026-11-20).
+	q := f.file("twice.txt", strings.Repeat("x", 500)+"NEEDLE"+strings.Repeat("y", 1500)+"NEEDLE\n")
+	got = f.ok(f.grep, in{"pattern": "NEEDLE", "output_mode": "count", "path": q})
+	mustContain(t, got, q+":1\n")
+	got = f.ok(f.grep, in{"pattern": "NEEDLE", "output_mode": "content", "path": q})
+	if n := strings.Count("\n"+got, "\n1:"); n != 1 {
+		t.Errorf("the line was shown %d times: %q", n, got)
 	}
 }
 
@@ -907,12 +982,12 @@ func TestGrepLiteralShortCutChangesNothing(t *testing.T) {
 	}
 	// And the answers are the right ones.
 	got := f.ok(f.grep, in{"pattern": "NEEDLE", "output_mode": "count", "-i": true})
-	want := f.path("big.txt") + ":12\n" + f.path("small.txt") + ":2\n" + f.path("crlf.txt") + ":1\n\nTotal: 15 matching lines in 3 files.\n"
+	want := f.path("big.txt") + ":12\n" + f.path("crlf.txt") + ":1\n" + f.path("small.txt") + ":2\n\nTotal: 15 matching lines in 3 files.\n"
 	if got != want {
 		t.Errorf("count ignoring case =\n%s\nwant\n%s", got, want)
 	}
 	got = f.ok(f.grep, in{"pattern": "needle", "output_mode": "count"})
-	want = f.path("big.txt") + ":8\n" + f.path("small.txt") + ":2\n" + f.path("crlf.txt") + ":1\n\nTotal: 11 matching lines in 3 files.\n"
+	want = f.path("big.txt") + ":8\n" + f.path("crlf.txt") + ":1\n" + f.path("small.txt") + ":2\n\nTotal: 11 matching lines in 3 files.\n"
 	if got != want {
 		t.Errorf("count =\n%s\nwant\n%s", got, want)
 	}
@@ -985,4 +1060,80 @@ func FuzzContainsFold(f *testing.F) {
 			t.Fatalf("containsFold(%q, %q) = %v, want %v", b, q, got, want)
 		}
 	})
+}
+
+// .ignore and .rgignore are read as ripgrep reads them, with more weight
+// than .gitignore: what .gitignore leaves out, .rgignore can let in.
+func TestSearchesReadIgnoreAndRgignore(t *testing.T) {
+	f := newFixture(t, Options{})
+	f.file(".gitignore", "kept.txt\n")
+	f.file(".ignore", "dropped.txt\n")
+	f.file(".rgignore", "!kept.txt\n")
+	for _, name := range []string{"kept.txt", "dropped.txt", "plain.txt"} {
+		f.file(name, "needle\n")
+	}
+	got := f.ok(f.grep, in{"pattern": "needle"})
+	mustContain(t, got, f.path("kept.txt"), f.path("plain.txt"))
+	mustNotContain(t, got, f.path("dropped.txt"))
+	if paths, _ := f.globbed(in{"pattern": "*.txt"}); !reflect.DeepEqual(sorted(paths), []string{"kept.txt", "plain.txt"}) {
+		t.Errorf("Glob listed %v", paths)
+	}
+}
+
+// The types the search-tools review of 2026-11-20 found missing or short.
+func TestMoreFileTypes(t *testing.T) {
+	for _, c := range []struct {
+		typ, name string
+		want      bool
+	}{
+		{"docker", "api.Dockerfile", true}, {"docker", "Dockerfile.dev", true}, {"docker", "Dockerfile", true},
+		{"java", "index.jsp", true}, {"java", "app.properties", true},
+		{"gradle", "build.gradle.kts", true}, {"cuda", "kernel.cu", true}, {"erb", "page.html.erb", true},
+		{"ps", "setup.ps1", true}, {"powershell", "mod.psm1", true}, {"sass", "a.sass", true},
+		{"java", "Main.kt", false},
+	} {
+		typ, ok := lookupFileType(c.typ)
+		if !ok {
+			t.Errorf("no type %q", c.typ)
+			continue
+		}
+		if got := typ.matches(c.name); got != c.want {
+			t.Errorf("type %s on %s: %v, want %v", c.typ, c.name, got, c.want)
+		}
+	}
+}
+
+// A file in UTF-16, with its byte order mark, is searched as the text it
+// is, as ripgrep searches one, and not passed over as binary.
+func TestGrepUTF16(t *testing.T) {
+	f := newFixture(t, Options{})
+	enc := func(s string, little bool) string {
+		var b strings.Builder
+		if little {
+			b.WriteString("\xff\xfe")
+		} else {
+			b.WriteString("\xfe\xff")
+		}
+		for _, u := range utf16.Encode([]rune(s)) {
+			if little {
+				b.WriteByte(byte(u))
+				b.WriteByte(byte(u >> 8))
+			} else {
+				b.WriteByte(byte(u >> 8))
+				b.WriteByte(byte(u))
+			}
+		}
+		return b.String()
+	}
+	le := f.file("win.txt", enc("first line\r\nthe needle, café\r\n", true))
+	be := f.file("mac.txt", enc("no\nneedle here\n", false))
+	got := f.ok(f.grep, in{"pattern": "needle", "output_mode": "content", "path": le})
+	if want := le + "\n2:the needle, café\n"; got != want {
+		t.Errorf("UTF-16LE: got %q, want %q", got, want)
+	}
+	got = f.ok(f.grep, in{"pattern": "needle", "output_mode": "content", "path": be})
+	if want := be + "\n2:needle here\n"; got != want {
+		t.Errorf("UTF-16BE: got %q, want %q", got, want)
+	}
+	mustContain(t, f.ok(f.grep, in{"pattern": "needle"}), le, be)
 }

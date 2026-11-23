@@ -24,6 +24,11 @@ import (
 type Texts struct {
 	// EmptyNudge is sent when the model answered with nothing.
 	EmptyNudge string
+	// TextCallNudge is sent when the model's reply is a tool call written
+	// out as text, and TextCallNotice tells the person at every third in a
+	// row.
+	TextCallNudge  string
+	TextCallNotice string
 	// EmptyNotice tells the person about it at every third empty reply in
 	// a row. It is given the count.
 	EmptyNotice string
@@ -35,6 +40,10 @@ type Texts struct {
 	// RepeatPair is the same for two calls taking turns. It is given the
 	// number of rounds looked at and the two calls.
 	RepeatPair string
+	// RepeatCycle is the same for a cycle of three or four rounds come
+	// round again and again. It is given the number of rounds looked at,
+	// the length of the cycle, and its rounds.
+	RepeatCycle string
 
 	// Checkpoint asks the model to judge whether there is a real reason to
 	// stop. It is given the marker and how many times in a row the turn
@@ -103,8 +112,9 @@ type Texts struct {
 	// after the summary and tells the model to carry on.
 	SummaryIntro string
 	SummaryAfter string
-	// TrimNote stands where the earliest part of a conversation was left
-	// out of a summary request because it would not fit.
+	// TrimNote stands where part of a conversation was left out of a
+	// summary request because it would not fit: after its first message,
+	// or at its start.
 	TrimNote string
 
 	// LoopContinue is /loop's "keep going" prompt. LoopQuestion questions
@@ -127,12 +137,17 @@ const (
 var defaultTexts = Texts{
 	EmptyNudge: "Your last reply was empty: it held no text and no tool call. " +
 		"If there is more to do, go on and do it now. If you are done, say what you did or found.",
+	TextCallNudge: "Your last reply held a tool call written out as text, which runs nothing. " +
+		"To use a tool, call it; otherwise answer in words.",
+	TextCallNotice: "The model has written a tool call out as text, which runs nothing, %d times in a row. gnosh keeps telling it so; Esc stops the turn.",
 	EmptyNotice: "The model has answered with nothing %d times in a row. gnosh keeps asking. " +
 		"A lower thinking level usually fixes this (/no_think, or pick a level in /model); Esc stops the turn.",
 
 	RepeatNudge: "You have made the same call in %d of your last %d rounds, with the same result each time:\n\n%s\n\n" +
 		"Making it again will tell you nothing new. Answer with what you have, or take a different approach.",
 	RepeatPair: "Your last %d rounds only went back and forth between the same calls, with the same results each time:\n\n%s\n\n" +
+		"Making them again will tell you nothing new. Answer with what you have, or take a different approach.",
+	RepeatCycle: "Your last %d rounds went round the same %d rounds again and again, with the same results each time:\n\n%s\n\n" +
 		"Making them again will tell you nothing new. Answer with what you have, or take a different approach.",
 
 	Checkpoint: "Decide this first, honestly, before anything else: is there a genuine reason to stop here? " +
@@ -175,14 +190,15 @@ var defaultTexts = Texts{
 		"1. What the user asked for: every message of the user's, in their own words where they are short, and what they meant by each.\n" +
 		"2. What was done: the steps taken and what came of each, with the names of the files read and changed and the commands run.\n" +
 		"3. What was found: facts about the project, decisions made and why, errors met and how each was fixed.\n" +
-		"4. Where things stand: what is finished, what is half done, and anything running in the background.\n" +
+		"4. Where things stand: what is finished, what is half done, what was found or planned and not yet done, and anything running in the background.\n" +
 		"5. The next step: what you were about to do, quoting the user's own words for it.\n\n" +
 		"Call no tools. Answer with the summary and nothing else.",
 	SummaryExtra: "The user asks this of the summary: %s",
 	SummaryIntro: "The earlier part of this conversation ran out of room in your context and was replaced by the summary of it that follows.",
-	SummaryAfter: "Carry on with the task from where the summary leaves it. Do not ask the user to repeat anything, " +
-		"and do not ask whether to go on.",
-	TrimNote: "The earliest part of the conversation is left out here, because the whole of it no longer fits.",
+	SummaryAfter: "Carry on with the task from where the summary leaves it. Keep every stop the user set: where they " +
+		"asked to be told or asked before a step, stop there and do that first. Do not ask the user to repeat anything, " +
+		"and otherwise do not ask whether to go on.",
+	TrimNote: "Part of the conversation is left out here, because the whole of it no longer fits.",
 
 	LoopContinue: "Keep going with the task. When all of it is finished and checked, reply with " + LoopDone + " alone on a line.",
 	LoopQuestion: "You said the task is done. Before that is believed: name what you produced, and show the listing or the output that proves each part of it. " +
@@ -203,9 +219,11 @@ func (t Texts) fill() Texts {
 		}
 	}
 	set(&d.EmptyNudge, t.EmptyNudge)
+	set(&d.TextCallNudge, t.TextCallNudge)
 	set(&d.EmptyNotice, t.EmptyNotice)
 	set(&d.RepeatNudge, t.RepeatNudge)
 	set(&d.RepeatPair, t.RepeatPair)
+	set(&d.RepeatCycle, t.RepeatCycle)
 	set(&d.Checkpoint, t.Checkpoint)
 	set(&d.DriverFailed, t.DriverFailed)
 	set(&d.StoppedBefore, t.StoppedBefore)
@@ -238,7 +256,7 @@ func (t Texts) fill() Texts {
 	// The texts that are given nothing are read as the formats they are,
 	// once, here; the loop then uses them as they stand.
 	for _, p := range []*string{
-		&d.EmptyNudge, &d.StoppedBefore, &d.StoppedDuring, &d.HaltedDuring, &d.ReplyCut, &d.Killed, &d.AsideRunning,
+		&d.EmptyNudge, &d.TextCallNudge, &d.StoppedBefore, &d.StoppedDuring, &d.HaltedDuring, &d.ReplyCut, &d.Killed, &d.AsideRunning,
 		&d.Denied, &d.Unattended, &d.SummaryRequest, &d.SummaryIntro, &d.SummaryAfter,
 		&d.TrimNote, &d.LoopContinue, &d.LoopQuestion,
 	} {

@@ -248,8 +248,11 @@ type command struct {
 	// pass such an argument.
 	passes   bool
 	dashHint string
-	pri      int
-	status   Status
+	// dashIsStdin says - by itself is an argument of the command's, which
+	// reads standard input there (mcp add-json <name> -).
+	dashIsStdin bool
+	pri         int
+	status      Status
 	// summary is the command's line in a list of commands; about is more,
 	// for its own help.
 	summary string

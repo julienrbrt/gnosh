@@ -244,11 +244,37 @@ func (t runTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEnv)
 	if err := decodeParams(call.Input, &p); err != nil {
 		return core.ErrorResult(err.Error()), nil
 	}
+	if p.Name == "" && callsMem(p.Code) {
+		// mem lives in a VM of its own: code that calls it, sent with no
+		// name, ran in the scratch VM, where mem is no name ("name mem not
+		// declared"), 10 times in 8 FrontierHarness trials on box 2
+		// (2026-11-19). It runs in mem, as it was meant to, and reads as a
+		// call on mem does (the words are the earlier gnosh's).
+		p.Name = gnovm.MemVM
+	}
 	res, err := t.run(ctx, p, call, env)
 	if err != nil {
 		return core.ToolResult{}, err
 	}
 	return p.shown(res), nil
+}
+
+// memCall is a call on mem in Gno code, and memDeclared a name of mem's
+// declared by the code itself.
+var (
+	memCall     = regexp.MustCompile(`(^|[^A-Za-z0-9_.])mem\.[A-Z][A-Za-z0-9_]*\(`)
+	memDeclared = regexp.MustCompile(`(^|[^A-Za-z0-9_])(mem\s*:=|var\s+mem\b|func\s+mem\b|type\s+mem\b|const\s+mem\b)`)
+)
+
+// callsMem reports whether code with no VM named is for mem: it calls mem,
+// does not declare a mem of its own, and is no package (which runs in a
+// fresh VM of its own).
+func callsMem(code string) bool {
+	trimmed := strings.TrimSpace(code)
+	if strings.HasPrefix(trimmed, "package ") {
+		return false
+	}
+	return memCall.MatchString(code) && !memDeclared.MatchString(code)
 }
 
 func (t runTool) run(ctx context.Context, p RunParams, call core.ToolCall, env *core.ToolEnv) (core.ToolResult, error) {
@@ -757,7 +783,7 @@ func renderList(l gnovm.ListResult, deaths []string) string {
 		fmt.Fprintf(&b, "the VM worker ended %d time(s) in this gnosh; last: %s\n", len(deaths), deaths[len(deaths)-1])
 	}
 	fmt.Fprintf(&b, "importable: fmt, %s\n", strings.Join(gnovm.ImportablePackages(), ", "))
-	b.WriteString("Built on gno.land (https://gno.land) · built on gnosh (https://gnosh.ai)\n")
+	b.WriteString(gnovm.AttributionNotice + "\n")
 	return b.String()
 }
 

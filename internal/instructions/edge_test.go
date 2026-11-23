@@ -190,8 +190,13 @@ func TestSmallHelpers(t *testing.T) {
 	}
 	same(t, "ancestors", ancestors("/a/b/c"), []string{"/", "/a", "/a/b", "/a/b/c"})
 	same(t, "ancestors of the top", ancestors("/"), []string{"/"})
-	if !bareWord("alice") || bareWord("a.md") || bareWord("a/b") || bareWord("~") {
-		t.Error("bareWord")
+	for written, want := range map[string]bool{
+		"alice": false, "types/node": false, "pytest.fixture": false, "docs": false,
+		"a.md": true, "docs/a.MD": true, "notes.txt": true, "./a": true, "../a": true, "~/a": true, "/etc/a": true,
+	} {
+		if meantAsPath(written) != want {
+			t.Errorf("meantAsPath(%q) = %v", written, !want)
+		}
 	}
 }
 
@@ -206,4 +211,69 @@ func TestSetsWithEscapes(t *testing.T) {
 	if !matches(t, `[+-\]]x`, "]x") || !matches(t, `[+-\]]x`, "Ax") || matches(t, `[+-\]]x`, "ax") {
 		t.Error(`[+-\]]x`)
 	}
+}
+
+// lookFS is a file system that notes every name it is asked about.
+type lookFS struct {
+	fstest.MapFS
+	looked []string
+}
+
+func (l *lookFS) Open(name string) (fs.File, error) {
+	l.looked = append(l.looked, name)
+	return l.MapFS.Open(name)
+}
+
+func (l *lookFS) Stat(name string) (fs.FileInfo, error) {
+	l.looked = append(l.looked, name)
+	return l.MapFS.Stat(name)
+}
+
+func (l *lookFS) Lstat(name string) (fs.FileInfo, error) {
+	l.looked = append(l.looked, name)
+	return l.MapFS.Lstat(name)
+}
+
+func (l *lookFS) ReadLink(name string) (string, error) {
+	l.looked = append(l.looked, name)
+	return l.MapFS.ReadLink(name)
+}
+
+func (l *lookFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	l.looked = append(l.looked, name)
+	return l.MapFS.ReadDir(name)
+}
+
+// Nothing in a folder the system mounts from the network as it is looked
+// at (/net/<host>, /Network) is looked at outside the project and the
+// person's home: an import of "@/net/beacon.example/x.md", or a file
+// linked there, would have the machine call that host as gnosh starts
+// (the skills review of 2026-11-19). A project that lives in one is read
+// as ever.
+func TestNetworkMountsAreNotLookedAt(t *testing.T) {
+	fsys := &lookFS{MapFS: tree(map[string]string{
+		"/p/CLAUDE.md":             "See @/net/beacon.example/x.md and @/Network/Servers/b/y.md\n",
+		"/p/.claude/CLAUDE.md":     "-> /net/beacon.example/z.md",
+		"/net/beacon.example/x.md": "beacon\n",
+		"/net/beacon.example/z.md": "beacon\n",
+		"/Network/Servers/b/y.md":  "far\n",
+		"/net/srv/proj/CLAUDE.md":  "a project that lives on the network\n",
+	})}
+	s := load(t, Options{Cwd: "/p", Home: "/home/u", ProjectNames: []string{"CLAUDE.md"}, DotDirs: []string{".claude"}, Trusted: true, FS: fsys})
+	same(t, "files", paths(s.Files()), []string{"/p/CLAUDE.md"})
+	for _, name := range fsys.looked {
+		if strings.HasPrefix(name, "net/") || strings.HasPrefix(name, "Network/") {
+			t.Errorf("looked at %s", name)
+		}
+	}
+	var said []string
+	for _, w := range s.Warnings() {
+		said = append(said, w.Text)
+	}
+	if all := strings.Join(said, "\n"); strings.Count(all, "mounts from the network") != 3 {
+		t.Errorf("the warnings:\n%s", all)
+	}
+	fsys.looked = nil
+	s = load(t, Options{Cwd: "/net/srv/proj", ProjectNames: []string{"CLAUDE.md"}, Trusted: true, FS: fsys})
+	same(t, "files of a project on the network", paths(s.Files()), []string{"/net/srv/proj/CLAUDE.md"})
 }

@@ -53,6 +53,21 @@ func TestLooksSecret(t *testing.T) {
 		{"rotate the secret every month", ""},
 		{"İstanbul password: hunter22", "a password with its value"},
 		{"", ""},
+
+		// A wallet's recovery phrase, as BIP-0039's own examples have
+		// them, written out or numbered as one is written down (the gno
+		// review of 2026-11-19: mem kept a 24-word one); and prose,
+		// which is held together by words the list has not.
+		{"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "a wallet's recovery phrase (seed words)"},
+		{"seed: 1. legal 2. winner 3. thank 4. year 5. wave 6. sausage 7. worth 8. useful 9. legal 10. winner 11. thank 12. yellow", "a wallet's recovery phrase (seed words)"},
+		{"Letter Advice Cage Absurd Amount Doctor Acoustic Avoid Letter Advice Cage Above", "a wallet's recovery phrase (seed words)"},
+		{"legal winner thank year wave sausage worth useful legal winner thank", ""},
+		{"the deploy script reads the config file and then restarts the service on every host in the cluster", ""},
+		// A private key in hex, and a digest, which is written the same.
+		{"validator private key 0x1f2e3d4c5b6a79881f2e3d4c5b6a79881f2e3d4c5b6a79881f2e3d4c5b6a7988", "a private key in hex"},
+		{"wallet key: 1f2e3d4c5b6a79881f2e3d4c5b6a79881f2e3d4c5b6a79881f2e3d4c5b6a7988", "a private key in hex"},
+		{"the release tarball's sha256 is 1f2e3d4c5b6a79881f2e3d4c5b6a79881f2e3d4c5b6a79881f2e3d4c5b6a7988", ""},
+		{"the monkey sha256 1f2e3d4c5b6a79881f2e3d4c5b6a79881f2e3d4c5b6a79881f2e3d4c5b6a7988", ""},
 	} {
 		what, shown := looksSecret(c.text)
 		require.Equal(t, c.what, what, "%q", c.text)

@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
+	"io"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -17,6 +17,7 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/cli"
 	"github.com/gnosh-ai/gnosh/internal/config"
 	"github.com/gnosh-ai/gnosh/internal/hooks"
+	"github.com/gnosh-ai/gnosh/internal/instructions"
 	"github.com/gnosh-ai/gnosh/internal/permission"
 	"github.com/gnosh-ai/gnosh/internal/tools/fstools"
 	"github.com/gnosh-ai/gnosh/internal/tools/shelltool"
@@ -30,6 +31,8 @@ import (
 type startup struct {
 	p   *program
 	inv cli.Invocation
+	// sandbox is the session's sandbox, worked out once (sandbox.go).
+	sandbox sandboxState
 
 	// attended says a person is there to be asked: the session is an
 	// interactive one, and its front end can be typed into.
@@ -76,8 +79,8 @@ type startup struct {
 // as Claude Code writes it, WebFetch(domain:...) say, was refused.
 func ownTools() []string {
 	d := fstools.Defaults()
-	return []string{d.ReadName, d.WriteName, d.EditName, d.GlobName, d.GrepName, shelltool.BashName, shelltool.StopName, shelltool.MonitorName,
-		webFetchName, webSearchName, agentToolName, sendMessageName, askToolName, enterPlanName, exitPlanName, skillToolName}
+	return []string{d.ReadName, d.WriteName, d.EditName, d.GlobName, d.GrepName, d.NotebookEditName, shelltool.BashName, shelltool.StopName, shelltool.MonitorName,
+		webFetchName, webSearchName, agentToolName, sendMessageName, askToolName, enterPlanName, exitPlanName, enterTreeName, exitTreeName, cronCreateName, cronListName, cronDeleteName, scheduleWakeupName, pushName, skillToolName, gnokeyToolName}
 }
 
 // toolNames returns the one list of tool names of this program: gnosh's
@@ -139,7 +142,7 @@ func firedEvents() []hooks.Event {
 	for _, name := range agent.Fires() {
 		out = append(out, hooks.Event(name))
 	}
-	return append(out, hooks.InstructionsLoaded, hooks.Notification, hooks.PostModelSwitch, hooks.DirectoryAdded, hooks.CwdChanged, hooks.UserPromptExpansion)
+	return append(out, hooks.InstructionsLoaded, hooks.Notification, hooks.PreModelSwitch, hooks.PostModelSwitch, hooks.DirectoryAdded, hooks.CwdChanged, hooks.UserPromptExpansion, hooks.ConfigChange, hooks.FileChanged, hooks.Elicitation, hooks.ElicitationResult)
 }
 
 // absFrom makes a path typed on the command line absolute: a relative one
@@ -156,6 +159,20 @@ func (p *program) absFrom(path string) string {
 		path = filepath.Join(p.o.Cwd, path)
 	}
 	return filepath.Clean(path)
+}
+
+// prepared is prepare for a command that needs the config and starts no
+// session: with a nil result, what kept the folder or the config from
+// being read has been printed, and the int is the exit code.
+func (p *program) prepared(ctx context.Context, inv cli.Invocation) (*startup, int) {
+	st, code := p.prepare(ctx, inv, false)
+	if st == nil || st.cfg == nil {
+		if st != nil {
+			st.printProblems()
+		}
+		return nil, max(code, cli.ExitFailure)
+	}
+	return st, code
 }
 
 // prepare settles the folder a command line works in, its trust and its
@@ -188,10 +205,7 @@ func (p *program) prepare(ctx context.Context, inv cli.Invocation, interactive b
 	if st.cfg == nil {
 		return st, cli.ExitFailure
 	}
-	for _, h := range st.cfg.Held {
-		st.held = append(st.held, trust.Holding{Kind: h.Kind, Text: h.Text, File: h.Origin.File, Line: h.Origin.Line})
-	}
-	st.held = append(st.held, st.gitPrograms...)
+	st.held = st.heldList()
 
 	record := st.trustStore()
 	st.decision = trust.Decide(trust.Asked{
@@ -237,6 +251,7 @@ func (st *startup) load(trusted bool) {
 	flags := config.Flags{
 		Model:           inv.Model,
 		SmallModel:      inv.SmallModel,
+		FallbackModel:   inv.FallbackModel,
 		ReasoningEffort: inv.Effort,
 		PermissionMode:  inv.PermissionMode,
 		AllowedTools:    inv.AllowedTools,
@@ -295,7 +310,7 @@ func (st *startup) load(trusted bool) {
 		},
 		Tools:      p.toolNames(),
 		KnownEnv:   env,
-		Checks:     []config.Check{st.checkRules, st.checkHooks},
+		Checks:     []config.Check{st.checkRules, st.checkHooks, checkExcludes},
 		LookupUser: lookupUser,
 	}
 	cfg, problems, err := config.Load(st.inputs)
@@ -390,6 +405,10 @@ func (st *startup) printProblems() bool {
 // change always asks.
 func (st *startup) permissionOptions(cfg *config.Config, protected []string) permission.Options {
 	known, quiet, _ := st.p.featureTools()
+	// gnosh's own tools that Claude Code has no tool like, which the
+	// engine does not know by itself: they ask before every call unless a
+	// rule or the mode allows them.
+	known = append(known, gnokeyToolName)
 	o := permission.Options{
 		Mode:            permission.Mode(cfg.Permissions.Mode.V),
 		Cwd:             cfg.Paths.Cwd,
@@ -403,6 +422,7 @@ func (st *startup) permissionOptions(cfg *config.Config, protected []string) per
 		Resolve:         resolvePath,
 		Glob:            globPaths,
 		GitRunsPrograms: !cfg.Trusted && len(st.gitPrograms) > 0,
+		RepoOf:          repoGitDir,
 	}
 	// gnosh's own files are never changed without a question: its config,
 	// the data it keeps for the person (sessions among it), and whatever
@@ -413,6 +433,13 @@ func (st *startup) permissionOptions(cfg *config.Config, protected []string) per
 	}
 	if s := st.inputs.Flags.Settings; s != "" && !strings.HasPrefix(strings.TrimSpace(s), "{") {
 		o.Protected = append(o.Protected, s)
+	}
+	// And the files --mcp-config names, as Claude Code protects them: a
+	// server added to one would start with the next run that names it.
+	for _, m := range st.inv.MCPConfigs {
+		if m = strings.TrimSpace(m); m != "" && !strings.HasPrefix(m, "{") {
+			o.Protected = append(o.Protected, st.p.absFrom(m))
+		}
 	}
 	o.Protected = append(o.Protected, protected...)
 	// What is inside the work trees made for sub-agents (worktree.go) is
@@ -426,14 +453,74 @@ func (st *startup) permissionOptions(cfg *config.Config, protected []string) per
 	for _, l := range cfg.Permissions.Layers {
 		o.Layers = append(o.Layers, ruleLayer(l))
 	}
-	if len(cfg.Permissions.Dirs) > 0 {
-		layer := permission.Layer{Scope: permission.ScopeCLI, Name: "additional directories"}
-		for _, d := range cfg.Permissions.Dirs {
-			layer.Dirs = append(layer.Dirs, d.V)
+	// The additional directories, the person's and the project's apart:
+	// the blocks outside the working directories do not count those only
+	// the project's own files add. (Both under the command line's scope,
+	// which a change of the settings files mid-session leaves in place.)
+	mine := permission.Layer{Scope: permission.ScopeCLI, Name: "additional directories"}
+	theirs := permission.Layer{Scope: permission.ScopeCLI, FromProject: true, Name: "the project's additional directories"}
+	for _, d := range cfg.Permissions.Dirs {
+		if slices.Contains(cfg.Permissions.ProjectDirs, d.V) {
+			theirs.Dirs = append(theirs.Dirs, d.V)
+		} else {
+			mine.Dirs = append(mine.Dirs, d.V)
 		}
-		o.Layers = append(o.Layers, layer)
+	}
+	for _, ly := range []permission.Layer{mine, theirs} {
+		if len(ly.Dirs) > 0 {
+			o.Layers = append(o.Layers, ly)
+		}
+	}
+	o.Sandbox = st.sandboxPermission(cfg)
+	o.BlockReads, o.BlockWrites = cfg.Permissions.BlockReads.V, cfg.Permissions.BlockWrites.V
+	if o.BlockReads || o.BlockWrites {
+		o.OwnReads, o.SettingsFiles = ownReads(cfg), settingsFiles(cfg)
+		o.SettingsNames = []string{"gnosh.json", filepath.Join(filepath.Base(cfg.Paths.DataDir), "settings.local.json")}
+		if s := strings.TrimSpace(st.inputs.Flags.Settings); s != "" && !strings.HasPrefix(s, "{") {
+			o.SettingsFiles = append(o.SettingsFiles, st.p.absFrom(s))
+		}
 	}
 	return o
+}
+
+// ownReads are gnosh's own files that the read block lets the file tools
+// reach all the same (permission.Options.OwnReads): the folders of
+// skills, sub-agents, commands and rules, the person's, and the project's
+// that lie above the working directory, in a trusted folder and really
+// inside the project once their links are followed: a repository's
+// .claude/skills that leads to / would otherwise let every read through
+// (the blocks review of 2026-11-20). The session's own folder is added
+// once it is known (live.ownSession).
+func ownReads(cfg *config.Config) []string {
+	var out []string
+	root := cfg.Paths.ProjectRoot
+	for _, kind := range []string{"skills", "agents", "commands", "rules"} {
+		out = append(out, userDefDirs(cfg, kind)...)
+		if !cfg.Trusted || root == "" {
+			continue
+		}
+		for _, d := range projectDefDirs(cfg, kind, nil) {
+			if within(d, cfg.Paths.Cwd) {
+				continue // (readable as the working directory's own)
+			}
+			if real, err := filepath.EvalSymlinks(d); err == nil && within(real, root) {
+				out = append(out, d)
+			}
+		}
+	}
+	return out
+}
+
+// settingsFiles are the settings files gnosh reads, there or not yet,
+// which the write block refuses to let a tool change wherever they are
+// (permission.Options.SettingsFiles): a settings file could lift the block,
+// or bring hooks. (A file given to --settings is added by the caller.)
+func settingsFiles(cfg *config.Config) []string {
+	out := []string{cfg.Paths.UserSettings, filepath.Join(cfg.Paths.Cwd, "gnosh.json"), cfg.Paths.LocalSettings}
+	if p := cfg.Paths.ProjectSettings; p != "" && !slices.Contains(out, p) {
+		out = append(out, p)
+	}
+	return out
 }
 
 // ruleLayer turns one source of rules of the configuration into the
@@ -545,16 +632,20 @@ func hooksConfig(cfg *config.Config) (hooks.Config, []hooks.Problem) {
 
 			StatusMessage: h.StatusMessage,
 
-			URL:            h.URL,
-			Headers:        h.Headers,
-			AllowedEnvVars: h.AllowedEnvVars,
-			Server:         h.Server,
-			Tool:           h.Tool,
-			Input:          h.Input,
-			Timeout:        h.Timeout,
-			Source:         h.Origin.String(),
-			Global:         h.Scope == "user",
-			If:             h.If,
+			URL:             h.URL,
+			Headers:         h.Headers,
+			AllowedEnvVars:  h.AllowedEnvVars,
+			Server:          h.Server,
+			Tool:            h.Tool,
+			Input:           h.Input,
+			Prompt:          h.Prompt,
+			Model:           h.Model,
+			ContinueOnBlock: h.ContinueOnBlock,
+			Agent:           h.Agent,
+			Timeout:         h.Timeout,
+			Source:          h.Origin.String(),
+			Global:          h.Scope == "user",
+			If:              h.If,
 		})
 		if err != nil {
 			var ce *hooks.ConfigError
@@ -579,11 +670,27 @@ func (st *startup) hookOptions(cfg *config.Config) hooks.Options {
 		Fires:      firedEvents(),
 		ProjectDir: cfg.Paths.ProjectRoot,
 		StartDir:   cfg.Paths.Cwd,
-		Environ:    func() []string { return overlayEnv(base, extra) },
+		Untrusted:  !st.trusted,
+		Environ:    func() []string { return st.p.childEnv(overlayEnv(base, extra)) },
 		Now:        st.p.now,
 		ToolNames:  st.p.toolNames(),
 		Guards:     guards,
+		// (nil stays nil: no file gives the list, and nothing is limited.)
+		HTTPURLs:    listValues(cfg.HTTPHookURLs),
+		HTTPEnvVars: listValues(cfg.HTTPHookEnvVars),
 	}
+}
+
+// listValues is the values of a config list, nil for nil.
+func listValues(items []config.ListItem) []string {
+	if items == nil {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.V)
+	}
+	return out
 }
 
 // overlayEnv lays the env block of the settings over an environment:
@@ -628,48 +735,69 @@ func (st *startup) checkHooks(cfg *config.Config) []config.Problem {
 	return out
 }
 
+// checkExcludes says which claudeMdExcludes patterns the instruction
+// files' reader cannot use, where they are set: one that matched nothing
+// would leave a file in that the person meant to keep out.
+func checkExcludes(cfg *config.Config) []config.Problem {
+	var out []config.Problem
+	for _, e := range cfg.Context.Exclude {
+		if _, problems := instructions.CompilePaths([]string{e.V}); len(problems) > 0 {
+			out = append(out, config.Problem{Severity: config.Error, File: e.Origin.File, Line: e.Origin.Line, Where: e.Origin.Name,
+				Message: "in \"options.claudeMdExcludes\", " + problems[0]})
+		}
+	}
+	return out
+}
+
+// repoGitDir is the permission engine's RepoOf: the git directory of the
+// repository that holds dir, as git finds it going up from dir (a .git
+// folder, or the folder a .git file names), with its links followed; ""
+// when no folder above dir has a .git. A .git file that names nothing
+// readable stands for a repository of its own.
+func repoGitDir(dir string) string {
+	for d := filepath.Clean(dir); ; d = filepath.Dir(d) {
+		dotgit := filepath.Join(d, ".git")
+		li, err := os.Lstat(dotgit)
+		if err != nil {
+			if d == filepath.Dir(d) {
+				return ""
+			}
+			continue
+		}
+		gd := dotgit
+		if li.Mode().IsRegular() {
+			var head [4096]byte
+			n := 0
+			if f, err := os.Open(dotgit); err == nil {
+				n, _ = io.ReadFull(f, head[:])
+				f.Close()
+			}
+			line, _, _ := strings.Cut(string(head[:n]), "\n")
+			if named, ok := strings.CutPrefix(strings.TrimSpace(line), "gitdir:"); ok && strings.TrimSpace(named) != "" {
+				gd = strings.TrimSpace(named)
+				if !filepath.IsAbs(gd) {
+					gd = filepath.Join(d, gd)
+				}
+			}
+		}
+		if real, err := filepath.EvalSymlinks(gd); err == nil {
+			return real
+		}
+		return filepath.Clean(gd)
+	}
+}
+
 // resolvePath follows the symbolic links of a cleaned absolute path and
 // returns where it really leads. For a path that does not exist yet it
 // resolves the part that does, and a link that points at nothing is
-// followed to where it points: a write through it would land there.
+// followed to where it points: a write through it would land there. A
+// link's target is walked piece by piece from where the link is, as the
+// system walks it: tidied as text first, "a/../hooks/pre-commit" with a a
+// link to .git/info was hooks/pre-commit beside the link, where the
+// system writes .git/hooks/pre-commit (the review of 2026-11-20).
 func resolvePath(p string) (string, error) {
-	return resolveDepth(filepath.Clean(p), 0)
-}
-
-func resolveDepth(p string, depth int) (string, error) {
-	if depth > 40 {
-		return "", fmt.Errorf("%s leads through too many symbolic links", p)
-	}
-	rest := ""
-	for cur := p; ; {
-		real, err := filepath.EvalSymlinks(cur)
-		if err == nil {
-			return filepath.Join(real, rest), nil
-		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return "", err
-		}
-		if li, lerr := os.Lstat(cur); lerr == nil && li.Mode()&fs.ModeSymlink != 0 {
-			target, rerr := os.Readlink(cur)
-			if rerr != nil {
-				return "", rerr
-			}
-			if !filepath.IsAbs(target) {
-				target = filepath.Join(filepath.Dir(cur), target)
-			}
-			real, err := resolveDepth(filepath.Clean(target), depth+1)
-			if err != nil {
-				return "", err
-			}
-			return filepath.Join(real, rest), nil
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return p, nil
-		}
-		rest = filepath.Join(filepath.Base(cur), rest)
-		cur = parent
-	}
+	real, _, err := fstools.FollowLinks(p)
+	return real, err
 }
 
 // globPaths expands a file name pattern the way a shell would, to cleaned

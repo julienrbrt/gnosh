@@ -20,6 +20,15 @@ import (
 // wait is then the server's, not the model's (box 1, 16 November: turns
 // stopped after 11 to 13 minutes of waiting, with nothing said of why).
 
+// ModeEvent tells the front end the permission mode changed from the
+// session's side (a plan approved, EnterPlanMode, a "switch to
+// acceptEdits" answer): the screen read it only as a turn ended, and showed
+// plan mode while asking about an edit after the plan was approved (seen on
+// the devbox's screen).
+type ModeEvent struct {
+	Mode string
+}
+
 // ServerLoadEvent tells the front end what the model server is doing while
 // the session waits for a reply to start. Text "" says there is nothing
 // more to show.
@@ -137,7 +146,7 @@ func loadText(load core.ServerLoad, estimate int) string {
 		s := load.Slots[mine]
 		text := "reading the prompt: " + kTokens(s.Read) + " of " + kTokens(s.Prompt) + " tokens"
 		if others := busy - 1; others > 0 {
-			text += ", beside " + plural(others, "other request", "other requests")
+			text += ", beside " + countWords(others, "other request", "other requests")
 		}
 		return text
 	case busy == 0:
@@ -147,7 +156,7 @@ func loadText(load core.ServerLoad, estimate int) string {
 	case busy == len(load.Slots):
 		return fmt.Sprintf("the server's %d slots are all busy with other requests; yours waits", busy)
 	}
-	return "the server is also answering " + plural(busy, "other request", "other requests")
+	return "the server is also answering " + countWords(busy, "other request", "other requests")
 }
 
 // near reports whether a server's count of a prompt's tokens is the
@@ -167,12 +176,4 @@ func kTokens(n int) string {
 	}
 	s := strconv.FormatFloat(float64(n)/1000, 'f', 1, 64)
 	return strings.TrimSuffix(s, ".0") + "k"
-}
-
-// plural is n and the word for it: "1 other request", "2 other requests".
-func plural(n int, one, many string) string {
-	if n == 1 {
-		return "1 " + one
-	}
-	return strconv.Itoa(n) + " " + many
 }

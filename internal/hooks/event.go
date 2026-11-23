@@ -10,8 +10,8 @@ import (
 // "pretooluse" and "pre_tool_use" are mistakes.
 type Event string
 
-// The nineteen events gnosh has. The comment on each says when the agent
-// loop fires it and what a hook can do there.
+// The events gnosh has. The comment on each says when the agent loop fires
+// it and what a hook can do there.
 const (
 	// PreToolUse fires before every tool call, a sub-agent's included. A
 	// hook can stop the call, approve it, put it to the user, change its
@@ -63,6 +63,11 @@ const (
 	// Notification fires when gnosh raises a notification. Nothing a hook
 	// says there is read, and the loop does not wait for it.
 	Notification Event = "Notification"
+	// PreModelSwitch fires before a switch of the session's model that the
+	// person asked for (/model, or its picker) is made. A hook can refuse
+	// the switch, or put it to the person; a refusal leaves the model as it
+	// was.
+	PreModelSwitch Event = "PreModelSwitch"
 	// PostModelSwitch fires after the session's model is switched (/model).
 	// What a hook adds (additionalContext, or plain text) goes to the model
 	// with the next request. It cannot undo the switch.
@@ -81,17 +86,44 @@ const (
 	// (a skill or a command of the person's), before the model sees it. A
 	// hook can stop the expansion or add text beside it.
 	UserPromptExpansion Event = "UserPromptExpansion"
+	// ConfigChange fires when a settings file changes while the session
+	// runs, before the change is taken in. A block keeps the settings the
+	// session had.
+	ConfigChange Event = "ConfigChange"
+	// PostToolBatch fires once after every tool call of a reply has
+	// finished, before the model is asked again. A hook can add text for
+	// the model, and a block ends the turn there, with the reason kept in
+	// the conversation.
+	PostToolBatch Event = "PostToolBatch"
+	// FileChanged fires when a watched file is made, changed or removed,
+	// whatever did it. Nothing can be stopped; a hook's systemMessage is
+	// shown, it may write export lines to the session's environment file,
+	// and it may say which files are watched from then on (watchPaths).
+	FileChanged Event = "FileChanged"
+	// Elicitation fires when an MCP server asks the person for values in
+	// the middle of a call, before the form is shown. A hook can answer in
+	// the person's place ("action": "accept", with the values in
+	// "content"), decline or cancel; one that says nothing leaves the form
+	// to the person. A block, or a hook that could not evaluate, declines.
+	Elicitation Event = "Elicitation"
+	// ElicitationResult fires when the person has answered an MCP server's
+	// form, before the answer goes to the server. A hook can put other
+	// values in its place, or decline or cancel instead; one that says
+	// nothing lets the answer go as it is. A block, or a hook that could
+	// not evaluate, declines.
+	ElicitationResult Event = "ElicitationResult"
 )
 
-// Events returns the nineteen events gnosh has, in the order the
-// specification lists them.
+// Events returns the events gnosh has, in the order the specification
+// lists them.
 func Events() []Event {
 	return []Event{
 		PreToolUse, PostToolUse, PostToolUseFailure, UserPromptSubmit,
 		SessionStart, Stop, SubagentStart, SubagentStop, StopFailure,
 		PreCompact, PostCompact, SessionEnd, InstructionsLoaded,
-		PermissionRequest, Notification, PostModelSwitch, DirectoryAdded,
-		CwdChanged, UserPromptExpansion,
+		PermissionRequest, Notification, PreModelSwitch, PostModelSwitch,
+		DirectoryAdded, CwdChanged, UserPromptExpansion, ConfigChange,
+		PostToolBatch, FileChanged, Elicitation, ElicitationResult,
 	}
 }
 
@@ -149,8 +181,9 @@ const (
 const (
 	// defaultTimeout is what a hook gets on most events.
 	defaultTimeout = 600 * time.Second
-	// promptTimeout is what a UserPromptSubmit hook gets: it holds up the
-	// prompt the user has just sent.
+	// promptTimeout is what a hook on UserPromptSubmit, PreModelSwitch or
+	// PostModelSwitch gets: each holds up what the person has just asked
+	// for.
 	promptTimeout = 30 * time.Second
 	// sessionEndTimeout is what a SessionEnd hook gets, so that quitting
 	// is not held up.
@@ -171,8 +204,9 @@ type eventInfo struct {
 	// values lists every value the subject can take, when they are a
 	// fixed list.
 	values []string
-	// narrow marks the one event whose list matchers are made of letters,
-	// digits, "_" and "|" only (StopFailure, as in Claude Code).
+	// narrow marks the events whose list matchers are made of letters,
+	// digits, "_" and "|" only (StopFailure and FileChanged, as in Claude
+	// Code).
 	narrow bool
 
 	// mode says that the event's input carries permission_mode.
@@ -191,7 +225,7 @@ type eventInfo struct {
 }
 
 // describe returns what the package knows about e, and whether e is one
-// of the nineteen events.
+// of the events gnosh has.
 func describe(e Event) (eventInfo, bool) {
 	tool := eventInfo{subject: toolName, what: "the tool's name", mode: true, reads: true, halts: true}
 	switch e {
@@ -267,7 +301,13 @@ func describe(e Event) (eventInfo, bool) {
 	case Notification:
 		return eventInfo{
 			class: records, subject: ownValue, what: "the type of notification",
-			values: []string{"permission_prompt", "idle_prompt"},
+			values: []string{"permission_prompt", "idle_prompt", "push_notification"},
+		}, true
+	case PreModelSwitch:
+		return eventInfo{
+			class: gate, subject: ownValue, what: "the model switched to",
+			reads:  true,
+			fields: []string{"permissionDecision", "permissionDecisionReason"},
 		}, true
 	case PostModelSwitch:
 		return eventInfo{
@@ -282,12 +322,36 @@ func describe(e Event) (eventInfo, bool) {
 			reads:  true,
 		}, true
 	case CwdChanged:
-		return eventInfo{class: warns, reads: true}, true
+		return eventInfo{class: warns, reads: true, fields: []string{"watchPaths"}}, true
+	case FileChanged:
+		return eventInfo{
+			class: warns, subject: ownValue, what: "the file's name", narrow: true,
+			reads: true, fields: []string{"watchPaths"},
+		}, true
+	case PostToolBatch:
+		return eventInfo{
+			class: gate, mode: true, reads: true, halts: true,
+			fields: []string{"additionalContext"},
+		}, true
+	case ConfigChange:
+		// (Claude Code's policy_settings and skills are not here: gnosh
+		// has no managed settings and does not watch skill files, so a
+		// matcher on them fits nothing, which is said.)
+		return eventInfo{
+			class: gate, subject: ownValue, what: "the source",
+			values: []string{"user_settings", "project_settings", "local_settings"},
+			reads:  true,
+		}, true
 	case UserPromptExpansion:
 		return eventInfo{
 			class: gate, subject: ownValue, what: "the command's name",
 			mode: true, reads: true, plain: true, halts: true,
 			fields: []string{"additionalContext"},
+		}, true
+	case Elicitation, ElicitationResult:
+		return eventInfo{
+			class: gate, subject: ownValue, what: "the MCP server's name",
+			reads: true, fields: []string{"action", "content"},
 		}, true
 	}
 	return eventInfo{}, false
@@ -303,7 +367,7 @@ func timeoutFor(e Event, own time.Duration) time.Duration {
 		return sessionEndTimeout
 	case own > 0:
 		return own
-	case e == UserPromptSubmit:
+	case e == UserPromptSubmit, e == PreModelSwitch, e == PostModelSwitch:
 		return promptTimeout
 	}
 	return defaultTimeout
@@ -314,19 +378,18 @@ func timeoutFor(e Event, own time.Duration) time.Duration {
 // Claude Code. A hook configured on one of them would never run.
 func claudeOnly(name string) (canBlock, ok bool) {
 	switch name {
-	case "PostToolBatch", "ConfigChange", "PreModelSwitch",
-		"WorktreeCreate", "WorktreeRemove", "TaskCreated", "TaskCompleted",
-		"TeammateIdle", "Elicitation", "ElicitationResult":
+	case "WorktreeCreate", "WorktreeRemove", "TaskCreated", "TaskCompleted",
+		"TeammateIdle":
 		return true, true
-	case "PermissionDenied", "FileChanged", "Setup", "MessageDisplay":
+	case "PermissionDenied", "Setup", "MessageDisplay":
 		return false, true
 	}
 	return false, false
 }
 
-// eventList is the nineteen names in a sentence.
+// eventList is the events' names in a sentence.
 func eventList() string {
-	names := make([]string, 0, 19)
+	var names []string
 	for _, e := range Events() {
 		names = append(names, string(e))
 	}
@@ -348,7 +411,7 @@ func nearEvent(name string) (Event, bool) {
 }
 
 // eventProblem says what is wrong with name as an event, or returns "" if
-// it is one of the fifteen.
+// it is one of gnosh's.
 func eventProblem(name string) string {
 	if _, ok := describe(Event(name)); ok {
 		return ""

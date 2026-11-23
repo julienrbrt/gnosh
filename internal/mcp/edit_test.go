@@ -179,7 +179,8 @@ func TestEntry(t *testing.T) {
 			t.Errorf("CheckEntry(%s) = %v, want %q", tc.entry, err, tc.wrong)
 		}
 	}
-	for name, ok := range map[string]bool{"github": true, "my-server_2": true, "a.b": false, "": false, "ünï": false, strings.Repeat("x", 65): false} {
+	for name, ok := range map[string]bool{"github": true, "my-server_2": true, "_x": true, strings.Repeat("x", 48): true,
+		"a.b": false, "": false, "ünï": false, strings.Repeat("x", 49): false, "github__x": false, "github_": false} {
 		if got := CheckName(name) == ""; got != ok {
 			t.Errorf("CheckName(%q) ok = %v", name, got)
 		}
@@ -226,5 +227,44 @@ func TestLocalScope(t *testing.T) {
 		if m["u"].Shown != "user-u --key ${K}" || m["l"].Shown != "https://l.example.org" {
 			t.Errorf("shown: %q, %q", m["u"].Shown, m["l"].Shown)
 		}
+	}
+}
+
+// A file whose servers were written at its top level, beside "mcpServers"
+// instead of inside it, is named when servers are read and is not added
+// to, as Claude Code 2.1.327's `mcp add` stops there too.
+func TestServersAtTheTopOfAFile(t *testing.T) {
+	dir := t.TempDir()
+	project := filepath.Join(dir, ".mcp.json")
+	text := `{"github": {"command": "gh-server"}, "docs": {"type": "http", "url": "https://docs.example.org/mcp"}, "note": {"say": "not a server"}, "mcpServers": {"kept": {"command": "k"}}}`
+	if err := os.WriteFile(project, []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, probs := LoadConfig(Sources{Project: project, Root: dir, Trusted: true, Getenv: func(string) (string, bool) { return "", false }})
+	if len(got) != 1 || got[0].Name != "kept" {
+		t.Errorf("read %+v", got)
+	}
+	found := false
+	for _, p := range probs {
+		if p.Path == project && strings.Contains(p.Message, `the servers "docs", "github" at its top level`) && strings.Contains(p.Message, `move them inside "mcpServers"`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the servers at the top were not named: %+v", probs)
+	}
+	err := Put(Place{Path: project}, "more", json.RawMessage(`{"command": "m"}`), 0o600)
+	if err == nil || !strings.Contains(err.Error(), `the servers "docs", "github" at its top level`) || !strings.Contains(err.Error(), "the file was left as it is") {
+		t.Errorf("Put into the file: %v", err)
+	}
+	if data, _ := os.ReadFile(project); string(data) != text {
+		t.Errorf("the file was changed:\n%s", data)
+	}
+	// One server, said as one.
+	if err := os.WriteFile(project, []byte(`{"github": {"command": "gh-server"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Put(Place{Path: project}, "more", json.RawMessage(`{"command": "m"}`), 0o600); err == nil || !strings.Contains(err.Error(), `the server "github" at its top level`) || !strings.Contains(err.Error(), "Move it inside") {
+		t.Errorf("Put into a file with one server at the top: %v", err)
 	}
 }

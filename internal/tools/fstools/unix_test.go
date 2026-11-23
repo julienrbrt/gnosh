@@ -4,6 +4,7 @@ package fstools
 
 import (
 	"context"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -371,3 +372,64 @@ func TestPermissionsAsNobody(t *testing.T) {
 	}
 	permissionTests(t, dir)
 }
+
+// A file with other names, hard links, is written where it is, so that
+// they see the new content, and the result says why (the Edit/Write
+// review of 2026-11-19: a new file in its place left them the old).
+func TestEditWritesAFileWithOtherNamesWhereItIs(t *testing.T) {
+	f := newFixture(t, Options{})
+	p := f.file("dotfile", "one\n")
+	other := f.path("linked")
+	if err := os.Link(p, other); err != nil {
+		t.Skipf("no hard links here: %v", err)
+	}
+	f.ok(f.read, in{"file_path": p})
+	res := f.run(f.edit, in{"file_path": p, "old_string": "one", "new_string": "two"})
+	if res.IsError {
+		t.Fatalf("failed: %s", core.TextOf(res.Content))
+	}
+	mustContain(t, core.TextOf(res.Content), "The file was overwritten where it is, because it has 1 other name by hard links")
+	if got := f.content(other); got != "two\n" {
+		t.Errorf("the other name holds %q", got)
+	}
+}
+
+// What a new file in a file's place would lose is said by the file and the
+// process: its other names; its owner or its group, when the process may
+// not give a new file those; nothing, to root.
+func TestReplaceLoses(t *testing.T) {
+	info := func(nlink int, uid, gid uint32) fs.FileInfo {
+		st := &syscall.Stat_t{Uid: uid, Gid: gid}
+		for range nlink {
+			st.Nlink++ // (its type is the system's own)
+		}
+		return statInfo{st}
+	}
+	for _, c := range []struct {
+		old        fs.FileInfo
+		euid, egid int
+		groups     []int
+		want       string
+	}{
+		{info(2, 1000, 1000), 1000, 1000, nil, "it has 1 other name by hard links"},
+		{info(1, 1000, 1000), 1000, 1000, nil, ""},
+		{info(1, 1001, 1000), 1000, 1000, nil, "it belongs to another user"},
+		{info(1, 1000, 50), 1000, 1000, nil, "its group is not one of yours"},
+		{info(1, 1000, 50), 1000, 1000, []int{50}, ""},
+		{info(1, 1001, 50), 0, 0, nil, ""},
+	} {
+		if got := replaceLosesFor(c.old, c.euid, c.egid, c.groups); !strings.HasPrefix(got, c.want) || (c.want == "") != (got == "") {
+			t.Errorf("%+v: %q, want %q", c, got, c.want)
+		}
+	}
+}
+
+// statInfo is a file's info made up around a stat record.
+type statInfo struct{ st *syscall.Stat_t }
+
+func (s statInfo) Name() string       { return "f" }
+func (s statInfo) Size() int64        { return 0 }
+func (s statInfo) Mode() fs.FileMode  { return 0o644 }
+func (s statInfo) ModTime() time.Time { return time.Time{} }
+func (s statInfo) IsDir() bool        { return false }
+func (s statInfo) Sys() any           { return s.st }

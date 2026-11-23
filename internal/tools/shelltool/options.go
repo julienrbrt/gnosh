@@ -2,7 +2,10 @@ package shelltool
 
 import (
 	"os"
+	"strings"
 	"time"
+
+	"github.com/gnosh-ai/gnosh/internal/sandbox"
 )
 
 // Options sets up a Manager. The zero value is usable: every field has a
@@ -23,11 +26,38 @@ type Options struct {
 	// variable; "NAME" alone removes it.
 	Env []string
 
+	// Scrub takes the credentials out of each command's environment as it
+	// is in the end, Env's among them (envscrub;
+	// CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).
+	Scrub bool
+	// PersonSandboxed runs the person's own commands (PersonsBash) in the
+	// sandbox too, where they otherwise run outside it, as Claude Code
+	// runs them with the scrub on, on Linux.
+	PersonSandboxed bool
+	// ScriptCaps are, by a text a command holds, how many of the model's
+	// commands holding it may run in the session (Claude Code's
+	// CLAUDE_CODE_SCRIPT_CAPS, with the scrub on): one more is refused.
+	// The text is matched as it is written, so "deploy.sh $(x)" counts
+	// for deploy.sh; what runs it again by other means (xargs, find -exec)
+	// is not seen.
+	ScriptCaps map[string]int
+	// Isolate, when set, is given the program line of each command on this
+	// machine that runs outside the sandbox, and returns the one to run in
+	// its place: on Linux with the scrub on, one with a PID namespace of
+	// its own, so that it reads no other process's environment through
+	// /proc, as Claude Code runs it.
+	Isolate func(argv []string) []string
+
 	// EnvFile is a shell file that runs before each command on this
 	// machine, when it is there and not empty: where SessionStart hooks
 	// write the variables later commands are to have (Claude Code's
 	// CLAUDE_ENV_FILE). Empty means none.
 	EnvFile string
+
+	// Sandbox, when not nil, runs this machine's commands inside the
+	// operating system's sandbox (internal/sandbox), but those it says run
+	// outside it.
+	Sandbox *Sandbox
 
 	// SpoolDir is the directory in which the manager makes a directory of
 	// its own for output files. Close removes what the manager made, never
@@ -74,6 +104,11 @@ type Options struct {
 	// whatever TimeoutToBackground says, and the person's control that
 	// moves a command to the background does nothing.
 	NoBackground bool
+
+	// NoCarryCwd keeps every command in the session's working directory:
+	// a cd in one does not carry over to the next, as Claude Code's
+	// CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1 has it.
+	NoCarryCwd bool
 
 	// TermGrace is how long a command being stopped has between SIGTERM and
 	// SIGKILL. Default: 2 seconds.
@@ -284,4 +319,65 @@ func (o Options) withDefaults() Options {
 	}
 	o.LongSleep = max(o.LongSleep, 0)
 	return o
+}
+
+// Sandbox is how commands run inside the operating system's sandbox.
+type Sandbox struct {
+	// Wrap returns the program and arguments that run argv, in dir, inside
+	// the sandbox, for a session whose folders are roots, reaching the
+	// files of gnosh's own given (the one its shell writes its last
+	// directory to, the scripts it reads), and the variables to set beside
+	// the command's own (where its temporary files and caches go). An
+	// error is why the command cannot be sandboxed.
+	Wrap func(dir string, roots, argv []string, expose []sandbox.Exposed) (wrapped []string, env []string, err error)
+	// Outside reports whether a command runs outside the sandbox: one
+	// excludedCommands names, or, with asked, one the model asked to
+	// (dangerouslyDisableSandbox), when Unsandboxed lets it.
+	Outside func(command string, asked bool) bool
+	// Unsandboxed offers dangerouslyDisableSandbox to the model.
+	Unsandboxed bool
+	// Writes says where a sandboxed command may write, for the model; ""
+	// when the sandbox leaves the files open (filesystem.disabled).
+	Writes string
+	// NoTrust says the command cannot reach macOS's certificate trust
+	// service, which Go's programs check certificates with.
+	NoTrust bool
+	// HidesReads says a read the sandbox refuses is told as a refused
+	// write is (macOS's "Operation not permitted"), and there are paths
+	// it refuses to read.
+	HidesReads bool
+	// Ignored are the reports of what the sandbox stopped that are not
+	// made (ignoreViolations).
+	Ignored []Ignored
+	// Hosts are the hosts a sandboxed command may reach at once, through a
+	// proxy its HTTP_PROXY names, and Network says what of the network it
+	// reaches, for the model ("" for: no network at all).
+	Hosts   []string
+	Network string
+	// Before is called as a sandboxed command starts, for the session's
+	// folders, and After as it ends, with what Before returned: what the
+	// sandbox could not keep from being made (a path that was not there to
+	// mount read-only) is taken away there, and After says so, for the
+	// model. Either may be nil.
+	Before func(roots []string) any
+	After  func(state any) string
+}
+
+// Ignored is a report of the sandbox's that is not made: for a command
+// holding Command ("*" for every command), of a stop whose line of output
+// holds What.
+type Ignored struct {
+	Command, What string
+}
+
+// network says what of the network a sandboxed command reaches, for the
+// model.
+func (sb *Sandbox) network() string {
+	switch {
+	case sb.Network != "":
+		return sb.Network
+	case len(sb.Hosts) == 0:
+		return "reach no network"
+	}
+	return "reach on the network only " + strings.Join(sb.Hosts, ", ") + ", through a proxy that HTTP_PROXY and HTTPS_PROXY name (a program that ignores those reaches nothing)"
 }

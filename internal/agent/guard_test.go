@@ -222,12 +222,14 @@ func TestRepetitionKeyAndNudgeAreTheWirings(t *testing.T) {
 		return use(tc(fmt.Sprintf("c%d", n), "gnovm_run", `{"name":"mem","code":"mem.Pop(\"fixed\")"}`))
 	}
 
-	t.Run("as they are, the results differ", func(t *testing.T) {
+	t.Run("the default blanks what changes from run to run", func(t *testing.T) {
+		// (The results differ only in numbers: the same, by the default
+		// key, and the model is told so in the default words.)
 		r := newRig(t, func(o *Options) { o.Tools = []core.Tool{mem} })
 		r.model.answer(script)
 		res := r.run("fix it")
-		if res.Reason != EndCompleted || r.model.count() != 9 || len(ownPrompts(r.log, "nudge:repeat")) != 0 {
-			t.Fatalf("result = %+v after %d requests", res, r.model.count())
+		if res.Reason != EndCompleted || r.model.count() != 9 || len(ownPrompts(r.log, "nudge:repeat")) != 1 {
+			t.Fatalf("result = %+v after %d requests, %d nudges", res, r.model.count(), len(ownPrompts(r.log, "nudge:repeat")))
 		}
 	})
 	t.Run("with the numbers blanked they are the same", func(t *testing.T) {
@@ -299,6 +301,31 @@ func TestEmptyReplyIsAskedAgain(t *testing.T) {
 	r.checkLog()
 }
 
+// A reply that is a tool call written out as text (a chat template's
+// markup the model's server did not take as a call, or only its closing
+// tag, as Qwen on llama.cpp leaves now and then) runs nothing: the model
+// is told so and asked again, as after an empty reply, and the turn goes
+// on. A reply that only speaks of the markup is an answer.
+func TestCallWrittenAsTextIsToldSo(t *testing.T) {
+	r := newRig(t, nil)
+	r.model.push(say("</tool_call>"), say("<tool_call>\n{\"name\": \"Read\", \"arguments\": {}}\n</tool_call>"), say("here I am"))
+	res := r.run("hello?")
+	if res.Reason != EndCompleted || res.Text != "here I am" || res.Rounds != 3 {
+		t.Fatalf("result = %+v", res)
+	}
+	nudges := ownPrompts(r.log, "nudge:text-call")
+	if len(nudges) != 2 || !strings.Contains(nudges[0], "tool call written out as text") {
+		t.Fatalf("nudges = %q", nudges)
+	}
+	r.checkLog()
+
+	r2 := newRig(t, nil)
+	r2.model.push(say("Qwen puts <tool_call> tags around its calls, as its template says."))
+	if res := r2.run("how does Qwen call tools?"); res.Reason != EndCompleted || res.Rounds != 1 {
+		t.Fatalf("an answer that speaks of the markup: %+v", res)
+	}
+}
+
 // No count ends the asking. At every third empty reply in a row the person
 // is told what is happening and what usually fixes it.
 func TestEmptyRepliesTellThePersonAtEveryThird(t *testing.T) {
@@ -348,5 +375,95 @@ func TestCutAndWithheldRepliesAreLeftAlone(t *testing.T) {
 			}
 			r.checkLog()
 		})
+	}
+}
+
+// Three calls going round, each a third of the window, are under both
+// bars; three times round in a row is a loop all the same (the
+// FrontierHarness session, 2026-11-20: the same three commands for a
+// hundred calls).
+func TestRepetitionOfACycleOfThree(t *testing.T) {
+	r := newRig(t, func(o *Options) { o.Tools = []core.Tool{tool("Bash", nil)} })
+	cmds := []string{"ls", "pwd", "date"}
+	r.model.answer(func(req *core.Request, n int) step {
+		if strings.Contains(lastUserText(req), "went round the same 3 rounds") {
+			return say("stopping")
+		}
+		return use(tc(fmt.Sprintf("c%d", n), "Bash", fmt.Sprintf(`{"command":%q}`, cmds[n%3])))
+	})
+	res := r.run("look around")
+	if res.Reason != EndCompleted || r.model.count() != 10 {
+		t.Fatalf("result = %+v after %d requests", res, r.model.count())
+	}
+	nudges := ownPrompts(r.log, "nudge:repeat")
+	if len(nudges) != 1 || !strings.Contains(nudges[0], `{"command":"ls"}`) || !strings.Contains(nudges[0], `{"command":"date"}`) {
+		t.Errorf("nudges = %q", nudges)
+	}
+}
+
+// The same command, whose every result holds a fresh random id and a new
+// PID, is a loop all the same: what changes from run to run is blanked
+// before the results are compared (the FrontierHarness session,
+// 2026-11-20: eval.py's user ids, postfix's PIDs).
+func TestRepetitionThroughIDsAndPIDs(t *testing.T) {
+	n := 0
+	run := func(ctx context.Context, call core.ToolCall, env *core.ToolEnv) (core.ToolResult, error) {
+		n++
+		return core.TextResult(fmt.Sprintf("user %x added successfully.\npostfix is running: PID: %d", 0xda8f1828a0fbc12b+uint64(n)*7919, 7882+n)), nil
+	}
+	r := newRig(t, func(o *Options) { o.Tools = []core.Tool{tool("Bash", run)} })
+	r.model.answer(func(req *core.Request, k int) step {
+		if strings.Contains(lastUserText(req), "same call in") {
+			return say("stopping")
+		}
+		return use(tc(fmt.Sprintf("c%d", k), "Bash", `{"command":"python3 /app/eval.py 2>&1 | tail -60"}`))
+	})
+	res := r.run("make it pass")
+	if res.Reason != EndCompleted || r.model.count() != 7 {
+		t.Fatalf("result = %+v after %d requests", res, r.model.count())
+	}
+	if nudges := ownPrompts(r.log, "nudge:repeat"); len(nudges) != 1 {
+		t.Errorf("nudges = %q", nudges)
+	}
+}
+
+// What changes from run to run is blanked; words and small differences of
+// another kind are not.
+func TestSameButFor(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		same bool
+	}{
+		{"user da8f1828a0fbc12b added", "user 0c1d2e3f4a5b6c7d added", true},
+		{"running: PID: 7882", "running: PID: 81234", true},
+		{"id 123e4567-e89b-12d3-a456-426614174000", "id 9f0c4567-aa9b-42d3-b456-526614174111", true},
+		{"3 tests failed", "2 tests failed", true},
+		{"FAIL: TestA", "FAIL: TestB", false},
+		{"deadbeef cafe", "deadbeef face", false},
+	} {
+		if got := sameButFor(c.a) == sameButFor(c.b); got != c.same {
+			t.Errorf("%q and %q: same = %v, want %v", c.a, c.b, got, c.same)
+		}
+	}
+}
+
+// Three kinds of round in no fixed order are a loop too, once twelve
+// rounds in a row are made of nothing else (the FrontierHarness session,
+// 2026-11-20: a test run and a server restart, 58 and 35 times).
+func TestRepetitionOfThreeKindsInNoOrder(t *testing.T) {
+	r := newRig(t, func(o *Options) { o.Tools = []core.Tool{tool("Bash", nil)} })
+	seq := []string{"a", "b", "a", "c", "b", "a", "c", "c", "b", "a", "b", "c"}
+	r.model.answer(func(req *core.Request, n int) step {
+		if strings.Contains(lastUserText(req), "went round the same 3 rounds") {
+			return say("stopping")
+		}
+		return use(tc(fmt.Sprintf("c%d", n), "Bash", fmt.Sprintf(`{"command":%q}`, seq[n%len(seq)])))
+	})
+	res := r.run("make it pass")
+	if res.Reason != EndCompleted || r.model.count() != 13 {
+		t.Fatalf("result = %+v after %d requests", res, r.model.count())
+	}
+	if nudges := ownPrompts(r.log, "nudge:repeat"); len(nudges) != 1 {
+		t.Errorf("nudges = %q", nudges)
 	}
 }

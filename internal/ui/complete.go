@@ -18,7 +18,8 @@ import (
 // a path to mention, and so, on Tab, is any word that reads as a path.
 // Paths are completed a directory at a time, by the start of a name; the
 // files a project's ignore rules leave out are not offered, and neither
-// are names that begin with a dot until a dot is typed.
+// are names that begin with a dot until a dot is typed. A line of shell
+// mode, which begins with "!", is completed as shellcomplete.go says.
 
 // fileEntry is one name in a directory, as completion offers it.
 type fileEntry struct {
@@ -37,11 +38,30 @@ const (
 func (s *session) complete(text string, cursor int) []editor.Candidate {
 	cursor = min(max(cursor, 0), len(text))
 	before := text[:cursor]
+	if strings.HasPrefix(text, "!") && cursor > 0 {
+		return s.completeShell(text, cursor)
+	}
 	if strings.HasPrefix(text, "/") && !strings.ContainsAny(before, " \t\n") {
-		return s.completeCommand(before)
+		return s.completeCommand(before, 0)
 	}
 	start := strings.LastIndexAny(before, " \t\n") + 1
 	word := before[start:]
+	if folderCommand(before) {
+		// /cd and /add-dir take a folder: what is typed after them is
+		// one, slash or no slash, and only folders are offered.
+		return s.completeFolder(word, start)
+	}
+	if strings.HasPrefix(word, "/") && !strings.Contains(word[1:], "/") && !strings.HasPrefix(text, "/") {
+		// A command named partway through a prompt ("run the tests, then
+		// /com"), as Claude Code completes it: only names that begin
+		// with what was typed, so that a path such as /tmp, which no
+		// command's name begins with, is completed as a path. A bare /
+		// lists every command. The command does not run from there; the
+		// model reads its name.
+		if c := s.completeCommand(word, start); len(c) > 0 {
+			return c
+		}
+	}
 	switch {
 	case strings.HasPrefix(word, "@"):
 		return append(s.completeFile(word[1:], start, "@"), s.completeAgent(word[1:], start)...)
@@ -49,6 +69,18 @@ func (s *session) complete(text string, cursor int) []editor.Candidate {
 		return s.completeFile(word, start, "")
 	}
 	return nil
+}
+
+// folderCommand reports whether the line so far is a command that takes a
+// folder (/cd, /add-dir) with its first argument begun.
+func folderCommand(before string) bool {
+	name, rest, ok := strings.Cut(before, " ")
+	return ok && (name == "/cd" || name == "/add-dir") && !strings.ContainsAny(strings.TrimLeft(rest, " "), " \t\n")
+}
+
+// completeFolder is completeFile with only the folders.
+func (s *session) completeFolder(partial string, start int) []editor.Candidate {
+	return s.completePath(partial, start, "", true)
 }
 
 // agentLister is what a session's controls may also be: able to name the
@@ -76,18 +108,18 @@ func (s *session) completeAgent(typed string, start int) []editor.Candidate {
 // completeCommand offers the session's commands whose names begin with
 // what was typed, in the order /help lists them, and after them the
 // person's skills. When no name begins that way, the commands' other
-// names that do are offered.
-func (s *session) completeCommand(typed string) []editor.Candidate {
+// names that do are offered. start is where the typed word begins.
+func (s *session) completeCommand(typed string, start int) []editor.Candidate {
 	want := strings.TrimPrefix(typed, "/")
 	var out []editor.Candidate
 	for _, name := range s.info.Commands {
 		if strings.HasPrefix(name, strings.ToLower(want)) {
-			out = append(out, editor.Candidate{Text: "/" + name, Start: 0})
+			out = append(out, editor.Candidate{Text: "/" + name, Start: start})
 		}
 	}
 	for _, sk := range s.info.Skills {
 		if strings.HasPrefix(sk.Name, want) && !slices.Contains(s.info.Commands, sk.Name) {
-			out = append(out, editor.Candidate{Text: "/" + sk.Name, Start: 0})
+			out = append(out, editor.Candidate{Text: "/" + sk.Name, Start: start})
 		}
 	}
 	if len(out) == 0 && want != "" {
@@ -97,7 +129,7 @@ func (s *session) completeCommand(typed string) []editor.Candidate {
 		for _, c := range s.info.CommandList {
 			for _, alias := range c.Aliases {
 				if strings.HasPrefix(alias, strings.ToLower(want)) {
-					out = append(out, editor.Candidate{Text: "/" + alias, Start: 0})
+					out = append(out, editor.Candidate{Text: "/" + alias, Start: start})
 				}
 			}
 		}
@@ -107,8 +139,24 @@ func (s *session) completeCommand(typed string) []editor.Candidate {
 
 // completeFile offers the entries of the directory that partial names so
 // far whose names begin with its last part. sigil is what stands before
-// the path in the box ("@"), and start where the word begins.
+// the path in the box ("@"), and start where the word begins. After a
+// mention's "@", the project's files and folders that match what was typed
+// anywhere in their paths follow (mention.go), as Claude Code's @ finds
+// them: "@focus" offers internal/ui/focus.go.
 func (s *session) completeFile(partial string, start int, sigil string) []editor.Candidate {
+	if fs, ok := s.c.(fileSuggester); ok && sigil == "@" && s.info.FileSuggestion {
+		// The person's own command offers the paths (filesuggest.go).
+		return s.suggestFiles(fs, partial, start, sigil)
+	}
+	out := s.completePath(partial, start, sigil, false)
+	if sigil == "@" && fuzzyWord(partial) && (len(out) == 0 || !strings.Contains(partial, "/")) {
+		out = append(out, s.fuzzyFiles(partial, start, sigil, out)...)
+	}
+	return out
+}
+
+// completePath is completeFile, or with folders completeFolder.
+func (s *session) completePath(partial string, start int, sigil string, folders bool) []editor.Candidate {
 	if s.listDir == nil {
 		return nil
 	}
@@ -134,6 +182,8 @@ func (s *session) completeFile(partial string, start int, sigil string) []editor
 	lower := strings.ToLower(base)
 	for _, e := range s.listDir(dir) {
 		switch {
+		case folders && !e.dir:
+			continue
 		case !strings.HasPrefix(strings.ToLower(e.name), lower):
 			continue
 		case strings.HasPrefix(e.name, ".") && !strings.HasPrefix(base, "."):
@@ -146,8 +196,15 @@ func (s *session) completeFile(partial string, start int, sigil string) []editor
 		if e.dir {
 			name += "/"
 		}
+		if folders && e.name == base {
+			// The folder typed in full is a candidate as it was typed, and
+			// first: an exact name wins, so Enter runs the command (/cd
+			// ../lib) and does not take ../lib/ in its place, while Tab
+			// goes on to ../lib/ and into the folder.
+			out = append([]editor.Candidate{{Text: sigil + dirPart + base, Start: start, Label: base}}, out...)
+		}
 		out = append(out, editor.Candidate{Text: sigil + dirPart + name, Start: start, Label: name})
-		if len(out) == maxCandidates {
+		if len(out) >= maxCandidates {
 			break
 		}
 	}

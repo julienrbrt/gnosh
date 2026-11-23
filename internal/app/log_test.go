@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/gnosh-ai/gnosh/internal/agent"
 	"github.com/gnosh-ai/gnosh/internal/core"
+	"github.com/gnosh-ai/gnosh/internal/instructions"
 	"github.com/gnosh-ai/gnosh/internal/prompt"
 	"github.com/gnosh-ai/gnosh/internal/transcript"
 )
@@ -349,5 +351,42 @@ func TestLogStampsTheWorkingDirectory(t *testing.T) {
 	}
 	if ts.StartCwd() != "/work/app" {
 		t.Errorf("the session now belongs to %q", ts.StartCwd())
+	}
+}
+
+// After a cut, only the files given along the way that left the
+// conversation with it are forgotten, to be given again; one still in
+// what the model reads is not given a second time.
+func TestCutForgetsOnlyTheFilesItTook(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	for name, text := range map[string]string{"api/CLAUDE.md": "api rules\n", "web/CLAUDE.md": "web rules\n", "api/x.go": "", "web/y.go": ""} {
+		if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(name)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	instr, err := instructions.Load(ctx, instructions.Options{Cwd: dir, ProjectNames: []string{"CLAUDE.md"}, Trusted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	api, _ := instr.ForPath(ctx, filepath.Join(dir, "api/x.go"))
+	web, _ := instr.ForPath(ctx, filepath.Join(dir, "web/y.go"))
+	if len(api) != 1 || len(web) != 1 {
+		t.Fatalf("late files: %v %v", api, web)
+	}
+	log, _, _ := newTestLog(t)
+	// What the model reads after the cut holds web's file, not api's.
+	if err := log.Append(ctx, promptEntry("p1", "t1", "go on\n"+instructions.RenderFiles(web))); err != nil {
+		t.Fatal(err)
+	}
+	forgetGone(log, instr)
+	if again, _ := instr.ForPath(ctx, filepath.Join(dir, "api/x.go")); len(again) != 1 {
+		t.Errorf("the file the cut took is not given again: %v", again)
+	}
+	if again, _ := instr.ForPath(ctx, filepath.Join(dir, "web/y.go")); len(again) != 0 {
+		t.Errorf("the file still in view is given a second time: %v", again)
 	}
 }

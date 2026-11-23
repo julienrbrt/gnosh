@@ -22,6 +22,10 @@ type Thinking struct {
 	// BudgetTokens caps the reasoning, for providers that take a budget.
 	// Zero means the provider's default.
 	BudgetTokens int
+	// BudgetNote is what a provider that can (llama.cpp's server) puts at
+	// the end of the reasoning when BudgetTokens runs out, so the model
+	// knows why its thinking ended. Empty means nothing is put there.
+	BudgetNote string
 	// Effort is "low", "medium" or "high", for providers that take a level.
 	// Empty means the provider's default.
 	Effort string
@@ -204,6 +208,14 @@ type SlotLoad struct {
 // reading a long prompt, or answering someone else.
 type LoadReporter interface {
 	Load(ctx context.Context, model string) (ServerLoad, error)
+}
+
+// ImageDropper is a Provider that may leave a request's images out,
+// because its server said it cannot take them: it then sends each as a
+// line saying it was left out.
+type ImageDropper interface {
+	// LeavesOutImages reports whether it does so now for model.
+	LeavesOutImages(model string) bool
 }
 
 // TokenCounter is a Provider that can count a request's prompt tokens

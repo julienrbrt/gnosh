@@ -311,21 +311,14 @@ func TestReadRefusesWhatIsNotText(t *testing.T) {
 		p := f.file("wide.txt", "\xff\xfeh\x00i\x00\n\x00")
 		f.fails(f.read, in{"file_path": p}, "looks like a binary file", "UTF-16", "iconv")
 	})
-	t.Run("PDF", func(t *testing.T) {
-		p := f.file("doc.pdf", "%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n")
-		f.fails(f.read, in{"file_path": p}, "is a PDF", "cannot read yet", "pdftotext")
-		// By content, whatever the name; and by name, whatever the content.
-		f.fails(f.read, in{"file_path": f.file("renamed.txt", "%PDF-1.4\nstuff")}, "is a PDF")
-		f.fails(f.read, in{"file_path": f.file("empty.PDF", "not really")}, "is a PDF")
-		f.fails(f.read, in{"file_path": p, "pages": "1-3"}, "is a PDF", "cannot read yet")
-	})
 	t.Run("pages on a file that is not a PDF", func(t *testing.T) {
 		p := f.file("plain.txt", "text\n")
 		f.fails(f.read, in{"file_path": p, "pages": "1-3"}, "pages is for PDF files", "offset and limit")
 	})
-	t.Run("notebook", func(t *testing.T) {
-		p := f.file("nb.ipynb", `{"cells": []}`)
-		f.fails(f.read, in{"file_path": p}, "Jupyter notebook", "cannot read yet")
+	t.Run("a notebook that is not one", func(t *testing.T) {
+		p := f.file("nb.ipynb", `{"worksheets": []}`)
+		f.fails(f.read, in{"file_path": p}, "could not be read as a notebook", "nbformat 3")
+		f.fails(f.read, in{"file_path": f.file("bad.ipynb", `{"cells": 3}`)}, "no list of cells")
 	})
 	t.Run("directory", func(t *testing.T) {
 		d := f.mkdir("some/dir")
@@ -530,11 +523,11 @@ func TestReadArguments(t *testing.T) {
 		}
 		home.fails(home.read, in{"file_path": "~other/a.txt"}, "not expanded")
 	})
-	t.Run("allow_large is accepted and has no effect", func(t *testing.T) {
+	t.Run("allow_large without the room to read more", func(t *testing.T) {
 		small := newFixture(t, Options{ReadDefaultLines: 2})
 		big := small.file("b.txt", manyLines(5))
 		text := small.ok(small.read, in{"file_path": big, "allow_large": true})
-		mustContain(t, text, "Showing lines 1-2 of 5.", "allow_large is not supported")
+		mustContain(t, text, "Showing lines 1-2 of 5.", "allow_large finds no more room than that here")
 	})
 	t.Run("no arguments at all", func(t *testing.T) {
 		for _, raw := range []string{"", "{}", "null", " "} {
@@ -619,5 +612,74 @@ func TestReadNamesWithOddCharacters(t *testing.T) {
 		if got := f.ok(f.read, in{"file_path": p}); got != "1\tok\n" {
 			t.Errorf("%q: text = %q", name, got)
 		}
+	}
+}
+
+// allow_large reads the whole file in one call, as far as the context has
+// room for (Options.ReadRoom), as Claude Code's does; without the room, or
+// without the argument, the usual limits hold.
+func TestReadAllowLarge(t *testing.T) {
+	room, used := 50_000, []int{}
+	f := newFixture(t, Options{ReadMaxBytes: 1000, ReadRoom: func(context.Context) (int, func(int)) {
+		return room, func(n int) { used = append(used, n) }
+	}})
+	p := f.file("big.txt", manyLines(1500))
+	got := f.ok(f.read, in{"file_path": p})
+	mustContain(t, got, "This call stopped at the 1000 bytes one call may show")
+	got = f.ok(f.read, in{"file_path": p, "allow_large": true})
+	mustContain(t, got, "1500\tline 1500\n")
+	if strings.Contains(got, "To read on") {
+		t.Errorf("a whole read with allow_large says to read on: %s", got[len(got)-200:])
+	}
+	// What the call used is handed back, line numbers and all, so the
+	// rest of the room can go to another call.
+	if body, _, _ := strings.Cut(got, "\n["); len(used) != 1 || used[0] != len(body) {
+		t.Errorf("used = %v, want [%d]", used, len(body))
+	}
+	// A limit given still holds.
+	got = f.ok(f.read, in{"file_path": p, "allow_large": true, "limit": 10})
+	mustContain(t, got, "10\tline 10\n", "Showing lines 1-10")
+	// Less room than the file: as much as there is room for.
+	room = 5000
+	got = f.ok(f.read, in{"file_path": p, "allow_large": true})
+	mustContain(t, got, "the context has room for now, with allow_large", "To read on")
+	// No room given: the usual limits, and it says so.
+	g := newFixture(t, Options{ReadMaxBytes: 1000})
+	q := g.file("big.txt", manyLines(1500))
+	mustContain(t, g.ok(g.read, in{"file_path": q, "allow_large": true}), "allow_large finds no more room than that here")
+}
+
+// A Read never returns more than the loop lets through whole
+// (Options.ReadResultMost), with allow_large or without, counting the line
+// numbers: a longer result would be cut on its way to the model while
+// Read recorded every line as read, and a whole-file Write would then drop
+// the lines the model never saw (the review of 2026-11-20).
+func TestReadStopsShortOfWhatTheLoopCuts(t *testing.T) {
+	const most = 3000
+	f := newFixture(t, Options{
+		ReadMaxBytes:   100_000,
+		ReadRoom:       func(context.Context) (int, func(int)) { return 1 << 20, func(int) {} },
+		ReadResultMost: func(context.Context) int { return most },
+	})
+	// Short lines, so that the line numbers weigh: 1500 lines of two
+	// bytes are 4,500 bytes of text, and more than 10,000 shown.
+	var b strings.Builder
+	for range 1500 {
+		b.WriteString("x\n")
+	}
+	p := f.file("short.txt", b.String())
+	for _, large := range []bool{false, true} {
+		got := f.ok(f.read, in{"file_path": p, "allow_large": large})
+		body, _, _ := strings.Cut(got, "\n[")
+		if len(body) > most || len(body) < most-10 {
+			t.Errorf("allow_large %v: %d bytes of lines, want just under %d", large, len(body), most)
+		}
+		mustContain(t, got, "one result may hold for this model", "To read on")
+		// Only what was shown counts as read: the file is not replaced
+		// whole.
+		f.fails(f.write, in{"file_path": p, "content": "y\n"}, "would be replaced whole")
+	}
+	if f.content(p) != b.String() {
+		t.Error("the file was written")
 	}
 }

@@ -93,13 +93,14 @@ var builtinTools = map[string]toolInfo{
 	"ListMcpResourcesTool": {classQuiet, "", nil},
 	"ReadMcpResourceTool":  {classQuiet, "", nil},
 	"WaitForMcpServers":    {classQuiet, "", nil},
-	"EnterWorktree":        {classOther, "", nil},
-	"ExitWorktree":         {classQuiet, "", nil},
+	"EnterWorktree":        {classQuiet, "", []string{"name", "path"}},
+	"ExitWorktree":         {classQuiet, "", []string{"action", "discard_changes"}},
 	"CronCreate":           {classQuiet, "", nil},
 	"CronDelete":           {classQuiet, "", nil},
 	"CronList":             {classQuiet, "", nil},
 	"ScheduleWakeup":       {classQuiet, "", nil},
-	"LSP":                  {classQuiet, "", nil},
+	"LSP":                  {classFileRead, "filePath", []string{"operation", "line", "character", "query"}},
+	"PushNotification":     {classQuiet, "", []string{"message", "status"}},
 
 	// Names Claude Code has or had and gnosh does not: settings written
 	// for Claude Code load, and these rules do nothing because there is
@@ -112,7 +113,7 @@ var builtinTools = map[string]toolInfo{
 	"Artifact": {class: classAbsent}, "EndConversation": {class: classAbsent},
 	"ListAgents":   {class: classAbsent},
 	"SendUserFile": {class: classAbsent}, "SendFeedback": {class: classAbsent},
-	"PushNotification": {class: classAbsent}, "RemoteTrigger": {class: classAbsent},
+	"RemoteTrigger":  {class: classAbsent},
 	"ReportFindings": {class: classAbsent}, "ShareOnboardingGuide": {class: classAbsent},
 	"SubagentHandback": {class: classAbsent}, "Workflow": {class: classAbsent},
 }

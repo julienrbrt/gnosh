@@ -18,7 +18,16 @@ var (
 	errLinkLoop   = errors.New("it leads through too many symbolic links, which is probably a loop")
 	errNotRegular = errors.New("it is not an ordinary file")
 	errTooBig     = errors.New("it is too big")
+	errNetMount   = errors.New("it lies in a folder the system mounts from the network as soon as it is looked at, so it is not looked at")
 )
+
+// netMounts are folders whose entries the system mounts from the network
+// the moment one is looked at: macOS's /net, a folder for every host, and
+// /Network; and AFS's cells. A look at /net/beacon.example is a connection
+// to that host, so a repository's "@/net/beacon.example/x.md", or a link
+// there, would make the machine call out as gnosh starts, before anyone
+// has said the folder may be trusted (the skills review of 2026-11-19).
+var netMounts = []string{"/net", "/Network", "/afs"}
 
 // disk reads the file system the loader was given. The paths it takes are
 // absolute, cleaned and slash-separated ("/a/b"). The file system is rooted
@@ -29,6 +38,33 @@ var (
 // here, and a link with an absolute target works on any file system.
 type disk struct {
 	fsys fs.FS
+	// mine are the places inside a network mount (netMounts) that may be
+	// looked at all the same: the project, the person's home and their own
+	// files, when they lie there, and the folders on the way to them.
+	// Nothing else inside one is.
+	mine []string
+}
+
+// offLimits reports whether p lies inside a network mount and outside
+// every place of mine.
+func (d disk) offLimits(p string) bool {
+	for _, m := range netMounts {
+		if !strings.HasPrefix(p, m+"/") {
+			continue
+		}
+		for _, ok := range d.mine {
+			if ok != "" && (within(p, ok) || within(ok, p)) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// fenced is the error for a look at p that is off limits.
+func fenced(op, p string) error {
+	return &fs.PathError{Op: op, Path: fsName(p), Err: errNetMount}
 }
 
 // fsName turns one of the package's paths into the name the file system
@@ -44,17 +80,26 @@ func fsName(p string) string {
 // lstat describes what is at p without following a link there. The
 // directory part of p must hold no links.
 func (d disk) lstat(p string) (fs.FileInfo, error) {
+	if d.offLimits(p) {
+		return nil, fenced("lstat", p)
+	}
 	return fs.Lstat(d.fsys, fsName(p))
 }
 
 // stat describes the file at real, a path with no links in it.
 func (d disk) stat(real string) (fs.FileInfo, error) {
+	if d.offLimits(real) {
+		return nil, fenced("stat", real)
+	}
 	return fs.Stat(d.fsys, fsName(real))
 }
 
 // readDir lists the directory at real, a path with no links in it, in name
 // order.
 func (d disk) readDir(real string) ([]fs.DirEntry, error) {
+	if d.offLimits(real) {
+		return nil, fenced("readdir", real)
+	}
 	return fs.ReadDir(d.fsys, fsName(real))
 }
 
@@ -122,6 +167,9 @@ func (d disk) resolveLoose(p string) string {
 // links in it. It refuses a file of more than max bytes without reading it
 // all.
 func (d disk) read(real string, max int64) ([]byte, fs.FileInfo, error) {
+	if d.offLimits(real) {
+		return nil, nil, fenced("open", real)
+	}
 	f, err := d.fsys.Open(fsName(real))
 	if err != nil {
 		return nil, nil, err

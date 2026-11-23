@@ -31,14 +31,14 @@ type Place struct {
 
 // goodName is what a server's name may be made of, so that its tools'
 // names (mcp__<server>__<tool>) are the name as it was typed.
-var goodName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+var goodName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // CheckName says what is wrong with a name for a new server, or "".
 func CheckName(name string) string {
 	if !goodName.MatchString(name) {
-		return "a server's name is made of letters, digits, - and _ (up to 64 of them), since its tools are named after it"
+		return fmt.Sprintf("a server's name is made of letters, digits, - and _ (up to %d of them), since its tools are named after it", maxServerName)
 	}
-	return ""
+	return blurredName(name)
 }
 
 // Lookup returns a server's entry in a place, compacted, or nil when it
@@ -84,6 +84,14 @@ func Put(pl Place, name string, entry json.RawMessage, mode fs.FileMode) error {
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, entry); err != nil {
 		return fmt.Errorf("the entry is not JSON: %w", err)
+	}
+	// A file whose servers were written at its top level, beside
+	// "mcpServers" instead of inside it, is not added to: one more shape
+	// in it would hide that its servers are not read.
+	if root, err := readPlace(pl.Path); err == nil {
+		if names := strays(root.vals); len(names) > 0 {
+			return fmt.Errorf("%s holds %s, outside \"mcpServers\", where no server is read. Move %s inside \"mcpServers\": {...} first; the file was left as it is", pl.Path, strayText(names), itOrThem(len(names)))
+		}
 	}
 	return change(pl, mode, func(servers *object) bool {
 		servers.put(name, compact.Bytes())

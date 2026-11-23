@@ -18,9 +18,12 @@ type expect struct {
 	stop     string
 	system   []string
 	input    string
+	output   string   // the replacement for the tool's output, compacted
 	warnings []string // one part for each warning expected, in order
 	result   Result   // the hook's record; ResultNone when left empty
 	notes    []string // parts the record's notes must contain
+	action   string   // the answer to an MCP server's request
+	content  string   // its values, compacted
 }
 
 // check compares an Outcome of one hook with what is expected.
@@ -56,6 +59,12 @@ func check(t *testing.T, out Outcome, want expect) {
 	}
 	if string(out.UpdatedInput) != want.input {
 		t.Errorf("UpdatedInput = %s, want %s", out.UpdatedInput, want.input)
+	}
+	if string(out.UpdatedOutput) != want.output {
+		t.Errorf("UpdatedOutput = %s, want %s", out.UpdatedOutput, want.output)
+	}
+	if out.ElicitAction != want.action || string(out.ElicitContent) != want.content {
+		t.Errorf("ElicitAction %q with %s, want %q with %s", out.ElicitAction, out.ElicitContent, want.action, want.content)
 	}
 	if len(out.Warnings) != len(want.warnings) {
 		t.Errorf("got %d warnings, want %d: %q", len(out.Warnings), len(want.warnings), out.Warnings)
@@ -311,7 +320,7 @@ var answerForms = []struct {
 		prints: "half a thought", after: "exit 1", want: expect{}},
 	{name: "a permission decision, which only a tool hook can give", event: UserPromptSubmit,
 		prints: `{"hookSpecificOutput": {"permissionDecision": "deny", "permissionDecisionReason": "no"}}`,
-		want:   expect{blocked: true, failed: true, reason: `~it gives "permissionDecision", which only a PreToolUse hook can`, result: ResultCouldNotEvaluate}},
+		want:   expect{blocked: true, failed: true, reason: `~it gives "permissionDecision", which only a PreToolUse or PreModelSwitch hook can`, result: ResultCouldNotEvaluate}},
 	{name: "text along with an answer", event: UserPromptSubmit,
 		prints: "Context follows.\n" + `{"hookSpecificOutput": {"additionalContext": "x"}}`,
 		want:   expect{blocked: true, failed: true, reason: "~other text along with its JSON answer", result: ResultCouldNotEvaluate}},
@@ -334,7 +343,7 @@ var answerForms = []struct {
 		want:   expect{failed: true, warnings: []string{"initialUserMessage"}, result: ResultCouldNotEvaluate}},
 	{name: "what is noted and not done", event: SessionStart,
 		prints: `{"hookSpecificOutput": {"sessionTitle": "Build", "watchPaths": ["/project/.env"], "reloadSkills": true, "additionalContext": "x"}}`,
-		want:   expect{context: "x", notes: []string{"name the session", "files to be watched", "skills to be loaded again"}}},
+		want:   expect{context: "x", notes: []string{"name the session", "skills to be loaded again"}}},
 	{name: "ending the turn", event: SessionStart,
 		prints: `{"continue": false, "stopReason": "the license has run out"}`,
 		want:   expect{endTurn: true, stop: "the license has run out", result: ResultEndedTurn}},
@@ -352,6 +361,94 @@ var answerForms = []struct {
 	{name: "a block is only an objection", event: PostModelSwitch,
 		prints: `{"decision": "block", "reason": "too slow"}`,
 		want:   expect{warnings: []string{"objected"}, result: ResultWarning}},
+
+	// ---- PreModelSwitch: allow, deny or ask, as PreToolUse does; nothing
+	// for the model.
+	{name: "deny", event: PreModelSwitch,
+		prints: `{"hookSpecificOutput": {"hookEventName": "PreModelSwitch", "permissionDecision": "deny", "permissionDecisionReason": "not approved here"}}`,
+		want:   expect{blocked: true, decision: Deny, reason: "not approved here", result: ResultBlocked}},
+	{name: "ask", event: PreModelSwitch,
+		prints: `{"hookSpecificOutput": {"hookEventName": "PreModelSwitch", "permissionDecision": "ask", "permissionDecisionReason": "it sends 180k tokens again"}}`,
+		want:   expect{decision: Ask, reason: "it sends 180k tokens again", result: ResultAsked}},
+	{name: "allow", event: PreModelSwitch,
+		prints: `{"hookSpecificOutput": {"hookEventName": "PreModelSwitch", "permissionDecision": "allow"}}`,
+		want:   expect{decision: Allow, result: ResultApproved}},
+	{name: "a top-level block", event: PreModelSwitch,
+		prints: `{"decision": "block", "reason": "pinned to the small model"}`,
+		want:   expect{blocked: true, decision: Deny, reason: "pinned to the small model", result: ResultBlocked}},
+	{name: "a cost report", event: PreModelSwitch,
+		prints: `{"systemMessage": "about $1.14 to fill the new cache"}`,
+		want:   expect{system: []string{"about $1.14 to fill the new cache"}, result: ResultWarning}},
+	{name: "no text for the model", event: PreModelSwitch,
+		prints: `{"hookSpecificOutput": {"hookEventName": "PreModelSwitch", "additionalContext": "x"}}`,
+		want:   expect{blocked: true, failed: true, decision: Deny, reason: "~not something a PreModelSwitch hook can say", result: ResultCouldNotEvaluate}},
+	{name: "plain words are not text for the model", event: PreModelSwitch, prints: "fine by me", want: expect{}},
+
+	// ---- PostToolBatch: text for the model after the batch; a block or
+	// "continue": false ends the turn before the next request.
+	{name: "added text", event: PostToolBatch,
+		prints: `{"hookSpecificOutput": {"hookEventName": "PostToolBatch", "additionalContext": "the suite ran: 2 failures"}}`,
+		want:   expect{context: "the suite ran: 2 failures"}},
+	{name: "block", event: PostToolBatch,
+		prints: `{"decision": "block", "reason": "stop and fix the build"}`,
+		want:   expect{blocked: true, reason: "stop and fix the build", result: ResultBlocked}},
+	{name: "continue false", event: PostToolBatch,
+		prints: `{"continue": false, "stopReason": "enough for today"}`,
+		want:   expect{endTurn: true, stop: "enough for today", result: ResultEndedTurn}},
+	{name: "plain words are not text for the model", event: PostToolBatch, prints: "ran the suite", want: expect{}},
+
+	// ---- FileChanged: a message is shown; nothing can be stopped.
+	{name: "a message", event: FileChanged,
+		prints: `{"systemMessage": ".envrc changed: direnv allow ran"}`,
+		want:   expect{system: []string{".envrc changed: direnv allow ran"}, result: ResultWarning}},
+	{name: "a block is only an objection", event: FileChanged,
+		prints: `{"decision": "block", "reason": "no"}`,
+		want:   expect{warnings: []string{"objected"}, result: ResultWarning}},
+	{name: "a relative path to watch", event: FileChanged,
+		prints: `{"hookSpecificOutput": {"hookEventName": "FileChanged", "watchPaths": ["rel/.env"]}}`,
+		want:   expect{failed: true, warnings: []string{"not an absolute path"}, result: ResultCouldNotEvaluate}},
+
+	// ---- Elicitation: an answer in the person's place; a decline in any
+	// form wins.
+	{name: "accept", event: Elicitation,
+		prints: `{"hookSpecificOutput": {"hookEventName": "Elicitation", "action": "accept", "content": {"project_key": "DOCS"}}}`,
+		want:   expect{action: "accept", content: `{"project_key":"DOCS"}`, result: ResultAnswered}},
+	{name: "cancel", event: Elicitation,
+		prints: `{"hookSpecificOutput": {"hookEventName": "Elicitation", "action": "cancel"}}`,
+		want:   expect{action: "cancel", result: ResultAnswered}},
+	{name: "decline", event: Elicitation,
+		prints: `{"hookSpecificOutput": {"hookEventName": "Elicitation", "action": "decline"}}`,
+		want:   expect{blocked: true, action: "decline", reason: "~blocked this and gave no reason", result: ResultBlocked}},
+	{name: "a block wins over an accept", event: Elicitation,
+		prints: `{"decision": "block", "reason": "not from this server", "hookSpecificOutput": {"hookEventName": "Elicitation", "action": "accept", "content": {}}}`,
+		want:   expect{blocked: true, action: "decline", reason: "not from this server", result: ResultBlocked}},
+	{name: "an action not known", event: Elicitation,
+		prints: `{"hookSpecificOutput": {"hookEventName": "Elicitation", "action": "approve"}}`,
+		want:   expect{blocked: true, failed: true, action: "decline", reason: "~must be exactly", result: ResultCouldNotEvaluate}},
+	{name: "values without an accept", event: Elicitation,
+		prints: `{"hookSpecificOutput": {"hookEventName": "Elicitation", "content": {"project_key": "DOCS"}}}`,
+		want:   expect{notes: []string{"without \"action\": \"accept\""}}},
+	{name: "plain words are not read", event: Elicitation, prints: "fine by me", want: expect{}},
+
+	// ---- ElicitationResult: another answer in place of the person's.
+	{name: "other values", event: ElicitationResult,
+		prints: `{"hookSpecificOutput": {"hookEventName": "ElicitationResult", "action": "accept", "content": {"project_key": "WEB-2"}}}`,
+		want:   expect{action: "accept", content: `{"project_key":"WEB-2"}`, result: ResultAnswered}},
+	{name: "block", event: ElicitationResult,
+		prints: `{"decision": "block", "reason": "no keys to this server"}`,
+		want:   expect{blocked: true, action: "decline", reason: "no keys to this server", result: ResultBlocked}},
+	{name: "nothing for the model", event: ElicitationResult,
+		prints: `{"hookSpecificOutput": {"hookEventName": "ElicitationResult", "additionalContext": "x"}}`,
+		want:   expect{blocked: true, failed: true, action: "decline", reason: "~not something a ElicitationResult hook can say", result: ResultCouldNotEvaluate}},
+
+	// ---- ConfigChange: a block keeps the settings the session had.
+	{name: "block", event: ConfigChange,
+		prints: `{"decision": "block", "reason": "project settings change only with review"}`,
+		want:   expect{blocked: true, reason: "project settings change only with review", result: ResultBlocked}},
+	{name: "plain words are not read", event: ConfigChange, prints: "logged", want: expect{}},
+	{name: "nothing for the model", event: ConfigChange,
+		prints: `{"hookSpecificOutput": {"hookEventName": "ConfigChange", "additionalContext": "x"}}`,
+		want:   expect{blocked: true, failed: true, reason: "~not something a ConfigChange hook can say", result: ResultCouldNotEvaluate}},
 
 	// ---- DirectoryAdded: a message, which goes to the model.
 	{name: "a message", event: DirectoryAdded,
@@ -391,7 +488,7 @@ var answerForms = []struct {
 	{name: "plain words are not read", event: Stop, prints: "the tests pass", want: expect{}},
 	{name: "a tool hook's reason with nothing to go with it", event: Stop,
 		prints: `{"hookSpecificOutput": {"permissionDecisionReason": "because"}}`,
-		want:   expect{blocked: true, failed: true, reason: `~it gives "permissionDecisionReason", which only a PreToolUse hook can`, result: ResultCouldNotEvaluate}},
+		want:   expect{blocked: true, failed: true, reason: `~it gives "permissionDecisionReason", which only a PreToolUse or PreModelSwitch hook can`, result: ResultCouldNotEvaluate}},
 	{name: "ending the turn beats its own block", event: Stop,
 		prints: `{"continue": false, "stopReason": "stop for today", "decision": "block", "reason": "not done"}`,
 		want:   expect{blocked: true, reason: "not done", endTurn: true, stop: "stop for today", result: ResultEndedTurn}},
@@ -412,12 +509,15 @@ var answerForms = []struct {
 	{name: "added text", event: PostToolUse,
 		prints: `{"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "gofmt changed the file"}}`,
 		want:   expect{context: "gofmt changed the file"}},
-	{name: "a replaced tool result, which gnosh does not do", event: PostToolUse,
+	{name: "a replaced tool result", event: PostToolUse,
 		prints: `{"hookSpecificOutput": {"updatedToolOutput": {"stdout": "[redacted]", "stderr": "", "interrupted": false, "isImage": false}}}`,
-		want:   expect{blocked: true, failed: true, reason: `~it gives "updatedToolOutput", to replace what the tool returned, which gnosh does not do yet`, result: ResultCouldNotEvaluate}},
+		want:   expect{output: `{"stdout":"[redacted]","stderr":"","interrupted":false,"isImage":false}`}},
 	{name: "a replaced MCP tool result", event: PostToolUse,
 		prints: `{"hookSpecificOutput": {"updatedMCPToolOutput": "x"}}`,
-		want:   expect{blocked: true, failed: true, reason: `~"updatedMCPToolOutput"`, result: ResultCouldNotEvaluate}},
+		want:   expect{output: `"x"`}},
+	{name: "two different replacements in one answer", event: PostToolUse,
+		prints: `{"hookSpecificOutput": {"updatedToolOutput": "a", "updatedMCPToolOutput": "b"}}`,
+		want:   expect{blocked: true, failed: true, reason: `~only one can stand in for the tool's output`, output: `"a"`, result: ResultCouldNotEvaluate}},
 	{name: "added text", event: PostToolUseFailure,
 		prints: `{"hookSpecificOutput": {"hookEventName": "PostToolUseFailure", "additionalContext": "the test server is on port 8081"}}`,
 		want:   expect{context: "the test server is on port 8081"}},
@@ -426,7 +526,7 @@ var answerForms = []struct {
 		want:   expect{blocked: true, reason: "do not retry this", result: ResultFeedback}},
 	{name: "a permission decision after the call has run", event: PostToolUse,
 		prints: `{"hookSpecificOutput": {"permissionDecision": "allow"}}`,
-		want:   expect{blocked: true, failed: true, reason: "~only a PreToolUse hook can", result: ResultCouldNotEvaluate}},
+		want:   expect{blocked: true, failed: true, reason: "~only a PreToolUse or PreModelSwitch hook can", result: ResultCouldNotEvaluate}},
 
 	// ---- PermissionRequest: allow or deny in the user's place.
 	{name: "allow", event: PermissionRequest,
@@ -482,7 +582,7 @@ var answerForms = []struct {
 		want:   expect{failed: true, decision: Deny, reason: "never this command", warnings: []string{"Its refusal holds."}, result: ResultCouldNotEvaluate}},
 	{name: "a deny in a tool hook's form: the refusal holds", event: PermissionRequest,
 		prints: `{"hookSpecificOutput": {"permissionDecision": "deny", "permissionDecisionReason": "never this command"}}`,
-		want:   expect{failed: true, decision: Deny, reason: "never this command", warnings: []string{"only a PreToolUse hook can"}, result: ResultCouldNotEvaluate}},
+		want:   expect{failed: true, decision: Deny, reason: "never this command", warnings: []string{"only a PreToolUse or PreModelSwitch hook can"}, result: ResultCouldNotEvaluate}},
 	{name: "an allow in a tool hook's form is no answer", event: PermissionRequest,
 		prints: `{"hookSpecificOutput": {"permissionDecision": "allow"}}`,
 		want:   expect{failed: true, warnings: []string{"did not answer the permission question"}, result: ResultCouldNotEvaluate}},
@@ -572,5 +672,29 @@ func TestLongAnswersAreClipped(t *testing.T) {
 		if n := len([]rune(got)); n > 260 {
 			t.Errorf("%s: the text is %d characters long, want about 200:\n%s", tt.event, n, got)
 		}
+	}
+}
+
+// watchPaths, from SessionStart, CwdChanged and FileChanged hooks, are the
+// files to watch from then on: every hook's, once each; an empty list
+// clears them, and a hook that says nothing of them leaves them.
+func TestWatchPaths(t *testing.T) {
+	for _, event := range []Event{SessionStart, CwdChanged, FileChanged} {
+		r := newRunner(t, options(t),
+			Hook{Event: event, Command: `echo '{"hookSpecificOutput": {"hookEventName": "` + string(event) + `", "watchPaths": ["/p/.env", "/p/.envrc"]}}'`},
+			Hook{Event: event, Command: `echo '{"hookSpecificOutput": {"hookEventName": "` + string(event) + `", "watchPaths": ["/p/.env", "/q/x"]}}'`},
+		)
+		out := run(t, r, input(event))
+		if !out.WatchSet || strings.Join(out.WatchPaths, " ") != "/p/.env /p/.envrc /q/x" {
+			t.Errorf("%s: WatchSet %v, WatchPaths %q", event, out.WatchSet, out.WatchPaths)
+		}
+	}
+	r := newRunner(t, options(t), Hook{Event: CwdChanged, Command: `echo '{"hookSpecificOutput": {"hookEventName": "CwdChanged", "watchPaths": []}}'`})
+	if out := run(t, r, input(CwdChanged)); !out.WatchSet || len(out.WatchPaths) != 0 {
+		t.Errorf("an empty list: WatchSet %v, WatchPaths %q", out.WatchSet, out.WatchPaths)
+	}
+	r = newRunner(t, options(t), Hook{Event: CwdChanged, Command: `echo '{"systemMessage": "moved"}'`})
+	if out := run(t, r, input(CwdChanged)); out.WatchSet {
+		t.Errorf("a hook that named no files set the list: %q", out.WatchPaths)
 	}
 }

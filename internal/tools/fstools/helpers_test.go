@@ -16,14 +16,14 @@ import (
 // in is the arguments of a tool call, as the JSON object a model sends.
 type in map[string]any
 
-// fixture is a temp directory, a session, and the five tools.
+// fixture is a temp directory, a session, and the six tools.
 type fixture struct {
 	t    *testing.T
 	dir  string
 	env  *core.ToolEnv
 	opts Options
 
-	read, write, edit, glob, grep core.Tool
+	read, write, edit, glob, grep, nbedit core.Tool
 }
 
 // newFixture makes a fixture whose tools are set up with opts. Searches
@@ -42,15 +42,16 @@ func newFixture(t *testing.T, opts Options) *fixture {
 	}
 	tools := New(opts)
 	return &fixture{
-		t:     t,
-		dir:   dir,
-		env:   &core.ToolEnv{Cwd: dir, Roots: []string{dir}, SessionID: "test", Store: &sync.Map{}},
-		opts:  opts.withDefaults(),
-		read:  tools[0],
-		write: tools[1],
-		edit:  tools[2],
-		glob:  tools[3],
-		grep:  tools[4],
+		t:      t,
+		dir:    dir,
+		env:    &core.ToolEnv{Cwd: dir, Roots: []string{dir}, SessionID: "test", Store: &sync.Map{}},
+		opts:   opts.withDefaults(),
+		read:   tools[0],
+		write:  tools[1],
+		edit:   tools[2],
+		glob:   tools[3],
+		grep:   tools[4],
+		nbedit: tools[5],
 	}
 }
 

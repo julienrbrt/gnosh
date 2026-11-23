@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 )
@@ -56,6 +57,19 @@ type answer struct {
 	input json.RawMessage
 	// context is "additionalContext": text for the model.
 	context string
+	// output is "updatedToolOutput" (or "updatedMCPToolOutput"): what the
+	// model is to read in place of what the tool returned, as the hook
+	// wrote it.
+	output json.RawMessage
+	// watch is "watchPaths", the files to watch from now on, and watchSet
+	// says it was given (an empty list clears the list).
+	watch    []string
+	watchSet bool
+	// action is an Elicitation or ElicitationResult hook's answer to an
+	// MCP server's request, "accept" or "cancel" (a "decline" is a
+	// refusal), and content the values that go with accept.
+	action  string
+	content json.RawMessage
 	// notes says, in plain words, what the hook asked for that gnosh does
 	// not act on and that is harmless to leave undone.
 	notes []string
@@ -193,15 +207,15 @@ func parseAnswer(event Event, info eventInfo, out []byte) answer {
 							permission = s
 						}
 					}
-					if event != PreToolUse {
-						a.fail("it gives \"permissionDecision\", which only a PreToolUse hook can")
+					if event != PreToolUse && event != PreModelSwitch {
+						a.fail("it gives \"permissionDecision\", which only a PreToolUse or PreModelSwitch hook can")
 					}
 				case g.key == "permissionDecisionReason":
 					// Read on every event too: it is the reason of a deny
 					// that holds wherever it was written.
 					permReason, _ = a.str(g)
-					if event != PreToolUse && !hasKey(inner, "permissionDecision") {
-						a.fail("it gives \"permissionDecisionReason\", which only a PreToolUse hook can")
+					if event != PreToolUse && event != PreModelSwitch && !hasKey(inner, "permissionDecision") {
+						a.fail("it gives \"permissionDecisionReason\", which only a PreToolUse or PreModelSwitch hook can")
 					}
 				case !slices.Contains(info.fields, g.key):
 					a.fail("\"hookSpecificOutput\" has %s, which is not something a %s hook can say%s", quote(g.key), event, known(info.fields))
@@ -216,7 +230,11 @@ func parseAnswer(event Event, info eventInfo, out []byte) answer {
 				case g.key == "decision":
 					behavior, message = a.permissionRequest(g.value)
 				case g.key == "updatedToolOutput", g.key == "updatedMCPToolOutput":
-					a.fail("it gives %s, to replace what the tool returned, which gnosh does not do yet", quote(g.key))
+					if a.output != nil && !bytes.Equal(a.output, compact(g.value)) {
+						a.fail("it gives both \"updatedToolOutput\" and \"updatedMCPToolOutput\", different, and only one can stand in for the tool's output")
+						continue
+					}
+					a.output = compact(g.value)
 				case g.key == "initialUserMessage":
 					a.fail("it gives \"initialUserMessage\", to start the conversation with a message of its own, which gnosh does not do yet")
 				case g.key == "sessionTitle":
@@ -229,8 +247,34 @@ func parseAnswer(event Event, info eventInfo, out []byte) answer {
 					if on, _ := a.flag(g); on {
 						a.note("it asked for skills to be loaded again, which gnosh does not do from a hook")
 					}
+				case g.key == "action":
+					if s, ok := a.str(g); ok {
+						if s == "accept" || s == "decline" || s == "cancel" {
+							a.action = s
+						} else {
+							a.fail("\"action\" is %s; it must be exactly \"accept\", \"decline\" or \"cancel\"", quote(s))
+						}
+					}
+				case g.key == "content":
+					if kindOf(g.value) != "an object" {
+						a.fail("\"content\" must be a JSON object holding the form's values by name; this one is %s", kindOf(g.value))
+						continue
+					}
+					a.content = compact(g.value)
 				case g.key == "watchPaths":
-					a.note("it asked for files to be watched, which gnosh does not do")
+					var paths []string
+					if kindOf(g.value) != "a list" || json.Unmarshal(g.value, &paths) != nil {
+						a.fail("\"watchPaths\" must be a list of absolute paths; this one is %s", kindOf(g.value))
+						continue
+					}
+					a.watch, a.watchSet = []string{}, true
+					for _, p := range paths {
+						if !filepath.IsAbs(p) {
+							a.fail("\"watchPaths\" holds %s, which is not an absolute path", quote(p))
+							continue
+						}
+						a.watch = append(a.watch, filepath.Clean(p))
+					}
 				}
 			}
 		default:
@@ -242,7 +286,7 @@ func parseAnswer(event Event, info eventInfo, out []byte) answer {
 	// proper form; a refusal in another form is still a refusal, and
 	// anything else in another form is a mistake.
 	switch event {
-	case PreToolUse:
+	case PreToolUse, PreModelSwitch:
 		switch {
 		case permission != "": // it wins over the older top-level form
 			a.refuse, a.ask, a.approve = permission == "deny", permission == "ask", permission == "allow"
@@ -253,6 +297,20 @@ func parseAnswer(event Event, info eventInfo, out []byte) answer {
 		case top != "":
 			a.refuse, a.approve = top == "block", top == "approve"
 			a.reason = topReason
+		}
+	case Elicitation, ElicitationResult:
+		// A decline in any form is a refusal, and wins over an answer in
+		// the same output, as a top-level block does in Claude Code.
+		switch {
+		case top == "block" || a.action == "decline" || permission == "deny":
+			a.refuse, a.action, a.content = true, "", nil
+			a.reason = topReason
+		case a.content != nil && a.action != "accept":
+			a.note("it gave \"content\" without \"action\": \"accept\", so its values were not used")
+			a.content = nil
+		}
+		if top == "approve" {
+			a.note("it said \"decision\": \"approve\", which answers nothing here; a hook answers a server's form with hookSpecificOutput.action")
 		}
 	case PermissionRequest:
 		switch {

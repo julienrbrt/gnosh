@@ -328,7 +328,8 @@ JSON on stdin (fields gnosh provides in **bold**):
 | **`context_window.*`** | From the most recent model response. `used_percentage` counts input tokens only (input + cache write + cache read) against `context_window_size`. `current_usage` is `null` before the first response and right after a compaction; the percentages may be `null` early. |
 | **`output_style.name`** | |
 | `prompt_id`, `effort`, `thinking`, `vim`, `agent`, `worktree`, `workspace.git_worktree`, `workspace.repo` | Present only when applicable. |
-| `rate_limits`, `prompt_cache`, `fast_mode`, `pr` | Anthropic account, cache and PR-badge data: not adopted. |
+| `prompt_cache` | Adopted 2026-11-17 in the fields gnosh can tell from the providers' cache counts (llama.cpp's cache_n, cached_tokens): `warm`, `caching_observed`, `requests`, `misses`, `expected_rebuilds`, `hit_ratio`, `cache_write_tokens`, `miss_recache_tokens`, `last_miss_at`. A model server of the person's own has no cache lifetime, so `ttl`, `expires_at` and the miss causes are left out. `/cost` says the same in words. |
+| `rate_limits`, `fast_mode`, `pr` | Anthropic account and PR-badge data: not adopted. |
 
 With or without a custom status line, the footer always shows the current
 permission mode.
@@ -393,7 +394,8 @@ unless marked.
 - [ ] History per directory, Up/Down rules, Ctrl+R search, cleared-draft
       recall.
 - [ ] Paste collapsing at 800 characters / three lines, with the paste
-      marked as pasted for the model.
+      marked as pasted for the model; invisible characters taken out on
+      Enter (`spec/DECISIONS.md` 72).
 - [ ] Queueing while the model works; Up to take back.
 - [ ] Esc, Esc-Esc, Ctrl+C (clear, then exit), Ctrl+D (double press),
       Shift+Tab mode cycle, Ctrl+B, Ctrl+Z.
@@ -421,13 +423,14 @@ unless marked.
 - The fullscreen (alternate-screen) renderer and everything specific to it:
   mouse selection, in-app scrolling, `/tui`, `/focus`, `/scroll-speed`, the
   diff panel.
-- Emoji shortcodes, spell checking, voice dictation, prompt suggestions,
-  "you should know" notes, `/btw` panel, PR status badge, issue links,
+- Emoji shortcodes, spell checking, voice dictation, the git-history
+  example in a new session's box (the next-prompt suggestions are adopted,
+  off unless set: `spec/DECISIONS.md` 71), "you should know" notes, `/btw` panel, PR status badge, issue links,
   usage-limit waiting, fast mode toggle (Alt+O).
 - The task checklist as a todo-tool view (Ctrl+T shows the `mem` plan
   instead).
 - The `#` memory shortcut.
-- `rate_limits`, `prompt_cache`, `fast_mode`, `pr` in the status-line JSON.
+- `rate_limits`, `fast_mode`, `pr` in the status-line JSON (`prompt_cache` is adopted).
 
 ## Unverified (docs silent)
 

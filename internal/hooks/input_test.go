@@ -227,9 +227,35 @@ func TestStdinOfEveryEvent(t *testing.T) {
 			want: with(common(Notification), map[string]any{"message": "the turn finished a minute ago", "notification_type": "idle_prompt"}),
 		},
 		{
+			name: "FileChanged",
+			in:   Input{Event: FileChanged, FilePath: "/project/.envrc", FileEvent: "unlink", EnvFile: "/state/env.sh"},
+			want: with(common(FileChanged), map[string]any{"file_path": "/project/.envrc", "event": "unlink"}),
+		},
+		{
+			name: "PostToolBatch",
+			in: Input{Event: PostToolBatch, ToolCalls: []BatchCall{
+				{ToolName: "Read", ToolUseID: "toolu_01", ToolInput: json.RawMessage(`{"file_path":"/p/a.go"}`), ToolResponse: "1\tpackage a"},
+				{ToolName: "Bash", ToolUseID: "toolu_02", ToolResponse: "Exit code 1"},
+			}},
+			want: with(common(PostToolBatch), map[string]any{"permission_mode": "default", "tool_calls": []any{
+				map[string]any{"tool_name": "Read", "tool_use_id": "toolu_01", "tool_input": map[string]any{"file_path": "/p/a.go"}, "tool_response": "1\tpackage a"},
+				map[string]any{"tool_name": "Bash", "tool_use_id": "toolu_02", "tool_input": map[string]any{}, "tool_response": "Exit code 1"},
+			}}),
+		},
+		{
+			name: "ConfigChange",
+			in:   Input{Event: ConfigChange, Source: "project_settings", FilePath: "/project/gnosh.json"},
+			want: with(common(ConfigChange), map[string]any{"source": "project_settings", "file_path": "/project/gnosh.json"}),
+		},
+		{
+			name: "PreModelSwitch",
+			in:   Input{Event: PreModelSwitch, FromModel: "local/a", ToModel: "local/b", RequestedModel: "b", Source: "command", ContextTokens: 182340},
+			want: with(common(PreModelSwitch), map[string]any{"from_model": "local/a", "to_model": "local/b", "requested_model": "b", "source": "command", "context_tokens": 182340.0}),
+		},
+		{
 			name: "PostModelSwitch",
 			in:   Input{Event: PostModelSwitch, FromModel: "local/a", ToModel: "local/b", RequestedModel: "b", Source: "command"},
-			want: with(common(PostModelSwitch), map[string]any{"from_model": "local/a", "to_model": "local/b", "requested_model": "b", "source": "command"}),
+			want: with(common(PostModelSwitch), map[string]any{"from_model": "local/a", "to_model": "local/b", "requested_model": "b", "source": "command", "context_tokens": 0.0}),
 		},
 		{
 			name: "DirectoryAdded",
@@ -245,6 +271,18 @@ func TestStdinOfEveryEvent(t *testing.T) {
 			name: "UserPromptExpansion",
 			in:   Input{Event: UserPromptExpansion, ExpansionType: "slash_command", CommandName: "deploy", CommandArgs: "staging", CommandSource: "project", Prompt: "Deploy to staging."},
 			want: with(common(UserPromptExpansion), map[string]any{"permission_mode": "default", "expansion_type": "slash_command", "command_name": "deploy", "command_args": "staging", "command_source": "project", "prompt": "Deploy to staging."}),
+		},
+		{
+			name: "Elicitation",
+			in: Input{Event: Elicitation, MCPServerName: "issue-tracker", Message: "Which project?", Mode: "form",
+				RequestedSchema: json.RawMessage(`{"type": "object", "properties": {"project_key": {"type": "string"}}}`)},
+			want: with(common(Elicitation), map[string]any{"mcp_server_name": "issue-tracker", "message": "Which project?", "mode": "form",
+				"requested_schema": map[string]any{"type": "object", "properties": map[string]any{"project_key": map[string]any{"type": "string"}}}}),
+		},
+		{
+			name: "ElicitationResult",
+			in:   Input{Event: ElicitationResult, MCPServerName: "issue-tracker", Action: "accept", Mode: "form", Content: json.RawMessage(`{"project_key":"WEB"}`)},
+			want: with(common(ElicitationResult), map[string]any{"mcp_server_name": "issue-tracker", "action": "accept", "mode": "form", "content": map[string]any{"project_key": "WEB"}}),
 		},
 	}
 	seen := map[Event]bool{}
@@ -436,9 +474,16 @@ func TestEnvironmentOfEveryEvent(t *testing.T) {
 			with(always(InstructionsLoaded), "GNOSH_INSTRUCTIONS_LOAD_REASON", "nested_traversal")},
 		{"Notification", Input{Event: Notification, NotificationType: "idle_prompt", Message: "idle"},
 			with(always(Notification), "GNOSH_NOTIFICATION_TYPE", "idle_prompt")},
+		{"PreModelSwitch", Input{Event: PreModelSwitch, FromModel: "local/a", ToModel: "local/b", Source: "command"}, always(PreModelSwitch)},
+		{"ConfigChange", Input{Event: ConfigChange, Source: "user_settings", FilePath: "/home/gnosh.json"}, always(ConfigChange)},
+		{"PostToolBatch", Input{Event: PostToolBatch}, always(PostToolBatch)},
+		{"FileChanged", Input{Event: FileChanged, FilePath: "/project/.envrc", FileEvent: "change", EnvFile: "/state/gnosh/env/session-1.sh"},
+			with(always(FileChanged), "GNOSH_ENV_FILE", "/state/gnosh/env/session-1.sh", "CLAUDE_ENV_FILE", "/state/gnosh/env/session-1.sh")},
 		{"PostModelSwitch", Input{Event: PostModelSwitch, FromModel: "local/a", ToModel: "local/b", Source: "command"}, always(PostModelSwitch)},
 		{"DirectoryAdded", Input{Event: DirectoryAdded, Directory: "/project/docs", Source: "slash_command"}, always(DirectoryAdded)},
 		{"UserPromptExpansion", Input{Event: UserPromptExpansion, ExpansionType: "slash_command", CommandName: "deploy", Prompt: "x"}, always(UserPromptExpansion)},
+		{"Elicitation", Input{Event: Elicitation, MCPServerName: "issue-tracker", Message: "Which project?"}, always(Elicitation)},
+		{"ElicitationResult", Input{Event: ElicitationResult, MCPServerName: "issue-tracker", Action: "decline"}, always(ElicitationResult)},
 		{"CwdChanged", Input{Event: CwdChanged, OldCwd: "/project", NewCwd: "/project/sub", EnvFile: "/state/gnosh/env/session-1.sh"},
 			with(always(CwdChanged), "GNOSH_ENV_FILE", "/state/gnosh/env/session-1.sh", "CLAUDE_ENV_FILE", "/state/gnosh/env/session-1.sh")},
 	}

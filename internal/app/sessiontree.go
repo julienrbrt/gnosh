@@ -3,12 +3,14 @@ package app
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gnosh-ai/gnosh/internal/cli"
@@ -39,9 +41,19 @@ type sessionTree struct {
 	// named says the person gave the name, and reused that the work tree
 	// was there already: either keeps it at the end.
 	named, reused bool
+	// forked says a /fork run was started in it, which may still be
+	// working there when this session ends: that keeps it too.
+	forked atomic.Bool
 	// from is the folder the session was started in, and fromBranch the
 	// branch checked out there ("" when none could be read).
 	from, fromBranch string
+	// included are the files copied in as .worktreeinclude names them,
+	// and includeErr says what could not be.
+	included   []string
+	includeErr error
+	// entered says EnterWorktree moved the session into it: ExitWorktree
+	// takes it back out (worktreetool.go).
+	entered bool
 }
 
 // treeNameRe is what a work tree's name may be: a folder's name and a
@@ -92,60 +104,23 @@ func (st *startup) enterTree(ctx context.Context, trusted bool) int {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	env := p.o.Environ
-	// The repository's top folder as git has it, which the work tree
-	// keeps out of: the folder that settles trust may be a lower one (a
-	// .git/config that includes another file is read only that far).
-	top := st.folder.Root
-	if t, err := runGit(ctx, env, st.folder.Start, "rev-parse", "--show-toplevel"); err == nil && t != "" {
-		top = t
-	}
-	root, err := treesFolder(st.cfg.Paths.DataDir)
+	t, start, err := makeTree(ctx, p.childEnviron(), st.folder, st.cfg.Paths.DataDir, name, named)
 	if err != nil {
 		return fail("%v", err)
 	}
-	t := &sessionTree{worktree: worktree{repo: top, path: filepath.Join(root, name), branch: "worktree-" + name}, name: name, named: named, from: st.folder.Start}
-	if b, err := runGit(ctx, env, top, "rev-parse", "--abbrev-ref", "HEAD"); err == nil && b != "HEAD" {
-		t.fromBranch = b
+	if t.includeErr != nil {
+		fmt.Fprintf(p.stderr, "gnosh: %v\n", t.includeErr)
 	}
-	_, branchErr := runGit(ctx, env, top, "rev-parse", "--verify", "--quiet", "refs/heads/"+t.branch)
-	switch {
-	case fileExists(t.path):
-		// One of that name is there: it is opened again if it is a work
-		// tree of this repository, and nothing else is.
-		list, err := runGit(ctx, env, top, "worktree", "list", "--porcelain")
-		if err != nil || !listsTree(list, t.path) {
-			return fail("%s is there and is no work tree of this repository: name another", t.path)
-		}
-		head, err := runGit(ctx, env, t.path, "rev-parse", "HEAD")
-		if err != nil {
-			return fail("the work tree %s is there, and its commit could not be read (%v)", t.path, err)
-		}
-		t.base, t.reused = head, true
-	default:
-		base, err := runGit(ctx, env, top, "rev-parse", "--verify", "--quiet", "HEAD")
-		if err != nil || base == "" {
-			return fail("the repository has no commit yet, so there is nothing to make a work tree of")
-		}
-		t.base = base
-		// A branch of that name left from before is checked out again.
-		if err := addTree(ctx, env, &t.worktree, branchErr != nil); err != nil {
-			return fail("%v", err)
-		}
-		if branchErr == nil {
-			if head, err := runGit(ctx, env, t.path, "rev-parse", "HEAD"); err == nil {
-				t.base = head
-			}
-			t.reused = true
-		}
-	}
-	// The session starts in the folder of the work tree that stands where
-	// the one it was started in stands in the repository.
-	start := t.path
-	if rel, err := filepath.Rel(resolved(top), resolved(st.folder.Start)); err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, "../") {
-		if info, err := os.Stat(filepath.Join(t.path, rel)); err == nil && info.IsDir() {
-			start = filepath.Join(t.path, rel)
-		}
+	switch t.path {
+	case p.treeMove.Entered:
+		// EnterWorktree made it, or opened it again, a moment ago for this
+		// session: as one made here it goes at the end when it was left as
+		// made and nobody named it, and ExitWorktree may take it back.
+		t.reused, t.named, t.entered = false, p.treeMove.Named, true
+	case p.treeMove.Made:
+		// The gnosh before made it under a made-up name, and /restart
+		// found it by that name: it is still one made here, nobody named.
+		t.reused, t.named = false, false
 	}
 	folder, err := trust.Resolve(start, p.home)
 	if err != nil {
@@ -166,8 +141,91 @@ func (st *startup) enterTree(ctx context.Context, trusted bool) int {
 	if t.reused {
 		how = "opened again, on the branch " + t.branch
 	}
+	if len(t.included) > 0 {
+		how += ", with copies of " + fewOf(t.included, 5) + " (" + includeFile + ")"
+	}
 	fmt.Fprintf(p.stderr, "gnosh works in the git work tree %s, %s.\n", t.path, how)
 	return cli.ExitOK
+}
+
+// makeTree makes, or opens again, the work tree of a session in the
+// repository folder is in: <data folder>/worktrees/<name>, on the branch
+// worktree-<name>, as Claude Code names them; one of that name already
+// there is opened again. named says the name was given. It returns the
+// tree and the folder in it that stands where folder.Start stands in the
+// repository, where the session starts. A copy .worktreeinclude names that
+// could not be made is in the tree's includeErr. The error says why no
+// tree could be had.
+func makeTree(ctx context.Context, env []string, folder trust.Folder, dataDir, name string, named bool) (*sessionTree, string, error) {
+	// The repository's top folder as git has it, which the work tree
+	// keeps out of: the folder that settles trust may be a lower one (a
+	// .git/config that includes another file is read only that far).
+	top := folder.Root
+	if t, err := runGit(ctx, env, folder.Start, "rev-parse", "--show-toplevel"); err == nil && t != "" {
+		top = t
+	}
+	root, err := treesFolder(dataDir)
+	if err != nil {
+		return nil, "", err
+	}
+	t := &sessionTree{worktree: worktree{repo: top, path: filepath.Join(root, name), branch: "worktree-" + name}, name: name, named: named, from: folder.Start}
+	if b, err := runGit(ctx, env, top, "rev-parse", "--abbrev-ref", "HEAD"); err == nil && b != "HEAD" {
+		t.fromBranch = b
+	}
+	_, branchErr := runGit(ctx, env, top, "rev-parse", "--verify", "--quiet", "refs/heads/"+t.branch)
+	switch {
+	case fileExists(t.path):
+		// One of that name is there: it is opened again if it is a work
+		// tree of this repository, and nothing else is.
+		list, err := runGit(ctx, env, top, "worktree", "list", "--porcelain")
+		if err != nil || !listsTree(list, t.path) {
+			return nil, "", fmt.Errorf("%s is there and is no work tree of this repository: name another", t.path)
+		}
+		head, err := runGit(ctx, env, t.path, "rev-parse", "HEAD")
+		if err != nil {
+			return nil, "", fmt.Errorf("the work tree %s is there, and its commit could not be read (%v)", t.path, err)
+		}
+		t.base, t.reused = forkPoint(ctx, env, top, head), true
+	default:
+		base, err := runGit(ctx, env, top, "rev-parse", "--verify", "--quiet", "HEAD")
+		if err != nil || base == "" {
+			return nil, "", errors.New("the repository has no commit yet, so there is nothing to make a work tree of")
+		}
+		t.base = base
+		// A branch of that name left from before is checked out again.
+		if err := addTree(ctx, env, &t.worktree, branchErr != nil); err != nil {
+			return nil, "", err
+		}
+		copied, err := copyIncluded(ctx, env, &t.worktree)
+		t.included, t.includeErr = copied, err
+		if branchErr == nil {
+			if head, err := runGit(ctx, env, t.path, "rev-parse", "HEAD"); err == nil {
+				t.base = forkPoint(ctx, env, top, head)
+			}
+			t.reused = true
+		}
+	}
+	// The session starts in the folder of the work tree that stands where
+	// the one it was started in stands in the repository.
+	start := t.path
+	if rel, err := filepath.Rel(resolved(top), resolved(folder.Start)); err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, "../") {
+		if info, err := os.Stat(filepath.Join(t.path, rel)); err == nil && info.IsDir() {
+			start = filepath.Join(t.path, rel)
+		}
+	}
+	return t, start, nil
+}
+
+// forkPoint is where the work of a work tree opened again, at head, began:
+// the last commit it shares with the checkout's own HEAD, so that what was
+// committed in it before this gnosh started counts as its work (and is not
+// lost when it is taken away as one left as made). Where that cannot be
+// told, head itself.
+func forkPoint(ctx context.Context, env []string, top, head string) string {
+	if base, err := runGit(ctx, env, top, "merge-base", "HEAD", head); err == nil && base != "" {
+		return base
+	}
+	return head
 }
 
 // listsTree reports whether git worktree list --porcelain lists the work
@@ -213,7 +271,7 @@ func (st *startup) leaveTree() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	env, out := st.p.o.Environ, st.p.stderr
+	env, out := st.p.childEnviron(), st.p.stderr
 	what, err := treeHolds(ctx, env, &t.worktree)
 	why := ""
 	switch {
@@ -221,6 +279,8 @@ func (st *startup) leaveTree() {
 		why = err.Error()
 	case len(what) > 0:
 		why = "it holds " + strings.Join(what, " and ")
+	case t.forked.Load():
+		why = "a /fork run was started in it"
 	case t.reused:
 		why = "it was there before"
 	case t.named:

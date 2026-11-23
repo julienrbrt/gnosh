@@ -40,3 +40,11 @@ func sessionProcs(sid int) ([]procInfo, error) {
 	}
 	return out, nil
 }
+
+// procEnvHas cannot tell here: macOS keeps a process's environment from
+// other processes (what kern.procargs2 gives, and so ps -E, shows none,
+// even of one's own child), so no process is known by the mark, and only
+// a process seen as its command ended proves a session is the command's.
+func procEnvHas(pid int, entry string) (bool, error) {
+	return false, errNoEnviron
+}

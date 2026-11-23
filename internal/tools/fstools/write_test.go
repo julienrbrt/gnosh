@@ -427,6 +427,149 @@ func TestWriteLeavesNothingBehindWhenItFails(t *testing.T) {
 	})
 }
 
+// A rename refused for want of space is not got around by writing the file
+// in place, which fails as well, after cutting the file short; and a write
+// in place that fails puts the old content back. A full disk left the file
+// empty, or holding the start of the new text (the Edit/Write review of
+// 2026-11-19).
+func TestWriteInPlaceNeverLosesTheFile(t *testing.T) {
+	f := newFixture(t, Options{})
+	sys := f.write.(*writeTool).sys
+	sys.rename = func(oldpath, newpath string) error {
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.ENOSPC}
+	}
+	p := f.file("full.txt", "the old content\n")
+	f.ok(f.read, in{"file_path": p})
+	f.fails(f.write, in{"file_path": p, "content": "a longer new content\n"}, "could not be written", "no space left on device")
+	if got := f.content(p); got != "the old content\n" {
+		t.Errorf("after a full disk the file holds %q", got)
+	}
+	noTempFiles(t, f.dir)
+
+	// A rename refused where writing in place gets around it, and the
+	// write in place failing half way.
+	sys.rename = func(oldpath, newpath string) error {
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.EBUSY}
+	}
+	failed := false
+	sys.writeAt = func(file *os.File, b []byte, off int64) (int, error) {
+		if !failed {
+			failed = true
+			n, _ := file.WriteAt(b[:len(b)/2], off)
+			return n, syscall.ENOSPC
+		}
+		return file.WriteAt(b, off)
+	}
+	f.fails(f.write, in{"file_path": p, "content": "a much longer new content than before\n"}, "could not be written", "no space left on device", "the file holds its old content")
+	if got := f.content(p); got != "the old content\n" {
+		t.Errorf("after a failed write in place the file holds %q", got)
+	}
+	// And one that works says why it was done.
+	sys.writeAt = (*os.File).WriteAt
+	res := f.run(f.write, in{"file_path": p, "content": "new\n"})
+	if res.IsError {
+		t.Fatalf("failed: %s", core.TextOf(res.Content))
+	}
+	mustContain(t, core.TextOf(res.Content), "overwritten where it is, because it could not be replaced in one step: device or resource busy")
+	if got := f.content(p); got != "new\n" {
+		t.Errorf("file holds %q", got)
+	}
+}
+
+// Two sessions of one process, a session and its sub-agent, take turns on
+// a file. Each passed its check against what it had read, and the later
+// write undid the earlier one (the Edit/Write review of 2026-11-19). The
+// second edit now waits for the first, then goes in on top of it where
+// its old_string still picks out one place, as Claude Code lets an edit
+// of a changed file, and says the file had changed; a Write over the
+// file by the session that no longer has it as it is is refused.
+func TestTwoSessionsTakeTurnsOnAFile(t *testing.T) {
+	f := newFixture(t, Options{})
+	p := f.file("shared.go", "package x\n\nimport \"fmt\"\n")
+	other := &core.ToolEnv{Cwd: f.dir, Roots: []string{f.dir}, SessionID: "sub", Store: &sync.Map{}}
+	f.ok(f.read, in{"file_path": p})
+	if res, err := f.read.Run(context.Background(), call(in{"file_path": p}), other); err != nil || res.IsError {
+		t.Fatalf("the other session's read: %v %s", err, core.TextOf(res.Content))
+	}
+	sys := f.edit.(*editTool).sys
+	held, release := make(chan struct{}), make(chan struct{})
+	first := true
+	sys.rename = func(oldpath, newpath string) error {
+		if first {
+			first = false
+			close(held)
+			<-release
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	done := make(chan core.ToolResult, 1)
+	go func() {
+		done <- f.run(f.edit, in{"file_path": p, "old_string": "import \"fmt\"", "new_string": "import \"fmt\"\nimport \"os\""})
+	}()
+	<-held
+	theirs := make(chan core.ToolResult, 1)
+	go func() {
+		res, _ := f.edit.Run(context.Background(), call(in{"file_path": p, "old_string": "import \"fmt\"", "new_string": "import \"fmt\"\nimport \"io\""}), other)
+		theirs <- res
+	}()
+	select {
+	case res := <-theirs:
+		t.Fatalf("the other session's edit ran while the first was writing: %s", core.TextOf(res.Content))
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	if res := <-done; res.IsError {
+		t.Fatalf("the first edit failed: %s", core.TextOf(res.Content))
+	}
+	res := <-theirs
+	if res.IsError {
+		t.Fatalf("the other session's edit failed: %s", core.TextOf(res.Content))
+	}
+	mustContain(t, core.TextOf(res.Content), "had changed on disk since this session last read it")
+	if got := f.content(p); !strings.Contains(got, "\"os\"") || !strings.Contains(got, "\"io\"") {
+		t.Errorf("one edit undid the other: the file holds %q", got)
+	}
+	f.fails(f.write, in{"file_path": p, "content": "package x\n"}, "has changed on disk")
+}
+
+// A file written whole keeps its own CRLF line endings and byte order
+// mark, which Read does not show, when the content given has neither: in
+// a Windows-style project every line came out changed (the Edit/Write
+// review of 2026-11-19). A file whose endings are mixed is written as given.
+func TestWriteKeepsTheFilesLineEndings(t *testing.T) {
+	f := newFixture(t, Options{})
+	p := f.file("win.txt", "\uFEFFone\r\ntwo\r\n")
+	f.ok(f.read, in{"file_path": p})
+	res := f.run(f.write, in{"file_path": p, "content": "one\ntwo\nthree\n"})
+	if res.IsError {
+		t.Fatalf("failed: %s", core.TextOf(res.Content))
+	}
+	if got := f.content(p); got != "\uFEFFone\r\ntwo\r\nthree\r\n" {
+		t.Errorf("the file holds %q", got)
+	}
+	mustContain(t, core.TextOf(res.Content), "It keeps its byte order mark and its CRLF line endings, which the content given did not have.")
+	mixed := f.file("mixed.txt", "a\r\nb\n")
+	f.ok(f.read, in{"file_path": mixed})
+	f.ok(f.write, in{"file_path": mixed, "content": "a\nb\nc\n"})
+	if got := f.content(mixed); got != "a\nb\nc\n" {
+		t.Errorf("a file of mixed endings holds %q", got)
+	}
+}
+
+// An old_string found again where it overlaps itself ("aba" in "ababa") is
+// found more than once: the edit is refused, as for two places apart. It
+// went to the first place unasked (the Edit/Write review of 2026-11-19).
+func TestEditRefusesAnOverlappingRepeat(t *testing.T) {
+	f := newFixture(t, Options{})
+	p := f.file("pattern.txt", "x ababa y\n")
+	f.ok(f.read, in{"file_path": p})
+	f.fails(f.edit, in{"file_path": p, "old_string": "aba", "new_string": "ABA"}, "found more than once", "overlap")
+	if got := f.content(p); got != "x ababa y\n" {
+		t.Errorf("the file holds %q", got)
+	}
+	f.ok(f.edit, in{"file_path": p, "old_string": "x aba", "new_string": "x ABA"})
+}
+
 func TestWriteGuardsDamagedText(t *testing.T) {
 	f := newFixture(t, Options{})
 	p := f.file("latin1.txt", "caf\xe9\n")

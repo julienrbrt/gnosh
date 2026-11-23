@@ -148,6 +148,32 @@ func (o GradientOptions) Render(s string, stops ...Color) string {
 	return string(out)
 }
 
+// Blend returns the colour a fraction t of the way from one colour to
+// another: from at 0 and below, to at 1 and above, and between them the
+// 24-bit colour that far along the straight line between the two in Oklab,
+// as a gradient of the two would have it there (see GradientOptions.Render).
+// ANSI and palette colours stand for their colours in the xterm palette.
+// Default has no colour to blend: when either is Default the result is from
+// below one half and to from there on.
+func Blend(from, to Color, t float64) Color {
+	from, to = from.valid(), to.valid()
+	switch {
+	case !(t > 0): // also when t is not a number
+		return from
+	case t >= 1:
+		return to
+	}
+	fr, fg, fb, fromOK := from.rgb()
+	tr, tg, tb, toOK := to.rgb()
+	if !fromOK || !toOK {
+		if t < 0.5 {
+			return from
+		}
+		return to
+	}
+	return RGB(toLab(fr, fg, fb).blend(toLab(tr, tg, tb), t).rgb())
+}
+
 // rampAt returns the colour at position at, from 0 to 1, of a gradient whose
 // stops are spread evenly.
 func rampAt(ramp []lab, at float64) lab {

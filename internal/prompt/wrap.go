@@ -22,6 +22,10 @@ const tagName = "gnosh"
 // gnosh's own words too, made elsewhere and sent as they are.
 const memTag = "mem"
 
+// agentMemoryTag is the block a sub-agent's MEMORY.md is given in
+// (AgentMemory): text from outside can neither open nor close one.
+const agentMemoryTag = "agent-memory"
+
 // Wrap marks text as gnosh's own words: it trims it and puts it between
 // Open and Close. Text that is empty once trimmed gives an empty string,
 // so that a caller can leave an empty line out.
@@ -56,6 +60,28 @@ func EstimateTokens(s string) int {
 // and ends in "…".
 func oneLine(s string, max int) string {
 	return clip(strings.Join(strings.Fields(s), " "), max)
+}
+
+// Lines makes every line break in s a line feed: a carriage return (alone
+// or before a line feed), the next-line character, and the line and
+// paragraph separators, which a model may read as breaks of their own.
+func Lines(s string) string {
+	if !strings.ContainsAny(s, "\r\u0085\u2028\u2029") {
+		return s
+	}
+	return strings.NewReplacer("\r\n", "\n", "\r", "\n", "\u0085", "\n", "\u2028", "\n", "\u2029", "\n").Replace(s)
+}
+
+// Indented is s with every line set two spaces in: a block of what the
+// agent wrote, put under a heading of gnosh's in a judge's request, where
+// no line of it may stand as a line of gnosh's own ("The end of the
+// conversation:", "the user: …").
+func Indented(s string) string {
+	s = strings.TrimSpace(Lines(s))
+	if s == "" {
+		return ""
+	}
+	return "  " + strings.ReplaceAll(s, "\n", "\n  ")
 }
 
 // lines takes the blank lines off both ends of s and the blanks off its

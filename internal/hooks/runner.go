@@ -7,15 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gnosh-ai/gnosh/internal/execpath"
 )
 
 // Options is what a Runner is given about the program and the machine
@@ -25,7 +27,7 @@ type Options struct {
 	// Fires lists the events the program really fires. It has no
 	// default: a hook configured on an event that is not listed would
 	// never run, so Check reports it and NewRunner refuses it, and Run
-	// refuses an event that is not listed. Events returns all fifteen.
+	// refuses an event that is not listed. Events returns all of them.
 	Fires []Event
 
 	// ProjectDir is the project's root, where the session started. Hooks
@@ -42,6 +44,14 @@ type Options struct {
 	// StartDir is the directory the session started in. Hooks start
 	// there when the session's working directory no longer exists.
 	StartDir string
+
+	// Untrusted says the project's folder is not trusted. A hook of the
+	// person's own (Hook.Global) whose command runs a program in the
+	// project, as "$CLAUDE_PROJECT_DIR"/.claude/hooks/check.sh does, is
+	// then not run: a repository just cloned could have put anything
+	// there. It counts as a hook that could not be started, so a guard of
+	// that kind blocks what it would have checked.
+	Untrusted bool
 
 	// Shell is the shell that runs hook commands: a program that takes
 	// -c and a command line. Empty means /bin/bash when that file exists
@@ -107,10 +117,36 @@ type Options struct {
 	// when it ended, from a goroutine of its own. Nil drops it.
 	Background func(Background)
 
+	// Lifecycle is told as each hook starts and as it ends (Life), from
+	// the goroutine that runs it, for Claude Code's stream-json lines
+	// hook_started and hook_response. It must not block. Nil tells
+	// nothing.
+	Lifecycle func(Life)
+
 	// MCP calls a tool of a connected MCP server for an mcp_tool hook,
 	// and returns the text it answered with, and whether the tool said it
 	// failed. Nil: such a hook could not run.
 	MCP func(ctx context.Context, server, tool string, input json.RawMessage) (text string, failed bool, err error)
+
+	// Prompt asks the model a prompt hook's question (prompthook.go) and
+	// returns its answer; model is the hook's own "model", which the
+	// caller may not honor. Nil: such a hook could not run.
+	Prompt func(ctx context.Context, model, text string) (string, error)
+	// Agent runs an agent hook's task in a sub-agent that may look with
+	// its tools, and returns the sub-agent's last message (the app's
+	// agenthook.go). Without it an agent hook could not run.
+	Agent func(ctx context.Context, model, task string) (string, error)
+
+	// HTTPURLs is Claude Code's allowedHttpHookUrls: when not nil, an
+	// http hook runs only when its URL fits one of these patterns (see
+	// urlAllowed), and any other is passed over as if it were not there,
+	// as Claude Code passes it over; Check warns of it. Empty but not
+	// nil: no http hook runs.
+	HTTPURLs []string
+	// HTTPEnvVars is Claude Code's httpHookAllowedEnvVars: when not nil,
+	// an http hook's header takes a variable only when both the hook's
+	// own allowedEnvVars and this list name it.
+	HTTPEnvVars []string
 }
 
 const (
@@ -137,6 +173,7 @@ type Runner struct {
 	now        func() time.Time
 	projectDir string
 	startDir   string
+	untrusted  bool
 	memStatus  string
 	killGrace  time.Duration
 	pipeWait   time.Duration
@@ -174,7 +211,11 @@ type selected struct {
 	// guardOnly says the hook fits the tool only as a guard for another
 	// tool's name.
 	guardOnly bool
-	id        int
+	// asBash says the hook is a Bash hook that guards a Monitor command:
+	// it is given the command as a Bash call, and what it changes of that
+	// is not Monitor's input.
+	asBash bool
+	id     int
 }
 
 // NewRunner makes a Runner for a configuration. It refuses, with a
@@ -200,6 +241,7 @@ func NewRunner(cfg Config, opts Options) (*Runner, error) {
 		now:        opts.Now,
 		projectDir: opts.ProjectDir,
 		startDir:   opts.StartDir,
+		untrusted:  opts.Untrusted,
 		memStatus:  opts.MemStatus,
 		killGrace:  opts.KillGrace,
 		pipeWait:   opts.PipeWait,
@@ -387,6 +429,24 @@ func (r *Runner) Run(ctx context.Context, in Input) (Outcome, error) {
 		return r.refuse(in.Event, nil, fmt.Errorf("the %s hooks were not run: %w", in.Event, err))
 	}
 	env := in.environ(info, base, dir, r.projectDir, r.memStatus)
+	// A Bash hook that guards a Monitor command gets it as a Bash call, as
+	// in Claude Code: a hook written for Bash reads Bash's input.
+	feed := func(selected) ([]byte, []string) { return stdin, env }
+	if slices.ContainsFunc(sel, func(h selected) bool { return h.asBash }) {
+		asBash := in
+		asBash.ToolName, asBash.ToolInput = "Bash", bashOfMonitor(in.ToolInput)
+		bashIn, err := asBash.payload(info, in.Cwd)
+		if err != nil {
+			return r.refuse(in.Event, nil, fmt.Errorf("the %s hooks were not run: %w", in.Event, err))
+		}
+		bashEnv := asBash.environ(info, base, dir, r.projectDir, r.memStatus)
+		feed = func(h selected) ([]byte, []string) {
+			if h.asBash {
+				return bashIn, bashEnv
+			}
+			return stdin, env
+		}
+	}
 
 	// The hooks that run in the background are started, and nothing
 	// waits for them.
@@ -402,7 +462,8 @@ func (r *Runner) Run(ctx context.Context, in Input) (Outcome, error) {
 				ExitCode: -1, Result: ResultCancelled, Background: true, Reason: "the session is ending, and no hook starts in the background now."})
 			continue
 		}
-		started = append(started, r.background(&in, info, h, stdin, env, dir))
+		hStdin, hEnv := feed(h)
+		started = append(started, r.background(&in, info, h, hStdin, hEnv, dir))
 	}
 	if sel = waited; len(sel) == 0 {
 		return Outcome{Records: started}, nil
@@ -411,13 +472,28 @@ func (r *Runner) Run(ctx context.Context, in Input) (Outcome, error) {
 	procs := make([]proc, len(sel))
 	var all sync.WaitGroup
 	for i, h := range sel {
+		stdin, env := feed(h)
 		all.Go(func() {
+			id := r.lifeStart(&in)
+			defer func() { r.lifeEnd(id, &in, procs[i]) }()
 			if h.URL != "" {
 				procs[i] = r.post(ctx, h.Hook, stdin, env, timeoutFor(h.Event, h.Timeout))
 				return
 			}
 			if h.Server != "" {
 				procs[i] = r.callMCP(ctx, h.Hook, stdin, timeoutFor(h.Event, h.Timeout))
+				return
+			}
+			if h.Prompt != "" {
+				limit := h.Timeout
+				switch {
+				case limit > 0:
+				case h.Agent:
+					limit = agentTimeoutDefault
+				default:
+					limit = promptTimeoutDefault
+				}
+				procs[i] = r.askModel(ctx, h.Hook, stdin, limit)
 				return
 			}
 			procs[i] = r.exec(ctx, h.Hook, stdin, env, dir, timeoutFor(h.Event, h.Timeout))
@@ -432,6 +508,68 @@ func (r *Runner) Run(ctx context.Context, in Input) (Outcome, error) {
 		return r.refuse(in.Event, out.Records, stopped(ctx, in.Event))
 	}
 	return out, nil
+}
+
+// runsInProject says a hook's command names a program in the project's
+// folder: by the variable the project's folder is given in, or by its
+// path.
+func runsInProject(h Hook, projectDir string) bool {
+	for _, w := range append([]string{h.Command}, h.Args...) {
+		for _, v := range []string{"$CLAUDE_PROJECT_DIR", "${CLAUDE_PROJECT_DIR", "$GNOSH_PROJECT_DIR", "${GNOSH_PROJECT_DIR"} {
+			if strings.Contains(w, v) {
+				return true
+			}
+		}
+		if projectDir != "" && strings.Contains(w, strings.TrimSuffix(projectDir, "/")+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// sameHandler says two hooks are one handler configured twice: the same
+// command, address with its headers, question, or MCP tool with its input,
+// run the same way (in the background or not, with the same time). Such a
+// hook runs once, as in Claude Code. The line a person reads of a hook
+// (CommandLine) cannot tell: it cuts a question short and leaves out an
+// MCP tool's input and an address's headers, and two hooks that differ in
+// how they run are two guards.
+func sameHandler(a, b Hook) bool {
+	return a.Command == b.Command && slices.Equal(a.Args, b.Args) && (a.Args == nil) == (b.Args == nil) &&
+		a.URL == b.URL && maps.Equal(a.Headers, b.Headers) && slices.Equal(a.AllowedEnvVars, b.AllowedEnvVars) &&
+		a.Server == b.Server && a.Tool == b.Tool && bytes.Equal(a.Input, b.Input) &&
+		a.Prompt == b.Prompt && a.Model == b.Model && a.Agent == b.Agent && a.ContinueOnBlock == b.ContinueOnBlock &&
+		a.Async == b.Async && a.AsyncRewake == b.AsyncRewake && a.Timeout == b.Timeout
+}
+
+// monitorTool is the tool whose commands Bash hooks guard.
+const monitorTool = "Monitor"
+
+// bashOfMonitor is a Monitor call's input as the Bash call's that runs its
+// command: the command, its description, its time (timeout_ms as timeout),
+// and run_in_background, which a Monitor's command always is (the hosts
+// review of 2026-11-19: a hook that refuses commands in the background
+// let a Monitor's through). What cannot be read is passed on as it is.
+func bashOfMonitor(input json.RawMessage) json.RawMessage {
+	var in struct {
+		Command     *string          `json:"command"`
+		Description *string          `json:"description"`
+		TimeoutMs   *json.RawMessage `json:"timeout_ms"`
+	}
+	if json.Unmarshal(input, &in) != nil || in.Command == nil {
+		return input
+	}
+	m := struct {
+		Command      *string          `json:"command"`
+		Description  *string          `json:"description,omitempty"`
+		Timeout      *json.RawMessage `json:"timeout,omitempty"`
+		InBackground bool             `json:"run_in_background"`
+	}{in.Command, in.Description, in.TimeoutMs, true}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return input
+	}
+	return out
 }
 
 // refuse returns what Run returns when it has no answer from the hooks:
@@ -470,14 +608,24 @@ func (r *Runner) choose(in *Input, info eventInfo) []selected {
 			// A sub-agent's own hook, and this is not its event.
 			continue
 		}
+		if h.Agent && in.NoAgentHooks {
+			continue
+		}
+		if h.URL != "" && !r.urlAllowed(h.URL) {
+			// (allowedHttpHookUrls does not let it post there: it is not
+			// run, as in Claude Code, and Check has warned of it.)
+			continue
+		}
 		matched, guardOnly := true, false
 		switch info.subject {
 		case toolName:
 			matched, guardOnly = r.tools.fit(h.m, in.ToolName)
 		case ownValue:
-			matched = h.m.matches(in.subject())
+			matched = h.m.matchesAny(in.subjects())
 		}
-		if !matched {
+		if !matched || guardOnly && in.ToolName == monitorTool && in.Event != PreToolUse && in.Event != PermissionRequest {
+			// (A Bash hook guards a Monitor command before it runs; after
+			// it, as in Claude Code, it has nothing to do with it.)
 			continue
 		}
 		// An "if" filter: on a tool event the hook runs for the calls the
@@ -485,13 +633,15 @@ func (r *Runner) choose(in *Input, info eventInfo) []selected {
 		if h.If != "" && (info.subject != toolName || in.IfMatch != nil && !in.IfMatch(h.If)) {
 			continue
 		}
-		// The same command configured twice runs once. It is a guard
+		// The same handler configured twice runs once. It is a guard
 		// only if every hook that brought it here is one.
-		if i := slices.IndexFunc(out, func(s selected) bool { return s.CommandLine() == h.CommandLine() && (s.Args == nil) == (h.Args == nil) }); i >= 0 {
+		asBash := guardOnly && in.ToolName == monitorTool
+		if i := slices.IndexFunc(out, func(s selected) bool { return sameHandler(s.Hook, h.Hook) }); i >= 0 {
 			out[i].guardOnly = out[i].guardOnly && guardOnly
+			out[i].asBash = out[i].asBash && asBash
 			continue
 		}
-		out = append(out, selected{Hook: h.Hook, guardOnly: guardOnly, id: h.id})
+		out = append(out, selected{Hook: h.Hook, guardOnly: guardOnly, asBash: asBash, id: h.id})
 	}
 	return out
 }
@@ -601,6 +751,10 @@ func (r *Runner) exec(ctx context.Context, h Hook, stdin []byte, env []string, d
 	began := r.now()
 	defer func() { p.took = r.now().Sub(began) }()
 
+	if r.untrusted && h.Global && runsInProject(h, r.projectDir) {
+		p.startErr = errors.New("its program is in this folder, which is not trusted, and a repository could have put anything there. gnosh trust (or --trust-folder for one run) lets it run")
+		return p
+	}
 	cmd := exec.Command(r.shell, "-c", h.Command)
 	if h.Args != nil {
 		// The exec form: the program and its arguments as they are, with
@@ -771,30 +925,10 @@ func isClosed(ch <-chan struct{}) bool {
 
 // program finds the program of a hook in the exec form: a name that holds
 // a slash is a path, from dir when it is relative, and a bare name is
-// looked for on the PATH the hook is given.
+// looked for in the absolute folders of the PATH the hook is given.
 func program(name string, env []string, dir string) (string, error) {
-	if strings.Contains(name, "/") {
-		if !filepath.IsAbs(name) {
-			name = filepath.Join(dir, name)
-		}
-		return name, nil
-	}
-	path := ""
-	for _, kv := range env {
-		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
-			path = v
-		}
-	}
-	for _, d := range filepath.SplitList(path) {
-		if !filepath.IsAbs(d) {
-			// (An empty or relative entry is the hook's own directory, or
-			// under it.)
-			d = filepath.Join(dir, d)
-		}
-		p := filepath.Join(d, name)
-		if info, err := os.Stat(p); err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
-			return p, nil
-		}
+	if p, ok := execpath.Find(name, env, dir); ok {
+		return p, nil
 	}
 	return "", fmt.Errorf("%s is not a program on the PATH the hook is given", name)
 }
@@ -843,7 +977,7 @@ func (r *Runner) post(ctx context.Context, h Hook, body []byte, env []string, li
 	}
 	for name, val := range h.Headers {
 		req.Header.Set(name, os.Expand(val, func(v string) string {
-			if slices.Contains(h.AllowedEnvVars, v) {
+			if slices.Contains(h.AllowedEnvVars, v) && (r.opts.HTTPEnvVars == nil || slices.Contains(r.opts.HTTPEnvVars, v)) {
 				return vars[v]
 			}
 			return ""

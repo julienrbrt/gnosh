@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gnosh-ai/gnosh/internal/agent"
 )
 
 // This file is a sub-agent's own git work tree (isolation: worktree,
@@ -53,18 +55,28 @@ var gitEnvDrop = []string{"GIT_DIR=", "GIT_WORK_TREE=", "GIT_INDEX_FILE=", "GIT_
 // without the variables that would point it elsewhere. An error says what
 // git said.
 func (l *live) git(ctx context.Context, dir string, args ...string) (string, error) {
-	return runGit(ctx, l.p.o.Environ, dir, args...)
+	return runGit(ctx, l.p.childEnviron(), dir, args...)
 }
 
 // runGit is live.git for code that has no session yet: git in dir, in
 // the environment environ, as live.git runs it.
 func runGit(ctx context.Context, environ []string, dir string, args ...string) (string, error) {
+	out, err := gitWith(ctx, environ, dir, "", args...)
+	return strings.TrimSpace(out), err
+}
+
+// gitWith is runGit with stdin as git's input, and what git printed as it
+// printed it. An exit with nothing on stderr is git's *exec.ExitError.
+func gitWith(ctx context.Context, environ []string, dir, stdin string, args ...string) (string, error) {
 	base := []string{"--no-pager", "-c", "core.fsmonitor=false", "-C", dir}
 	cmd := exec.CommandContext(ctx, "git", append(base, args...)...)
 	env := slices.DeleteFunc(slices.Clone(environ), func(kv string) bool {
 		return slices.ContainsFunc(gitEnvDrop, func(p string) bool { return strings.HasPrefix(kv, p) })
 	})
 	cmd.Env = append(env, "GIT_PAGER=cat", "PAGER=cat", "GIT_TERMINAL_PROMPT=0")
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	// A hook git runs (post-checkout, on worktree add) may leave a program
 	// behind that holds git's output open: once git itself has ended, or
 	// been stopped, what it printed is not waited for longer than this.
@@ -85,7 +97,7 @@ func runGit(ctx context.Context, environ []string, dir string, args ...string) (
 		}
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	return string(out), nil
 }
 
 // treeName is the name a sub-agent's work tree and branch take: the random
@@ -130,8 +142,15 @@ func (l *live) makeWorktree(ctx context.Context, cwd, id string) (*worktree, str
 	if _, err := l.git(ctx, top, "rev-parse", "--verify", "--quiet", "refs/heads/"+wt.branch); err == nil || fileExists(wt.path) {
 		return nil, "", fmt.Errorf("the branch %s or the folder %s is there already, so no work tree was made", wt.branch, wt.path)
 	}
-	if err := addTree(ctx, l.p.o.Environ, wt, true); err != nil {
+	if err := addTree(ctx, l.p.childEnviron(), wt, true); err != nil {
 		return nil, "", err
+	}
+	copied, err := copyIncluded(ctx, l.p.childEnviron(), wt)
+	if len(copied) > 0 {
+		l.flog.logf("turn", "the work tree %s has copies of %s, as %s names them", wt.path, fewOf(copied, 20), includeFile)
+	}
+	if err != nil {
+		l.notice(agent.LevelWarning, "worktree", err.Error())
 	}
 	if err := l.engine.AddDir(wt.path); err != nil {
 		l.flog.logf("turn", "the work tree %s could not be made a working directory: %v", wt.path, err)
@@ -161,7 +180,7 @@ func (l *live) endWorktree(wt *worktree) (note string, kept bool) {
 		return fmt.Sprintf("[It worked in its own git work tree, %s, on the branch %s, which started at %s: %s. None of it is in the folder you work in. Look at it there, and merge the branch or copy what you want; then git -C %s worktree remove --force %s and git -C %s branch -D %s take it away.]",
 			wt.path, wt.branch, shortCommit(wt.base), why, wt.repo, wt.path, wt.repo, wt.branch), true
 	}
-	what, err := treeHolds(ctx, l.p.o.Environ, wt)
+	what, err := treeHolds(ctx, l.p.childEnviron(), wt)
 	if err != nil {
 		return keep(err.Error() + ", so the work tree is kept")
 	}
@@ -199,8 +218,21 @@ func treesFolder(dataDir string) (string, error) {
 // addTree adds the work tree wt to its repository: on a new branch at its
 // base when newBranch is set, else on its branch as it stands. What a
 // failed attempt left behind (a branch git made, part of the folder) is
-// taken away.
+// taken away, and only that.
+//
+// The folder is made first, by this gnosh alone (os.Mkdir fails when it is
+// there), and git makes the work tree in it, which git does in an empty
+// folder. So two starts of one name at once (gnosh --worktree same, twice)
+// make one work tree, and the one that comes second leaves the other's
+// alone: it used to run git into the same folder, fail, and take away, as
+// its own leftovers, the folder and the branch the first had just made.
 func addTree(ctx context.Context, environ []string, wt *worktree, newBranch bool) error {
+	if err := os.Mkdir(wt.path, 0o755); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%s was made by another start at the same moment: start again to open it, or name another", wt.path)
+		}
+		return fmt.Errorf("the folder for the work tree could not be made: %v", err)
+	}
 	args := []string{"worktree", "add", "--quiet", wt.path, wt.branch}
 	if newBranch {
 		args = []string{"worktree", "add", "--quiet", "-b", wt.branch, wt.path, wt.base}
@@ -212,7 +244,10 @@ func addTree(ctx context.Context, environ []string, wt *worktree, newBranch bool
 		_ = os.RemoveAll(wt.path)
 		_, _ = runGit(clean, environ, wt.repo, "worktree", "prune")
 		if newBranch {
-			_, _ = runGit(clean, environ, wt.repo, "branch", "-D", wt.branch)
+			// The branch this attempt made, which points at the base; one
+			// of that name that points elsewhere is someone else's (made
+			// since the start looked), and stays.
+			_, _ = runGit(clean, environ, wt.repo, "update-ref", "-d", "refs/heads/"+wt.branch, wt.base)
 		}
 		return fmt.Errorf("git could not make the work tree: %v", err)
 	}
@@ -225,7 +260,7 @@ func addTree(ctx context.Context, environ []string, wt *worktree, newBranch bool
 // elsewhere. Nothing means it is as it was made. An error says what could
 // not be told.
 func treeHolds(ctx context.Context, environ []string, wt *worktree) ([]string, error) {
-	status, err := runGit(ctx, environ, wt.path, "status", "--porcelain", "--ignored", "--untracked-files=all")
+	status, err := gitWith(ctx, environ, wt.path, "", "status", "--porcelain", "-z", "--ignored", "--untracked-files=all")
 	if err != nil {
 		return nil, fmt.Errorf("whether anything was changed there could not be told (%v)", err)
 	}
@@ -236,17 +271,40 @@ func treeHolds(ctx context.Context, environ []string, wt *worktree) ([]string, e
 		return nil, errors.New("how far its branch went could not be told")
 	}
 	var what []string
+	// Each entry is "XY path", whatever the path holds (-z); a renamed or
+	// copied file's is followed by the name it had. An ignored file that is
+	// a copy of the repository's, as .worktreeinclude's copies are while
+	// untouched, is no work; those are looked at only when nothing else is
+	// work, and only until one is not such a copy.
 	lines := 0
-	for _, line := range strings.Split(status, "\n") {
-		// "XY path", the first line's blanks trimmed off with the rest of
-		// git's output (runGit); a path that starts with a blank is quoted.
-		_, path, ok := strings.Cut(strings.TrimLeft(line, " "), " ")
-		if ok && !gnoshOwn(wt.path, strings.TrimLeft(path, " ")) {
+	var ignored []string
+	entries := strings.Split(status, "\x00")
+	for i := 0; i < len(entries); i++ {
+		e := entries[i]
+		if len(e) < 4 || e[2] != ' ' {
+			continue
+		}
+		xy, path := e[:2], e[3:]
+		if xy[0] == 'R' || xy[0] == 'C' {
+			i++
+		}
+		switch {
+		case gnoshOwn(wt.path, path):
+		case xy == "!!":
+			ignored = append(ignored, path)
+		default:
 			lines++
 		}
 	}
 	if lines > 0 {
-		what = append(what, countWords(lines, "file changed or made and not committed (git's ignored ones among them)", "files changed or made and not committed (git's ignored ones among them)"))
+		what = append(what, countWords(lines, "file changed or made and not committed", "files changed or made and not committed"))
+	} else {
+		for _, path := range ignored {
+			if !copiedAsIs(ctx, wt, path) {
+				what = append(what, "at least 1 file git ignores, changed or made there")
+				break
+			}
+		}
 	}
 	if n > 0 {
 		what = append(what, countWords(n, "commit", "commits"))

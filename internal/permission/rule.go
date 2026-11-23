@@ -93,6 +93,8 @@ const (
 	kindSkill
 	// kindNever: a rule about a tool gnosh does not have.
 	kindNever
+	// kindCd: the folders the person's /cd may move the session to.
+	kindCd
 )
 
 // crule is a rule made ready to match.
@@ -138,8 +140,8 @@ func (e *Engine) compile(r Rule, list List, ly *layer) (*crule, error) {
 	}
 
 	info, known := e.names.info(c.canon)
-	if !known && c.canon == "Cd" {
-		return nil, errors.New("Cd rules govern a /cd command, which gnosh does not have yet, so the rule would do nothing")
+	if !known && c.canon == toolCd {
+		return e.compileCd(c)
 	}
 	if !known {
 		return nil, fmt.Errorf("gnosh has no tool named %q; the tools are %s, and MCP tools are named mcp__server__tool", r.Tool, strings.Join(e.names.all(), ", "))
@@ -254,6 +256,73 @@ func (e *Engine) compile(r Rule, list List, ly *layer) (*crule, error) {
 		return nil, fmt.Errorf("%s takes no specifier in parentheses; write %s for every use of the tool, or %s(param:value) to match one of its inputs", r.Tool, r.Tool, r.Tool)
 	}
 	return c, nil
+}
+
+// toolCd is the name Cd rules go by. No tool has it: the rules are about
+// the person's own /cd, which the model cannot call.
+const toolCd = "Cd"
+
+// compileCd prepares a Cd rule, as Claude Code has them: a bare deny rule
+// switches /cd off, a deny rule with a pattern keeps /cd out of the
+// folders it covers, and once there is any allow rule, /cd goes only to a
+// folder one of them covers. There are no ask rules: /cd is the person's
+// own command, so there is nobody else to ask.
+func (e *Engine) compileCd(c *crule) (*crule, error) {
+	if c.list == ListAsk {
+		return nil, errors.New("a Cd rule is a deny or an allow rule: /cd is the person's own command, so there is nobody else to ask")
+	}
+	c.kind = kindCd
+	if c.Spec == "" {
+		return c, nil
+	}
+	p, err := e.parseDirPattern(c.Spec, c.list, c.layer)
+	if err != nil {
+		return nil, err
+	}
+	c.path = p
+	return c, nil
+}
+
+// CdRefusal says why the Cd rules in force keep the person's /cd from
+// moving the session to a folder, or "" when they do not. names are the
+// folder's spellings, each a cleaned absolute path: as it was typed, after
+// each symbolic link on the way is followed, and last as it resolves. A
+// deny rule is checked against all of them; an allow rule must cover the
+// folder as it resolves.
+func (e *Engine) CdRefusal(names []string) string {
+	if len(names) == 0 {
+		return "There is no folder to go to."
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, c := range e.rules(ListDeny) {
+		if c.kind != kindCd {
+			continue
+		}
+		if c.Spec == "" {
+			return "The deny rule Cd from " + c.layer.Name + " switches /cd off."
+		}
+		for _, n := range names {
+			if ok, _ := c.path.matchKeyed(guardPath(n)); ok {
+				return "The deny rule " + c.Rule.String() + " from " + c.layer.Name + " covers " + n + "."
+			}
+		}
+	}
+	real := names[len(names)-1]
+	var allows []string
+	for _, c := range e.rules(ListAllow) {
+		if c.kind != kindCd {
+			continue
+		}
+		if c.Spec == "" || c.path.match(real) {
+			return ""
+		}
+		allows = append(allows, c.Rule.String())
+	}
+	if len(allows) > 0 {
+		return "The Cd allow rules name the folders /cd may go to (" + strings.Join(allows, ", ") + "), and " + real + " is none of them."
+	}
+	return ""
 }
 
 // firstField returns the text up to the first space.

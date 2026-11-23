@@ -24,7 +24,8 @@ type matcher struct {
 
 // compileMatcher reads pattern. With narrow set, a list is made of letters,
 // digits, "_" and "|" only, and "|" alone separates its names; that is the
-// rule for the one event whose values are error kinds.
+// rule for StopFailure, whose values are error kinds, and for FileChanged,
+// whose are file names, as in Claude Code.
 func compileMatcher(pattern string, narrow bool) (matcher, error) {
 	if pattern == "" || pattern == "*" {
 		return matcher{all: true}, nil
@@ -129,6 +130,11 @@ func newToolNames(renamed map[string]string, guards map[string][]string) toolNam
 	// A hook written for the tool that made several edits at once checked
 	// that tool's input, not Edit's. It guards Edit and approves nothing.
 	guard("Edit", "MultiEdit")
+	// A Bash hook guards the commands Monitor starts, as in Claude Code:
+	// before they run (PreToolUse and PermissionRequest), seeing each as a
+	// Bash call; its approval and changed input count for nothing there
+	// (selected.asBash).
+	guard(monitorTool, "Bash")
 	for _, tool := range slices.Sorted(maps.Keys(guards)) {
 		for _, by := range guards[tool] {
 			guard(tool, by)

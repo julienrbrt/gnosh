@@ -66,10 +66,12 @@ func finishSession(inv *Invocation, p *parsed, env Env) *Error {
 			"%s gives a new conversation its ID, and %s goes on with an earlier one, so nothing was started. Add --fork-session to go on in a copy that has the new ID, or drop one of the two.",
 			o.typed, chosen.typed)
 	}
-	if o := p.given("--include-partial-messages"); o != nil && printing && inv.OutputFormat != FormatStreamJSON {
-		return fail(ErrUsage, o.typed,
-			"%s only does something with --output-format stream-json, so nothing was started. Add --output-format stream-json.",
-			o.typed)
+	for _, name := range []string{"--include-partial-messages", "--include-hook-events"} {
+		if o := p.given(name); o != nil && printing && inv.OutputFormat != FormatStreamJSON {
+			return fail(ErrUsage, o.typed,
+				"%s only does something with --output-format stream-json, so nothing was started. Add --output-format stream-json.",
+				o.typed)
+		}
 	}
 	if o := p.given(idNoPersist); o != nil {
 		// Nothing of the run is kept: it cannot go on with a saved
@@ -82,24 +84,41 @@ func finishSession(inv *Invocation, p *parsed, env Env) *Error {
 			}
 		}
 	}
+	if o := p.given(idBack); o != nil {
+		// A session sent off at once, a new one or one that -c or -r
+		// names: there is nobody here to read a run's output, or to pick
+		// a session from a list.
+		for _, other := range []*occurrence{p.given(idPrint), p.given(idFork), p.given(idNoPersist)} {
+			if other != nil {
+				return fail(ErrConflict, o.typed,
+					"%s sends a session to the background, and %s does not go with it, so nothing was started. Drop one of the two.",
+					o.typed, other.typed)
+			}
+		}
+		if inv.Conversation == ConversationResume && strings.TrimSpace(inv.Resume) == "" {
+			return fail(ErrUsage, chosen.typed,
+				"%s with %s needs the session's ID or name after it, since nobody is there to pick one from a list, so nothing was started.",
+				chosen.typed, o.typed)
+		}
+		if strings.TrimSpace(inv.Prompt) == "" {
+			return fail(ErrUsage, o.typed,
+				"%s needs a prompt for the session to work on, after the flags (gnosh --bg \"fix the flaky test\"), so nothing was started.",
+				o.typed)
+		}
+	}
 	if printing && inv.Conversation == ConversationResume && inv.Resume == "" {
 		return fail(ErrUsage, chosen.typed,
 			"%s needs a session's ID or name after it in print mode, where nobody is there to pick from a list, so nothing was started.%s",
 			chosen.typed, implied)
 	}
 
-	// Permissions: -y is a permission mode, so it cannot sit beside another.
-	if y := p.given(idYolo); y != nil {
-		if m := p.given(idMode); m != nil && inv.PermissionMode != ModeBypassPermissions {
-			return fail(ErrConflict, y.typed,
-				"%s skips every permission question and %s %s starts in another mode, so nothing was started. Keep one of them.",
-				y.typed, m.typed, inv.PermissionMode)
-		}
-		inv.PermissionMode = ModeBypassPermissions
+	if err := finishYolo(inv, p); err != nil {
+		return err
 	}
 
-	// Flags that only print mode acts on.
-	if !printing {
+	// Flags that only print mode acts on (a session sent off with --bg
+	// is a run in print mode).
+	if !printing && p.given(idBack) == nil {
 		for k := range p.occs {
 			o := &p.occs[k]
 			if !o.f.printOnly {
@@ -209,4 +228,21 @@ func (t *Table) find(words []string) (*command, *Error) {
 		c = sub
 	}
 	return c, nil
+}
+
+// finishYolo settles -y, which is a permission mode, so it cannot sit
+// beside another: for gnosh, and for gnosh agents, whose view gives it to
+// the runs it starts.
+func finishYolo(inv *Invocation, p *parsed) *Error {
+	y := p.given(idYolo)
+	if y == nil {
+		return nil
+	}
+	if m := p.given(idMode); m != nil && inv.PermissionMode != ModeBypassPermissions {
+		return &Error{Kind: ErrConflict, Typed: y.typed, Message: fmt.Sprintf(
+			"%s skips every permission question and %s %s starts in another mode, so nothing was started. Keep one of them.",
+			y.typed, m.typed, inv.PermissionMode)}
+	}
+	inv.PermissionMode = ModeBypassPermissions
+	return nil
 }

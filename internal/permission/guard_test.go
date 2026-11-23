@@ -286,3 +286,21 @@ func TestPathologicalLinesComeBack(t *testing.T) {
 		t.Errorf("path matching took %s", took)
 	}
 }
+
+// EditDenied answers for an Edit deny rule, as written or as resolved, and
+// for no other list or tool: a rewind leaves such a file as it is (the
+// rewind review of 2026-11-19).
+func TestEditDenied(t *testing.T) {
+	e := engine(t, ModeDefault, rules{deny: []string{"Edit(//proj/secret/**)", "Read(//proj/hidden.txt)"}, allow: []string{"Edit(//proj/open/**)"}})
+	for p, want := range map[string]bool{
+		"/proj/secret/a.txt":     true,
+		"/proj/secret/deep/b.go": true,
+		"/proj/hidden.txt":       false,
+		"/proj/open/c.txt":       false,
+		"/proj/other.txt":        false,
+	} {
+		if got := e.EditDenied(p); got != want {
+			t.Errorf("EditDenied(%s) = %v, want %v", p, got, want)
+		}
+	}
+}

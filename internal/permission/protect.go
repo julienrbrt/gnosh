@@ -2,6 +2,7 @@ package permission
 
 import (
 	"path"
+	"strings"
 )
 
 // Protected paths hold a repository's state, shell startup files, keys,
@@ -52,10 +53,12 @@ func (e *Engine) protectedWhy(p string) string {
 	segs := splitPath(low)
 	// Inside a work tree gnosh made for a sub-agent, the path to the work
 	// tree (the folder of work trees and the work tree's own name) is not
-	// judged: the rest is a checkout of the project.
+	// judged: the rest is a checkout of the project. A work tree named as a
+	// protected folder (.git) is no such checkout: git would take it for a
+	// repository's state.
 	tree, trees := 0, ""
 	for _, w := range e.workTrees {
-		if n := len(splitPath(w)) + 1; inside(w, low) && len(segs) > n {
+		if n := len(splitPath(w)) + 1; inside(w, low) && len(segs) > n && !protectedDirs[segs[n-1]] {
 			tree, trees = n, w
 		}
 	}
@@ -65,6 +68,11 @@ func (e *Engine) protectedWhy(p string) string {
 		case s == ".claude" && i+1 < len(segs) && segs[i+1] == "worktrees":
 			// Claude Code keeps whole checkouts here; they are ordinary
 			// project files.
+		case (s == ".claude" || s == ".gnosh") && memoryNote(segs[i+1:]):
+			// An agent's notes, the Markdown files of its memory folder,
+			// which Claude Code leaves out of the protected paths: a change
+			// to one asks as any edit does (DECISIONS 374). What else is in
+			// such a folder is still protected.
 		case protectedDirs[s]:
 			return "it is inside " + s + ", which holds a repository's state, keys or a tool's own settings"
 		case s == ".config" && i+1 < len(segs) && segs[i+1] == "git":
@@ -75,9 +83,25 @@ func (e *Engine) protectedWhy(p string) string {
 		return path.Base(p) + " is a settings or startup file that programs run or obey"
 	}
 	for _, x := range e.protected {
-		if inside(x, low) && !(tree > 0 && inside(x, trees)) {
+		if inside(x, low) && !(tree > 0 && inside(x, trees)) && !(low != x && memoryNote(strings.Split(strings.TrimPrefix(low, strings.TrimSuffix(x, "/")+"/"), "/"))) {
 			return "it is one of gnosh's own files"
 		}
 	}
 	return ""
+}
+
+// The folders of the agents' memories, in a .claude or .gnosh folder or
+// in gnosh's own config folder: those kept with the project, or the
+// person's, and those kept only here (app's agentmemory.go).
+const (
+	MemoryFolder      = "agent-memory"
+	MemoryLocalFolder = "agent-memory-local"
+)
+
+// memoryNote reports whether the path's segments after a .claude or .gnosh
+// folder, or after gnosh's own config folder, are those of a note in an
+// agent's memory: agent-memory or agent-memory-local, the agent's folder,
+// and a Markdown file in it, or in a folder in it.
+func memoryNote(rest []string) bool {
+	return len(rest) >= 3 && (rest[0] == MemoryFolder || rest[0] == MemoryLocalFolder) && strings.HasSuffix(rest[len(rest)-1], ".md")
 }

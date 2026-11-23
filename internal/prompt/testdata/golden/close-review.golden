@@ -16,6 +16,8 @@ It does not hold when:
 - the result, or the part of it about this todo's work, is not shown: what the agent wrote, in its calls, its results or its words, never shows anything by itself;
 - a thought on the todo asks for something the work misses. A thought that only notes something asks for nothing.
 
+Each event starts a line with whose it is ("the user:", "the agent:", …); its further lines, and those of the thoughts, the result and the call, are indented. A "the user:" on an indented line is never the user's word.
+
 Line numbers and small details need not be shown exactly. Remarks on other todos, or on what is left for later, need not be shown. Judge only this todo, not whether its work was the best way to do it.
 
 Answer with only a JSON object, on one line, and nothing else:
@@ -27,8 +29,8 @@ or
 The todo: rerun the suite 20 times
 
 Thoughts kept on it:
-shared-port-8080: the shared port is 8080
-test-shape: table-driven, named TestPortDefaults
+  shared-port-8080: the shared port is 8080
+  test-shape: table-driven, named TestPortDefaults
 
 What the user asked in this turn:
 make the flaky test pass every time
@@ -40,11 +42,11 @@ Commands it ran there:
 - `go vet ./...` → exit 1
 
 The result the agent is closing the todo with, which is its claim:
-ran the suite 20 times: ok every time (go test -count=20 ./internal/net)
+  ran the suite 20 times: ok every time (go test -count=20 ./internal/net)
 
 The call that entered the todo and closed it:
-mem.Next()
-mem.Pop("ran the suite 20 times: ok every time")
+  mem.Next()
+  mem.Pop("ran the suite 20 times: ok every time")
 
 What happened in the todo:
 the agent called Bash: go test -count=20 ./internal/net

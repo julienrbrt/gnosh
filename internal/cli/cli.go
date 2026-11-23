@@ -50,8 +50,22 @@ const (
 	// another harness, as JSON lines on standard input and output
 	// (spec/gnosh/bridge.md).
 	CmdBridge Command = "bridge"
-	// CmdLogs prints the project's log.
+	// CmdPromptShow and the two after it are `gnosh prompt ...`: gnosh's
+	// texts to the model listed or printed, the folder of the person's own,
+	// and gnosh's written there to edit (Invocation.Force writes over a
+	// file that is there).
+	CmdPromptShow   Command = "prompt show"
+	CmdPromptPath   Command = "prompt path"
+	CmdPromptExport Command = "prompt export"
+	// CmdAgents lists the sessions in the background, of every folder or
+	// of Invocation.Cwd's.
+	CmdAgents Command = "agents"
+	// CmdLogs prints the project's log, or a background run's.
 	CmdLogs Command = "logs"
+	// CmdStop stops a session that runs in the background.
+	CmdStop Command = "stop"
+	// CmdAttach opens the agent view on one session in the background.
+	CmdAttach Command = "attach"
 	// CmdDirs says which config and data folders are in use.
 	CmdDirs Command = "dirs"
 	// CmdSSH is `gnosh ssh`: ssh, with what the far side copies put on
@@ -68,6 +82,10 @@ const (
 	CmdMCPGet     Command = "mcp get"
 	CmdMCPList    Command = "mcp list"
 	CmdMCPRemove  Command = "mcp remove"
+	// CmdMCPLogin and CmdMCPLogout sign in to a server reached at a URL,
+	// and forget the sign-in; Invocation.Args holds its name.
+	CmdMCPLogin  Command = "mcp login"
+	CmdMCPLogout Command = "mcp logout"
 )
 
 // Conversation says which conversation a session command works in.
@@ -147,6 +165,9 @@ type Invocation struct {
 	// ForkSession says to go on in a copy of the conversation and leave the
 	// original as it was.
 	ForkSession bool
+	// Background says to start the session in the background (--bg): a
+	// run of its own on the prompt, while this command returns at once.
+	Background bool
 	// Name is the name to give the session (-n).
 	Name string
 	// NoSessionPersistence keeps nothing of a run: its session is not
@@ -164,6 +185,10 @@ type Invocation struct {
 	// IncludePartialMessages is --include-partial-messages: stream-json
 	// also carries the main agent's replies as streaming events.
 	IncludePartialMessages bool
+	// IncludeHookEvents is --include-hook-events: stream-json carries
+	// every hook's start and end (hook_started, hook_response), not only
+	// the SessionStart hooks'.
+	IncludeHookEvents bool
 	// Agents is --agents: sub-agents defined for this run, as a JSON
 	// object of agents by name, or the path of a file that holds one.
 	Agents string
@@ -178,6 +203,9 @@ type Invocation struct {
 	Model string
 	// SmallModel is the model for a print run's short side jobs.
 	SmallModel string
+	// FallbackModel is --fallback-model, as typed: the models to go on
+	// with when the model cannot answer, separated by commas.
+	FallbackModel string
 	// Effort is the thinking level for the run (--reasoning-effort or
 	// --effort), as typed: the levels depend on the model.
 	Effort string
@@ -258,8 +286,13 @@ type Invocation struct {
 	// means no limit.
 	MaxTurns int
 
-	// JSON asks a subcommand to print JSON (`session ...`).
+	// JSON asks a subcommand to print JSON (`session ...`, `agents`).
 	JSON bool
+	// All belongs to `agents`: also every session in the background that
+	// is done, not only those of the last week.
+	All bool
+	// Force belongs to `prompt export`: write over a file that is there.
+	Force bool
 	// Hosts belongs to `doctor`: also try each declared host, which reaches
 	// out to other machines.
 	Hosts bool
@@ -278,13 +311,20 @@ type Invocation struct {
 	// as they were typed.
 	MCPScope     string
 	MCPTransport string
-	MCPEnv       []string
-	MCPHeaders   []string
+	// NoBrowser says gnosh mcp login opens no browser, and only says the
+	// address to sign in at.
+	NoBrowser  bool
+	MCPEnv     []string
+	MCPHeaders []string
 	// MCPConfigs are the MCP servers a session is given on its command line
 	// (--mcp-config): files, or the JSON itself, each in the shape of
 	// .mcp.json. StrictMCPConfig says to use those alone.
 	MCPConfigs      []string
 	StrictMCPConfig bool
+	// Channels are the MCP servers whose pushed events come into the
+	// session (--channels, and Claude Code's development spelling of it),
+	// each as written: server:<name>.
+	Channels []string
 }
 
 // Exit codes, for the code that runs what Parse describes.

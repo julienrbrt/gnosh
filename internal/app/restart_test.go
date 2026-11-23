@@ -1,8 +1,10 @@
 package app
 
 import (
+	"github.com/gnosh-ai/gnosh/internal/buildinfo"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -30,8 +32,8 @@ func TestRestart(t *testing.T) {
 		o.Executable = exe
 		o.Relaunch = func(args, env []string) error {
 			started = append(started, args)
-			if !slices.Contains(env, restartedEnv+"=1") {
-				t.Errorf("the gnosh /restart starts is not told it was restarted: %q", env)
+			if !slices.Contains(env, RestartedEnv+"="+buildinfo.BuildID) {
+				t.Errorf("the gnosh /restart starts is not told it was restarted, and from which build: %q", env)
 			}
 			if len(w.Sessions()) != 1 {
 				t.Errorf("gnosh starts again with %d session files", len(w.Sessions()))
@@ -51,7 +53,10 @@ func TestRestart(t *testing.T) {
 	}
 	s.typeLine("start a long job")
 	s.see("It sleeps.")
-	s.see("A newer gnosh has been installed since this one started: /restart runs it, in this session.")
+	// (It is said as a turn ends: on a busy machine the first turn's end
+	// was still under way when the newer build landed, and it was said
+	// there.)
+	s.seeAnywhere("A newer gnosh has been installed since this one started: /restart runs it, in this session.")
 
 	// What runs in the background would be stopped, so it waits.
 	s.typeLine("/restart")
@@ -104,5 +109,29 @@ func TestRestart(t *testing.T) {
 	s.typeLine("/exit")
 	if code := s.exit(); code != 0 {
 		t.Errorf("exit code %d", code)
+	}
+}
+
+// A session that has written nothing yet has no file to resume: /restart
+// (and /background) start gnosh again under its id.
+func TestRestartBeforeAnything(t *testing.T) {
+	w := apptest.NewWorld(t)
+	var started [][]string
+	s := sitWith(t, w, func(o *Options) {
+		o.Relaunch = func(args, env []string) error {
+			started = append(started, args)
+			return os.ErrPermission
+		}
+	})
+	s.see("Type a prompt and Enter.")
+	s.typeLine("/restart")
+	s.see("gnosh starts again, in this session.")
+	s.exit()
+	m := regexp.MustCompile(`session (\S+) in `).FindStringSubmatch(s.out.String())
+	if m == nil {
+		t.Fatalf("no session id on the screen:\n%s", s.out.String())
+	}
+	if len(started) != 1 || !slices.Equal(started[0], []string{"--permission-mode=default", "--session-id=" + m[1]}) {
+		t.Errorf("gnosh started again with %q", started)
 	}
 }

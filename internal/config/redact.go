@@ -61,9 +61,9 @@ func (s *secrets) scrub(text string) string {
 	return text
 }
 
-// displayURL is an address without the parts that can hold a secret: no
+// DisplayURL is an address without the parts that can hold a secret: no
 // user name or password, and no query string.
-func displayURL(raw string) string {
+func DisplayURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		return "(an address that cannot be read)"

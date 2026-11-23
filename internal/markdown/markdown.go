@@ -151,7 +151,7 @@ func (t Theme) in(p text.Profile) Theme {
 	for _, s := range []*text.Style{
 		&t.Text, &t.Heading, &t.HeadingMark, &t.Emphasis, &t.Strong, &t.Strikethrough,
 		&t.Code, &t.CodeBlock, &t.CodeMark, &t.Link, &t.LinkAddress, &t.Image, &t.HTML,
-		&t.QuoteMark, &t.ListMark, &t.TaskOpen, &t.TaskDone, &t.Rule,
+		&t.Quote, &t.QuoteMark, &t.ListMark, &t.TaskOpen, &t.TaskDone, &t.Rule,
 		&t.TableHeader, &t.TableRule, &t.Definition,
 	} {
 		*s = s.In(p)

@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/gnosh-ai/gnosh/internal/app/apptest"
+	"github.com/gnosh-ai/gnosh/internal/core"
 )
 
 // WebSearch asks the SearXNG server webSearchUrl names, and lists what it
@@ -44,7 +46,7 @@ func TestWebSearch(t *testing.T) {
 		t.Fatalf("with webSearchUrl the session has no WebSearch tool: %v", toolNamesOf(w.Model.Requests()[0]))
 	}
 	got := toolResult(t, w, 1, "c1")
-	has(t, "the results", got, `Results for "golang docs"`, "1. Go docs", "https://go.dev/doc/", "Documentation for Go.", "2. Go blog", "https://blog.go.dev/post", "Read a page with WebFetch")
+	has(t, "the results", got, `Results for "golang docs"`, "1. Go docs", "https://go.dev/doc/", "Documentation for Go.", "2. Go blog", "https://blog.go.dev/post", "Read a page you want with WebFetch")
 	hasNot(t, "a blocked host", got, "spam.example", "buy now")
 	if len(asked) != 1 || asked[0] != "golang docs" {
 		t.Errorf("the server was asked %q", asked)
@@ -72,5 +74,27 @@ func TestWebSearch(t *testing.T) {
 	run(t, w, "-p", "hi").wantCode(t, 0)
 	if slices.Contains(toolNamesOf(w.Model.Requests()[0]), "WebSearch") {
 		t.Error("without webSearchUrl the session offers WebSearch")
+	}
+}
+
+// The question about a search shows the server without its password and
+// the whole query, and a query too long to show is refused: what is sent
+// is what the person agrees to.
+func TestWebSearchQuestionHidesThePasswordAndShowsTheQuery(t *testing.T) {
+	tool := &webSearchTool{base: "https://me:secret-pw@searx.example/search?key=k"}
+	long := strings.Repeat("word ", 40) + "and the end of it"
+	act, err := tool.Describe(core.ToolCall{Name: "WebSearch", Input: []byte(`{"query":"` + long + `"}`)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(act.URL, "secret-pw") || strings.Contains(act.URL, "key=k") || !strings.Contains(act.URL, "searx.example") {
+		t.Errorf("the question shows %q", act.URL)
+	}
+	if !strings.Contains(act.Summary, "and the end of it") {
+		t.Errorf("the question cuts the query: %q", act.Summary)
+	}
+	too := strings.Repeat("x", webSearchMaxQuery+1)
+	if _, err := tool.Describe(core.ToolCall{Name: "WebSearch", Input: []byte(`{"query":"` + too + `"}`)}, nil); err == nil {
+		t.Error("a query longer than the question shows was taken")
 	}
 }

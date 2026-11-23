@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -165,6 +166,37 @@ func TestKeyBindingChords(t *testing.T) {
 	}
 }
 
+// The first key of a chord keeps its own binding when no chord follows:
+// taken away, it does nothing; bound, it does its action. A key that does
+// not end a chord may start one. chat:clearInput clears the box.
+func TestKeyBindingChordFirstKeyAlone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keybindings.json")
+	if err := os.WriteFile(path, []byte(`{"bindings": [{"context": "Chat", "bindings": {
+		"ctrl+k": null, "ctrl+k ctrl+s": "command:compact",
+		"ctrl+y": "chat:clearInput", "ctrl+y ctrl+y": "command:cost"}}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g := newRig(t, 100, 24, text.NoColor, func(c *controls) {
+		c.info.Keybindings = path
+		c.info.Commands = append(c.info.Commands, "compact", "cost")
+	})
+	g.keys(`"abc" <Ctrl+A> <Ctrl+K> "z"`)
+	if got := g.box(); got != "zabc" {
+		t.Fatalf("Ctrl+K, taken away, then z left %q in the box, want zabc", got)
+	}
+	g.keys(`<Ctrl+Y> "q"`)
+	if got := g.box(); got != "q" {
+		t.Fatalf("Ctrl+Y (chat:clearInput) then q left %q in the box, want q", got)
+	}
+	g.keys(`<Ctrl+K> <Ctrl+K> <Ctrl+S>`)
+	if !slices.Contains(g.c.commands, "/compact") {
+		t.Fatalf("Ctrl+K Ctrl+K Ctrl+S did not end in the chord: ran %q", g.c.commands)
+	}
+	if got := g.box(); got != "q" {
+		t.Fatalf("the Ctrl+K that did not end a chord changed the box to %q", got)
+	}
+}
+
 // Whatever the file holds, reading it never panics, and a key it binds is
 // already in the form keys are looked up by.
 func FuzzKeyBindings(f *testing.F) {
@@ -201,4 +233,145 @@ func TestKeyBindingsProblemsAtStart(t *testing.T) {
 	}
 	g := newRig(t, 100, 24, text.NoColor, func(c *controls) { c.info.Keybindings = path })
 	g.committedHas(`"ctl" is no modifier`)
+}
+
+// A named pipe where the keybindings file should be is not read: the keys
+// were stopped waiting on it (the status line review of 2026-11-19).
+func TestKeyBindingsFileThatIsAPipe(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keybindings.json")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g := newRig(t, 100, 24, text.NoColor, func(c *controls) { c.info.Keybindings = path })
+		g.keys(`"hi"`)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the session waited on a named pipe for its keybindings")
+	}
+}
+
+// The list of keys (? in an empty box) shows the person's own keys after
+// gnosh's: what each does here, a key taken away, a command, a chord.
+func TestKeyBindingsInTheListOfKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keybindings.json")
+	if err := os.WriteFile(path, []byte(`{"bindings": [
+		{"context": "Chat", "bindings": {"ctrl+k": "chat:stash", "ctrl+s": null, "ctrl+y": "command:compact", "ctrl+x ctrl+o": "app:toggleTranscript"}},
+		{"context": "Transcript", "bindings": {"ctrl+q": "transcript:exit"}}
+	]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g := newRig(t, 100, 40, text.NoColor, func(c *controls) {
+		c.info.Keybindings = path
+		c.info.Commands = append(c.info.Commands, "compact")
+	})
+	g.keys(`"?"`)
+	g.committedHas("Keys", "Yours, from "+path)
+	// Under that line, each key with what it does, on its own row.
+	var yours []string
+	for i, l := range g.committed {
+		if strings.Contains(l, "Yours, from") {
+			yours = g.committed[i+1:]
+		}
+	}
+	for _, want := range [][2]string{
+		{"Ctrl+K", "put the prompt aside, and bring it back"},
+		{"Ctrl+S", "taken away: it does nothing"},
+		{"Ctrl+Y", "runs /compact"},
+		{"Ctrl+X Ctrl+O", "the whole transcript: every thought, call and result"},
+		{"Ctrl+Q", "leave the transcript (in the transcript)"},
+	} {
+		found := false
+		for _, l := range yours {
+			if strings.HasPrefix(strings.TrimSpace(l), want[0]+" ") && strings.Contains(l, want[1]) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no row %q %q under the person's keys:\n%s", want[0], want[1], strings.Join(yours, "\n"))
+		}
+	}
+}
+
+func TestKeyLabel(t *testing.T) {
+	for _, c := range []struct {
+		key  term.Key
+		want string
+	}{
+		{term.Key{Code: term.KeyRune, Rune: 'y', Mod: term.ModCtrl}, "Ctrl+Y"},
+		{term.Key{Code: term.KeyRune, Rune: 'p', Mod: term.ModAlt}, "Alt+P"},
+		{term.Key{Code: term.KeyTab, Mod: term.ModShift}, "Shift+Tab"},
+		{term.Key{Code: term.KeyEnter, Mod: term.ModCtrl}, "Ctrl+Enter"},
+		{term.Key{Code: term.KeyEscape}, "Esc"},
+		{term.Key{Code: term.KeyF5}, "F5"},
+		{term.Key{Code: term.KeyRune, Rune: ' ', Mod: term.ModCtrl}, "Ctrl+Space"},
+		{term.Key{Code: term.KeyRune, Rune: 'q', Text: "q"}, "q"},
+	} {
+		if got := keyLabel(c.key); got != c.want {
+			t.Errorf("keyLabel(%+v) = %q, want %q", c.key, got, c.want)
+		}
+	}
+}
+
+// The hints name the key the person bound to what they tell of: the
+// transcript view's, and in it the key that shows all; with gnosh's own
+// key given to something else and none bound in its place, no hint names
+// one.
+func TestKeyHintsFollowTheKeybindings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keybindings.json")
+	write := func(text string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(`{"bindings": [{"context": "Chat", "bindings": {"ctrl+y": "app:toggleTranscript"}}, {"context": "Transcript", "bindings": {"ctrl+a": "transcript:toggleShowAll"}}]}`)
+	g := newRig(t, 100, 24, text.NoColor, func(c *controls) { c.info.Keybindings = path })
+	if got := g.s.keyHint("app:toggleTranscript", "Ctrl+O"); got != "Ctrl+Y" {
+		t.Errorf("the transcript's key is named %q, want Ctrl+Y", got)
+	}
+	if got := g.s.keyHint("transcript:toggleShowAll", "Ctrl+E"); got != "Ctrl+A" {
+		t.Errorf("the key that shows all is named %q, want Ctrl+A", got)
+	}
+	if got := g.s.keyHint("transcript:exit", "q"); got != "q" {
+		t.Errorf("the key that goes back is named %q, want q", got)
+	}
+	if got := g.s.transcriptHint(" · ", "shows it"); got != " · Ctrl+Y shows it" {
+		t.Errorf("the hint is %q", got)
+	}
+	// Ctrl+O given to something else, and no key in its place.
+	write(`{"bindings": [{"context": "Chat", "bindings": {"ctrl+o": "chat:stash"}}]}`)
+	g.wait(2 * time.Second)
+	if got := g.s.transcriptHint(" · ", "shows it"); got != "" {
+		t.Errorf("with Ctrl+O given away the hint is %q, want none", got)
+	}
+	// Taken away in a chord of gnosh's: Ctrl+X Ctrl+K.
+	write(`{"bindings": [{"context": "Chat", "bindings": {"ctrl+x ctrl+k": null}}]}`)
+	g.wait(2 * time.Second)
+	if got := g.s.keyHint("chat:killAgents", "Ctrl+X Ctrl+K"); got != "" {
+		t.Errorf("with Ctrl+X Ctrl+K taken away its hint is %q, want none", got)
+	}
+	if got := g.s.keyHint("app:toggleTranscript", "Ctrl+O"); got != "Ctrl+O" {
+		t.Errorf("with no binding of it the transcript's key is %q, want Ctrl+O", got)
+	}
+}
+
+// The welcome line and the working line name the key the person bound to
+// stop a turn.
+func TestStopHintFollowsTheKeybindings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keybindings.json")
+	if err := os.WriteFile(path, []byte(`{"bindings": [{"context": "Chat", "bindings": {"ctrl+q": "chat:cancel"}}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g := newRig(t, 100, 24, text.NoColor, func(c *controls) { c.info.Keybindings = path })
+	if got := g.s.keyHint("chat:cancel", "Esc"); got != "Ctrl+Q" {
+		t.Fatalf("the stop key is named %q, want Ctrl+Q", got)
+	}
+	if got := g.s.keyHint("chat:cycleMode", "Shift+Tab"); got != "Shift+Tab" {
+		t.Errorf("the mode key is named %q, want Shift+Tab", got)
+	}
 }

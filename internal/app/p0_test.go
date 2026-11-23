@@ -163,10 +163,54 @@ func TestInstructionFilesAreRead(t *testing.T) {
 	}
 }
 
+// The files a folder keeps in .claude or .gnosh are read beside its own:
+// .claude/CLAUDE.md, and the rules in .claude/rules, those without paths
+// from the start and one with paths once a file it names is touched; and
+// the person's rules beside their GNOSH.md (the skills review of
+// 2026-11-19: none of these were read).
+func TestDotFolderInstructionsAreRead(t *testing.T) {
+	read := apptest.Reply{Calls: []apptest.Call{{ID: "c1", Name: "Read", Args: `{"file_path":"api/server.go"}`}}}
+	w := apptest.NewWorld(t, read, apptest.Reply{Text: "ok"})
+	w.Write(w.ConfigDir()+"/rules/tone.md", "The person's rule: plain words.\n")
+	w.Write(".claude/CLAUDE.md", "The project's rule from .claude: tests live in ./tests.\n")
+	w.Write(".claude/rules/style.md", "A rule for the whole project: tabs.\n")
+	w.Write(".gnosh/rules/api.md", "---\npaths: \"api/**/*.go\"\n---\nA rule for the API: errors are wrapped.\n")
+	w.Write("api/server.go", "package api\n")
+	runWith(t, t.Context(), testOptions(w, "-p", "hello")).wantCode(t, 0).wantNoErr(t)
+	first := userTexts(w.Model.Requests()[0])[0]
+	has(t, "the first message", first, "The person's rule: plain words.", "The project's rule from .claude", "A rule for the whole project: tabs.")
+	hasNot(t, "the first message", first, "A rule for the API")
+	has(t, "what the model read with the file", requestText(t, w, 1), "A rule for the API: errors are wrapped.")
+}
+
+// claudeMdExcludes keeps the files it names out of what the model reads.
+// A pattern the reader cannot use stops startup, at the line that sets
+// it: it would keep nothing out.
+func TestClaudeMdExcludesLeaveFilesOut(t *testing.T) {
+	w := apptest.NewWorld(t, apptest.Reply{Text: "ok"})
+	w.Settings(`{"options": {"claudeMdExcludes": ["**/vendor/**/AGENTS.md"]}}`)
+	w.Write("AGENTS.md", "The project's rule: tests live in ./tests.\n")
+	w.Write("vendor/lib/AGENTS.md", "A vendored rule nobody here wrote.\n")
+	o := testOptions(w, "-p", "hello")
+	o.Cwd = w.Path("vendor/lib")
+	runWith(t, t.Context(), o).wantCode(t, 0).wantNoErr(t)
+	first := userTexts(w.Model.Requests()[0])[0]
+	has(t, "the first message", first, "The project's rule")
+	hasNot(t, "the first message", first, "nobody here wrote")
+
+	bad := apptest.NewWorld(t)
+	bad.Settings(`{"options": {"claudeMdExcludes": ["src/[a-"]}}`)
+	r := run(t, bad, "-p", "hello").wantCode(t, 1)
+	has(t, "stderr", r.err, "gnosh.json:", "claudeMdExcludes", "no ] closes")
+	if n := len(bad.Model.Requests()); n != 0 {
+		t.Errorf("the model was sent %d requests", n)
+	}
+}
+
 // A setting Claude Code has and this gnosh has not built stops startup,
 // with a message that says so. It is never taken and left unused.
 func TestConfigForWhatIsNotBuiltStopsStartup(t *testing.T) {
-	for _, key := range []string{"spinnerVerbs", "enabledMcpjsonServers", "sandbox"} {
+	for _, key := range []string{"spinnerVerbs", "enabledMcpjsonServers", "worktree"} {
 		t.Run(key, func(t *testing.T) {
 			w := apptest.NewWorld(t)
 			w.Write(w.SettingsFile(), "{\n  \""+key+"\": {}\n}\n")
@@ -177,4 +221,16 @@ func TestConfigForWhatIsNotBuiltStopsStartup(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Instruction files that come to more than 40,000 characters at the start
+// are said to be long, as Claude Code says it; shorter ones are not.
+func TestLongInstructionFilesAreSaidToBeLong(t *testing.T) {
+	w := apptest.NewWorld(t, apptest.Reply{Text: "ok"}, apptest.Reply{Text: "ok"})
+	w.Write("CLAUDE.md", "Keep it short.\n")
+	r := run(t, w, "-p", "hello").wantCode(t, 0)
+	hasNot(t, "stderr with short files", r.err, "instruction files given to the model at the start")
+	w.Write("CLAUDE.md", strings.Repeat("Keep every answer short and plain.\n", 1500))
+	r = run(t, w, "-p", "hello").wantCode(t, 0)
+	has(t, "stderr with long files", r.err, "The instruction files given to the model at the start come to 53.1K characters, over 40.0K", "/memory lists them")
 }

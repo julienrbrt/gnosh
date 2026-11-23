@@ -1,0 +1,16 @@
+gnosh mcp logout
+
+  Forget the sign-in to a server at a URL. The authorization server is not
+  told: the token it gave may still work until it runs out.
+
+  Not built yet in this build of gnosh: typing it stops with a message that
+  says so.
+
+Usage
+  gnosh mcp logout [flags] <name>
+
+Flags
+  --cwd <dir>
+      Work in this folder instead of the current one.
+  -h, --help
+      Show help: gnosh's, or after a command's name that command's.

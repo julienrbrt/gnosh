@@ -17,9 +17,20 @@ func TestOwnToolsNameEveryTool(t *testing.T) {
 	w := apptest.NewWorld(t)
 	w.Write(w.ConfigDir()+"/skills/deploy/SKILL.md", "---\nname: deploy\ndescription: Deploys.\n---\nDeploy the site.\n")
 	w.Model.Respond(func(n int, r apptest.Request) *apptest.Reply { return &apptest.Reply{Text: "Hi."} })
-	run(t, w, "-p", "hi").wantCode(t, 0)
-	names := toolNamesOf(w.Model.Requests()[0])
-	for _, want := range []string{"Agent", "SendMessage", "WebFetch", "Monitor", "Skill", "EnterPlanMode"} {
+	// (A session somebody attends, where every tool is offered.)
+	s := sit(t, w)
+	s.see("Type a prompt and Enter.")
+	s.typeLine("hi")
+	s.see("Hi.")
+	s.typeLine("/exit")
+	s.exit()
+	var names []string
+	for _, r := range w.Model.Requests() {
+		if names = toolNamesOf(r); slices.Contains(names, "Bash") {
+			break
+		}
+	}
+	for _, want := range []string{"Agent", "SendMessage", "WebFetch", "Monitor", "Skill", "EnterPlanMode", "AskUserQuestion"} {
 		if !slices.Contains(names, want) {
 			t.Errorf("%s was not offered, so this test does not cover it: %v", want, names)
 		}
@@ -127,7 +138,7 @@ func TestConfigMistakesStopStartup(t *testing.T) {
 		}, []string{"/proj/gnosh.json:3:", `"frobnicate" is not a key gnosh knows`}},
 		{"a rule for a tool that does not exist", func(w *apptest.World) []string {
 			return []string{"--allowedTools", "NoSuchTool(x)", "--"}
-		}, []string{"--allowedTools:", `"NoSuchTool" is not a tool gnosh has`, "Read, Write, Edit, Glob, Grep, Bash, TaskStop"}},
+		}, []string{"--allowedTools:", `"NoSuchTool" is not a tool gnosh has`, "Read, Write, Edit, Glob, Grep, NotebookEdit, Bash, TaskStop"}},
 		{"two mistakes are both told", own(`  "frobnicate": true,`, `  "options": {"noSuchOption": 3}`), []string{"has 2 mistakes", "gnosh.json:4:", "gnosh.json:5:"}},
 	}
 	for _, tc := range cases {
@@ -378,10 +389,55 @@ func TestModelIsNeverGuessed(t *testing.T) {
 		t.Errorf("the request names the model %v", got)
 	}
 
+	// /clear asks again, and in a session that reads lines the answer is
+	// the question's: a command that runs does not take it (the review of
+	// 16 November: the line went to the command, and on to the next
+	// session as its first prompt).
+	w = bare(t, apptest.Reply{Text: "The first model answers."})
+	s = sit(t, w)
+	s.see("? Which model?")
+	s.typeLine("2")
+	s.see("model local/second-model")
+	s.typeLine("/clear")
+	s.see("? Which model?")
+	s.see("Type a number and Enter.")
+	s.typeLine("1")
+	s.see("A new session is open")
+	s.typeLine("hello")
+	s.see("The first model answers.")
+	s.typeLine("/exit")
+	s.exit()
+	reqs := w.Model.Requests()
+	if len(reqs) != 1 || reqs[0].JSON["model"] != "first-model" {
+		t.Fatalf("after /clear and a pick of the first model, %d requests, the first naming %v", len(reqs), reqs[0].JSON["model"])
+	}
+
 	// With one model there is nothing to choose.
 	w = apptest.NewWorld(t, apptest.Reply{Text: "The only model answers."})
 	w.Write(w.SettingsFile(), `{"providers": {"local": {"type": "llamacpp", "baseUrl": "`+w.Model.URL+`"}}}`+"\n")
 	if out := run(t, w, "-p", "hello").wantCode(t, 0).out; out != "The only model answers.\n" {
 		t.Errorf("stdout = %q", out)
+	}
+}
+
+// A command that is nothing but calls on mem, one Gno call or chain of
+// them a line, is mem's to run (rerouteGno); anything more is the shell's.
+func TestMemCode(t *testing.T) {
+	for command, want := range map[string]bool{
+		"mem.Show()":                           true,
+		"mem.Show();":                          true,
+		`mem.Todo("ship it").Push()`:           true,
+		"mem.Fact(\"a\", \"b\")\n\nmem.Show()": true,
+		"mem.Show() && rm -rf build":           false,
+		"x := mem.Show()":                      false,
+		"echo mem.Show()":                      false,
+		"mem.show()":                           false,
+		"Mem.Show()":                           false,
+		"mem.Show()\nls":                       false,
+		"":                                     false,
+	} {
+		if _, got := memCode(command); got != want {
+			t.Errorf("memCode(%q) = %v, want %v", command, got, want)
+		}
 	}
 }

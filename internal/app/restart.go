@@ -2,13 +2,17 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
 	"github.com/gnosh-ai/gnosh/internal/agent"
+	"github.com/gnosh-ai/gnosh/internal/buildinfo"
 	"github.com/gnosh-ai/gnosh/internal/cli"
 	"github.com/gnosh-ai/gnosh/internal/shellquote"
 )
@@ -32,16 +36,30 @@ func (p *program) restartArgs() []string {
 	return p.restart
 }
 
-// restartedEnv is set for the gnosh that /restart starts, so that it knows
+// RestartedEnv is set for the gnosh that /restart starts, so that it knows
 // the conversation of the session it opens is still on the screen (and
-// draws no recap of it). gnosh takes it out of its environment as it
-// starts, so nothing it runs sees it.
-const restartedEnv = "GNOSH_RESTARTED"
+// draws no recap of it), and which build it took over from: the variable
+// holds that build's BuildID ("1" from a gnosh too old to say). gnosh takes
+// it out of its environment as it starts (Options.Environ here, the
+// process's own in main), so nothing it runs sees it.
+const RestartedEnv = "GNOSH_RESTARTED"
 
 // relaunch starts gnosh again with args, in place of this process. It
 // returns only when that could not be done, with the exit code.
 func (p *program) relaunch(args []string) int {
-	err := p.o.Relaunch(args, append(slices.Clone(p.o.Environ), restartedEnv+"=1"))
+	if _, err := os.Getwd(); err != nil {
+		// The folder this gnosh was started in is gone, and a start in it
+		// would not know where it is (gnosh never leaves it, and a /cd
+		// before named the session's folder with --cwd): it starts in that
+		// one instead (the cd review of 2026-11-19).
+		for _, a := range args {
+			if dir, ok := strings.CutPrefix(a, "--cwd="); ok && filepath.IsAbs(dir) {
+				_ = os.Chdir(dir)
+			}
+		}
+	}
+	env := append(slices.Clone(p.o.Environ), RestartedEnv+"="+firstOf(buildinfo.BuildID, "1"))
+	err := p.o.Relaunch(args, append(env, p.movingEnv()...))
 	p.errf("gnosh could not start again (%v). The session is kept: gnosh %s opens it again.", err, shellquote.Words(args))
 	return cli.ExitFailure
 }
@@ -103,50 +121,137 @@ func (l *live) slashRestart(ctx context.Context, c *SlashContext) error {
 	p := l.p
 	p.restartMu.Lock()
 	p.restart = args
+	switch t := l.st.tree; {
+	case t != nil && t.entered:
+		// A tree EnterWorktree moved the session into stays one in the
+		// new start: ExitWorktree may take the session back out.
+		move, _ := json.Marshal(treeMove{Entered: t.path, Named: t.named, Carried: true})
+		p.treeMoving = string(move)
+	case t != nil && !t.named && !t.reused:
+		// One --worktree made under a made-up name stays one that goes at
+		// the end when left as made (treeMove.Made).
+		move, _ := json.Marshal(treeMove{Made: t.path, Carried: true})
+		p.treeMoving = string(move)
+	}
 	p.restartMu.Unlock()
 	if p.newBuild() {
-		c.Say("gnosh starts again, the newer one, in this session.")
+		c.Say("gnosh starts again, the newer one, in this session." + l.loopEndsNote())
 	} else {
-		c.Say("gnosh starts again, in this session.")
+		c.Say("gnosh starts again, in this session." + l.loopEndsNote())
 	}
 	return nil
 }
 
 // goOnArgs is the command line that opens this session again, with its
-// flags as they stand, for a command (restart, background) that ends the
-// session for another gnosh to go on with it. It refuses while a turn or
-// work in the background runs, which ending the session would stop.
-func (l *live) goOnArgs(c *SlashContext, name string) ([]string, error) {
+// flags as they stand, for a command (restart, background, cd) that ends
+// the session for another gnosh to go on with it; adjust, when given,
+// changes what it is made from. It refuses while a turn or work in the
+// background runs, which ending the session would stop.
+func (l *live) goOnArgs(c *SlashContext, name string, adjust ...func(*cli.Relaunch)) ([]string, error) {
 	if c.Agent.State().Busy {
 		return nil, fmt.Errorf("a turn is running, and would be stopped: /%s once it has ended, or Esc stops it", name)
 	}
 	if work := l.runningWork(); len(work) > 0 {
 		return nil, fmt.Errorf("this is still running in the background, and would be stopped: %s. /%s once it has ended, or /tasks stop <id> stops it", strings.Join(work, ", "), name)
 	}
-	session := l.ts.ID()
-	if l.inv.ResumeIsFile && !l.inv.ForkSession {
+	session, fresh := l.ts.ID(), false
+	switch _, err := os.Stat(l.ts.Path()); {
+	case errors.Is(err, fs.ErrNotExist):
+		// Nothing written yet (a session just begun, or just cleared):
+		// there is no file to resume, so the new start makes the session
+		// under its id.
+		fresh = true
+	case l.inv.ResumeIsFile && !l.inv.ForkSession:
 		// A session opened from its file, which may lie outside this
 		// folder's sessions, is opened from its file again.
 		session = l.ts.Path()
 	}
-	return l.relaunchFor(session)
+	return l.relaunchFor(session, fresh, adjust...)
 }
 
 // relaunchFor is the command line that opens session with this session's
 // flags as they stand: its permission mode, model, thinking level and work
-// tree.
-func (l *live) relaunchFor(session string) ([]string, error) {
+// tree, and the folders /add-dir added that are still there. fresh says
+// the session has no file yet.
+func (l *live) relaunchFor(session string, fresh bool, adjust ...func(*cli.Relaunch)) ([]string, error) {
 	p := l.p
-	r := cli.Relaunch{Session: session, Mode: string(l.engine.Mode()), Effort: l.agent.Model().Level}
-	if ref, ok := l.modelRef(); ok {
-		r.Model = ref.String()
+	r := cli.Relaunch{Session: session, Fresh: fresh, Mode: string(l.engine.Mode()), Effort: firstOf(l.agent.Model().Level, cli.EffortDefault)}
+	for _, d := range l.addedDirs {
+		// (A folder gone since would stop the new start: --add-dir takes
+		// folders that are there.)
+		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+			r.AddDirs = append(r.AddDirs, d)
+		}
 	}
 	if t := l.st.tree; t != nil {
 		r.Tree = t.name
+	}
+	for _, f := range adjust {
+		f(&r)
+	}
+	if ref, ok := l.modelRef(); ok && (l.inv.Model != "" || l.modelPicked) {
+		// The model the command line named, or the one picked as the
+		// session started, which is kept nowhere; one from the settings,
+		// or saved by /model, the new start finds there itself.
+		r.Model = ref.String()
 	}
 	args, err := p.table.RelaunchArgs(p.o.Args, r)
 	if err != nil {
 		return nil, fmt.Errorf("the command line to go on with could not be made (%v). /exit ends the session, and %s opens it again", err, l.info().Resume)
 	}
 	return args, nil
+}
+
+// whatsNew says, in a session /restart opened in a newer build, what
+// changed since the build it took over from: the subjects of the commits
+// between them, the newest first, as many as the build carries
+// (buildinfo.Changes; a build of the tree as it stands carries none).
+func (l *live) whatsNew() {
+	from := l.p.restartedFrom
+	if !l.interactive || from == "" || strings.HasPrefix(buildinfo.BuildID, from) || strings.HasPrefix(from, buildinfo.BuildID) {
+		return
+	}
+	changes, found := buildinfo.Since(from)
+	if len(changes) == 0 {
+		return
+	}
+	l.notice(agent.LevelInfo, "restart", whatsNewText(from, changes, found))
+}
+
+// whatsNewShown is how many changes whatsNew lists; /release-notes lists
+// them all.
+const whatsNewShown = 8
+
+// whatsNewText is whatsNew's words: found says the old build is among the
+// changes the build carries, so that the count is the whole of them.
+func whatsNewText(from string, changes []buildinfo.Change, found bool) string {
+	count := fmt.Sprintf("%d", len(changes))
+	if !found {
+		count = "more than " + count
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "gnosh %s took over from %s: %s %s since.", buildinfo.BuildID, from, count, map[bool]string{true: "change", false: "changes"}[len(changes) == 1 && found])
+	for i, c := range changes {
+		if i == whatsNewShown {
+			fmt.Fprintf(&b, "\n  … and %d more: /release-notes lists them.", len(changes)-whatsNewShown)
+			break
+		}
+		fmt.Fprintf(&b, "\n  %s %s", c.ID, oneLine(c.Subject, 100))
+	}
+	return b.String()
+}
+
+// slashReleaseNotes is /release-notes: the changes this build was made
+// from, newest first, as Claude Code's lists its own.
+func (l *live) slashReleaseNotes(ctx context.Context, c *SlashContext) error {
+	changes := buildinfo.Changes()
+	if len(changes) == 0 {
+		c.Say("gnosh %s carries no list of its changes: it was built from the tree as it stands, not for installing.", buildinfo.BuildID)
+		return nil
+	}
+	c.Say("gnosh %s, its newest changes first:", buildinfo.BuildID)
+	for _, ch := range changes {
+		c.Say("  %s %s", ch.ID, oneLine(ch.Subject, 120))
+	}
+	return nil
 }

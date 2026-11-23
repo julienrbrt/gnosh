@@ -1,6 +1,7 @@
 package shelltool
 
 import (
+	"bytes"
 	"os"
 	"strconv"
 	"syscall"
@@ -52,4 +53,20 @@ func sessionProcs(sid int) ([]procInfo, error) {
 		})
 	}
 	return out, nil
+}
+
+// procEnvHas reports whether the environment process pid began its
+// program with holds entry ("NAME=value") whole. /proc keeps it as the
+// program was handed it.
+func procEnvHas(pid int, entry string) (bool, error) {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/environ")
+	if err != nil {
+		return false, err
+	}
+	for _, kv := range bytes.Split(data, []byte{0}) {
+		if string(kv) == entry {
+			return true, nil
+		}
+	}
+	return false, nil
 }

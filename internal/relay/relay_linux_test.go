@@ -139,13 +139,14 @@ func script(t *testing.T, body string) string {
 
 // fakeSSH is a stand-in for ssh that prints its arguments and its
 // terminal's size, writes a line to its standard error, copies "copied
-// text" (OSC 52), reads a line, prints the size again (after a resize,
-// if the test made one), and ends with status 7.
+// text" with an escape that would end a bracketed paste in it (OSC 52),
+// reads a line, prints the size again (after a resize, if the test made
+// one), and ends with status 7.
 func fakeSSH(t *testing.T) string {
 	return script(t, `echo "args: $*"
 echo "size: $(stty size)"
 echo "to stderr" >&2
-printf '\033]52;c;%s\007' "$(printf 'copied text' | base64)"
+printf '\033]52;c;%s\007' "$(printf 'copied \033[201~text' | base64)"
 IFS= read -r line
 echo "got: $line"
 echo "size: $(stty size)"
@@ -197,8 +198,9 @@ func TestRelay(t *testing.T) {
 		t.Fatal("gnosh ssh did not end when ssh did")
 	}
 	mu.Lock()
-	if len(copied) != 1 || copied[0] != "copied text" {
-		t.Errorf("copied %q, want the one write", copied)
+	// (Without the escape: the relay review of 2026-11-19.)
+	if len(copied) != 1 || copied[0] != "copied [201~text" {
+		t.Errorf("copied %q, want the one write, without its escape", copied)
 	}
 	mu.Unlock()
 	if b, _ := os.ReadFile(errs.Name()); string(b) != "to stderr\n" || scr.shows("to stderr") {

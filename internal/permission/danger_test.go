@@ -1,6 +1,7 @@
 package permission
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -40,6 +41,19 @@ func TestDangerousRemovals(t *testing.T) {
 		"ls && rm -rf / || true", "find . -exec rm -rf / \\;", "/bin/rm -rf /", "nohup rm -rf ~ &",
 		// A removal in a line the reader cannot follow is not ruled out.
 		"rm -rf $x &&", "select f in a b; do rm -rf $f; done", "rm -rf ${x:-\"}\"}", "echo 'x; rm -rf y",
+		// A program's name with a variable in it, read with the variable
+		// unset (oracle seed 126).
+		"rmdir${X[1]} . -n", "rmdir${X} .", "r${Y}m -rf /", "rm${X[1]} -rf ~",
+		// A word that starts with = is only zsh's way of naming a program:
+		// to bash and sh it is text (oracle seed 135).
+		"rm -rf =x/..", "rm -R ='*/..'", "rm -rf =/..", "rm -rf =/../..", "w=false'*/..'; r\\m -R ='*/..'",
+		// A program that a flag of its own sends to another folder runs
+		// there, and so does a command fc runs again from what history -s
+		// put in the shell's history.
+		"env --chdir=/ rm -rf usr", "env -C / rm -rf etc", "env -iC/ rm -rf usr", "env --ch=/ rm -rf usr", "sudo -D / rm -rf usr",
+		"env -C ~ rm -rf .", "env -C \"$D\" rm -rf .", "set -o history\nhistory -s 'rm -rf ~'\nfc -s",
+		"git -c alias.z='!rm -rf ~' z", "git -c core.sshCommand='rm -rf ~' fetch", "export PAGER='rm -rf ~'; git -p log",
+		"echo 'rm -rf ~' | /proc/$$/exe", "echo 'rm -rf ~' | /proc/self$x/exe",
 	}
 	for _, cmd := range dangerous {
 		d := bash(e, cmd)
@@ -57,7 +71,7 @@ func TestDangerousRemovals(t *testing.T) {
 		"rm -rf /data/extra/sub", "rm -rf /data/extra/sub/*", "rmdir empty",
 		"rm -rf \"${DIR:?}\"/*", "rm -rf \"${DIR:?must be set}/\"", "rm -rf $DIR", "rm -rf \"$DIR/build\"", "rm -rf $BUILD/out",
 		"rm \"$(pwd)/a.txt\"", "rm $(ls *.tmp)", "D=x; rm -rf \"$D\"", "echo rm -rf /", "echo 'rm -rf /'", "grep -r 'rm -rf /' .",
-		"ls /", "rm -- -rf", "git rm -r --cached .",
+		"ls /", "rm -- -rf", "git rm -r --cached .", "rm -rf =old", "rm -rf =x/build", "env -C build rm -rf out", "history -s ls", "git -c core.pager=less log", "git -c alias.st=status st", "git config core.editor vim",
 		// Forms the reader follows are judged on what they remove.
 		"[[ -d build ]] && rm -rf build", "rm -rf \"${dirs[@]}\"", "for ((i=0;i<3;i++)); do rm -f tmp$i; done",
 		"(( n > 0 )) && rm -rf build",
@@ -112,6 +126,13 @@ func TestOtherDestroyers(t *testing.T) {
 		"mv /home /x", "sudo mv /etc /x", "mv ${HOME} /tmp/h", "d=.git; mv $d /tmp", "mv ../proj /tmp", "mv \"$X\"/* /tmp", "mv $X/ /tmp",
 		"mv -T /tmp/new ~", "mv --no-target-directory /tmp/new .git", "for d in .git src; do mv $d /tmp/; done", "mv \"$(pwd)\" /tmp/x",
 		"mv ~/.local/share/gnosh /tmp", "mv ~/.config /tmp", "mv .gi* /tmp", "mv {.git,x} /tmp",
+		// A $"..." is a catalog's translation, which nobody knows ahead of
+		// time; and in a line that holds one, a process substitution is
+		// still a command's output (oracle seed 128).
+		"mv $\"x\" <(env) link-dir/file >& all.txt", "mv $\"x\" /tmp", "chmod -R 000 $\"x\"",
+		// In dash an alias given $'1rm' is $1rm, which is rm (oracle seed
+		// 131).
+		"alias zz=$'1rm'\nzz -rf ~", "sh -c $'1rm -rf ~'", "trap $'1rm -rf ~' EXIT",
 		// A variable inside a name right under the root leaves that name
 		// where it is empty (oracle seed 105): /tmp-a, /tmp:--rf.
 		"mv /tmp$X-a /tmp", "mv /tmp$X:--rf /tmp", "mv $X:--rf x} /tmp$X:--rf x} /tmp", "mv /tm${X}p /x",
@@ -141,6 +162,9 @@ func TestOtherDestroyers(t *testing.T) {
 		"dd if=/dev/zero of=/dev/sda", "dd of=/dev/nvme0n1 if=x", "shred -u *", "shred -u ~/*", "truncate -s 0 *", "truncate -s0 ./*",
 		"shred /dev/sda1", "truncate -s 0 .git/*", "shred -u \"$DIR\"/*", "truncate --size=0 ~/.config/gnosh/*", "dd if=x of=/dev/disk2",
 		"shred -n 3 -u /proj/*",
+		// An empty variable before "/." leaves the root, and shred has no
+		// -r to take the word after it (oracle seed 116).
+		"shred -rf $d/.", "shred $d/.", "truncate -s 0 $d/.", "rm -rf $d/.",
 		// rsync that deletes what is in the way, or takes its sources away.
 		"rsync -a --delete src/ .", "rsync -a --delete empty/ ~/", "rsync --del a/ /", "rsync -av --delete-after src/ ..",
 		"rsync -a --delete x/ ~/.config/gnosh", "rsync -a --delete -e ssh host:dir/ .", "rsync -a --remove-source-files * host:/backup/",
@@ -226,6 +250,13 @@ func TestOtherDestroyers(t *testing.T) {
 		// the reader; the shells join the lines (oracle seed 101).
 		"a[0]=rsync; $a -\\\na --delete src/ .", "x=chmod; $x -\\\nR 000 .",
 		"time coproc shred -u *", "echo $[1]; rsync -a --delete src/ .", "mv ${HOME:0:${#HOME}} /tmp/h", "chmod -R 000 \"${PWD%\"x\"}\"",
+		// A piece of a line the reader cannot follow keeps what it is
+		// handed as it is written: <(date) is what a command prints, not
+		// the word date (oracle seed 161).
+		"coproc kill ;\nmv <(date) 0", "coproc kill; mv <(date -d yesterday ./src/../a.txt) 0", "coproc kill; mv $(tr a 'b c') <(date) 0",
+		"coproc kill; while true; do mv <(date) 0; break; done", "coproc kill; x=$(mv <(date) 0)", "coproc kill; { mv <(date | cat) 0; }",
+		"coproc kill; mv <(date) 0 2>&1", "coproc kill; (mv <(date) 0)", "coproc kill; \"mv\" <(date) 0", "coproc kill; mv <(date) 0 &>/dev/null",
+		"while if whoami; then sort ../outside | alias; fi; do ! coproc kill ;\nmv ${X:-$(tr --complement ./src/../a.txt -n-f$X.env 'a b'${X})} <(date 010100002030 -d yesterday ./src/../a.txt) 0; break; done",
 		// The forms bash adds to ${...}, on a value the line knows.
 		"rm -rf ${HOME/x/y}", "rm -rf ${HOME:0:1}", "v=HOME; rm -rf ${!v}", "d=build; rm -rf ${d/build//}", "d=/x; rm -rf ${d:0:1}", "rm -rf ${PWD//zz/y}",
 		"rm -rf ${HOME,,}", "d=/HOME/U; rm -rf ${d,,}", "mv ${HOME/x/y} /tmp/h", "d=.GIT; mv ${d,,} /tmp/g", "v=PWD; chmod -R 000 ${!v}", "d=HOME; d=y true; rm -rf ${!d}",
@@ -245,6 +276,16 @@ func TestOtherDestroyers(t *testing.T) {
 		"f() { mv \"$@\"; }; f .$git /tmp/g", "f() { mv \"$1\" /tmp/g; }; f .$git", "d=.; f() { rm -rf \"$1\"; }; f $d$X",
 		"set -- /; rm -rf \"$1\"", "sh -c 'rm -rf \"$1\"' sh /", "bash -c 'rm -rf \"$0\"' ~", "bash -c 'mv \"$@\"' _ .git /tmp/g", "f() { \"$@\"; }; f rm -rf /",
 		"function g { chmod -R 000 $1; }; g .", "f() { shift; rm -rf \"$1\"; }; f x ~", "set -- . /tmp/x; mv \"$@\"", "f() { git -C \"$1\" clean -fdx; }; f ..",
+		// A brace that nothing closes is a character like any, and leaves
+		// the first word alone (oracle seed 117).
+		"f() { mv \"$@\"{; }; f .git /tmp/g", "set -- .git /tmp/g; mv \"$@\"{", "f() { rm -rf x{ \"$@\"; }; f .",
+		// Braces beside a variable: bash takes them apart before it fills
+		// the variable in, and dash leaves them as characters.
+		"f() { mv \"$@\"{,x}; }; f .git /tmp/g", "sh -c 'mv \"$@\"{,x}' sh .git /tmp/g", "set -- .git /tmp/g; mv \"$@\"{,.bak}",
+		// Braces beside a ${name}, and the positional parameters in braces
+		// (the second review of 16 November).
+		"rm -rf ${HOME}{,.old}", "rm -rf {${HOME},x}", "x=.git; mv ${x}{,.bak}", "f() { mv \"${1}\"{,x}; }; f .git", "f() { mv \"$1\"{,\\x}; }; f .git",
+		"f() { mv \"${1}\" /tmp/g; }; f .git", "set -- .git; mv \"${1}\" /tmp/g", "f() { rm -rf \"${@}\"; }; f .", "f() { mv \"${1:-x}\" /tmp/g; }; f .git",
 		// The program is one of more values than gnosh follows.
 		"for t in a b c d e f g h i j k l m n o p q r; do $t x; done",
 	}
@@ -258,6 +299,9 @@ func TestOtherDestroyers(t *testing.T) {
 		}
 	}
 	ordinary := []string{
+		// $'...' as models write it: dash's reading of it holds nothing
+		// that destroys.
+		"grep -c $'\\t' a.txt", "rm $'old file.txt'", "printf $'%s\\n' a b", "IFS=$'\\n'; for f in a b; do echo $f; done",
 		"mv a.txt b.txt", "mv build/out dist/", "mv *.log logs/", "mv src/a.go src/b.go", "mv x ~/", "mv x .", "mv -t build a.txt b.txt",
 		"mv \"$tmp\" out.txt", "mv \"$f\" \"$f.bak\"", "mv vendor/x/.git /tmp/g", "mv -T /tmp/new build", "mv -f a b", "mv src/* dst/",
 		"mv $tmp $dest", "mv -n a.txt ~/Documents/", "mv {a.txt,b.txt}", "mv logs/*.log", "chmod -R {755,build}",
@@ -296,6 +340,7 @@ func TestOtherDestroyers(t *testing.T) {
 		"alias ll='ls -l'\nll src", "hash -r; ls src", "hash -p /usr/local/bin/mytool mytool; mytool build", "a=(make -j4); \"${a[@]}\"", "args=(-la src); ls \"${args[@]}\"", "a=(mv a.txt b.txt); \"${a[@]}\"",
 		"find . -type f | xargs chmod 644", "ls *.log | xargs gzip", "find . -name '*.sh' | xargs chmod +x", "git ls-files | xargs wc -l",
 		"echo $[1+1]; mv build dist", "select x in a b; do mv $x build/; done", "coproc mv a.txt b.txt", "chmod --reference=a.txt b.txt",
+		"coproc kill; mv a.txt b.txt 2>&1", "coproc kill; { mv a.txt b.txt; }", "coproc kill; x=$(mv a.txt b.txt)", "coproc kill; while true; do mv a.txt b.txt; break; done",
 		"mv --backup=numbered a.txt b.txt", "mv --suffix=.bak -b a.txt b.txt", "mv a.txt b.txt {fd}>log", "declare -n ref=out; ref=build; echo $out",
 		"for t in go node python3; do $t --version; done", "rm -f$v build/out.o", "git -C \"$dir\" $sub", "f() { rm -rf \"$1\"; }; f build", "f() { echo \"$@\"; }; f . / ~", "f() { git \"$@\"; }; f status; f diff", "f() { mv $1 $2; }; f a.txt b.txt", "f() { git $1 $2 $3; }; f commit -m x", "f() { chmod -R $1 $2; }; f 755 build", "f() { git \"$@\"; }; f status; f log -x", "sh -c 'echo \"$@\"' sh rm -rf /", "sh -c 'echo \"$1\"' sh .",
 		"set -euo pipefail; rm -rf \"$1\"", "clean() { rm -rf \"$1\"; }; clean build; clean dist", "f() { mv \"$@\"; }; f a.txt b.txt", "chmod -R$v u+w build", "rm -rf $X-backup", "rm -rf \"$DIR\"-old", "rm -rf ${PREFIX}/lib/app", "rm -rf \"$HOME/.cache/app-$V\"",
@@ -383,5 +428,18 @@ func TestWhatTheRemovalCheckLetsGo(t *testing.T) {
 		if d := bash(e, cmd); d.Behavior != Allow {
 			t.Errorf("%q with permissions skipped: got %s critical=%v (%s); the record says it is let go", cmd, d.Behavior, d.Critical, d.Reason)
 		}
+	}
+}
+
+// rawCommands cuts at what ends a command outside quotes and nesting, and
+// not inside a redirection.
+func TestRawCommands(t *testing.T) {
+	got := rawCommands("a <(b; c) | d 2>&1 &>x >|y; e \"f;g\" && h ${x;y} `i;j`\nk")
+	want := []string{"a <(b; c)", "d 2>&1 &>x >|y", "e \"f;g\"", "h ${x;y} `i;j`", "k"}
+	if !slices.Equal(got, want) {
+		t.Errorf("rawCommands: got %q, want %q", got, want)
+	}
+	if got, want := nameTails("do x=$(mv <(date) 0) 'git' clean"), []string{"mv <(date) 0", "'git' clean"}; !slices.Equal(got, want) {
+		t.Errorf("nameTails: got %q, want %q", got, want)
 	}
 }

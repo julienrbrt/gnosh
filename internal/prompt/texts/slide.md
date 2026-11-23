@@ -1,1 +1,1 @@
-[[The start of `{{frame}}`]][[Your rounds before `{{before}}`]] left your context to make room; mem.Show("{{show}}") has the plan, the results so far and the thoughts. Your reads there are forgotten: read a file again before you edit it.
+[[The start of `{{frame}}`]][[Your rounds before `{{before}}`]] left your context to make room[[ (there you edited {{files}}, which is done)]]; mem.Show("{{show}}") has the plan, the results so far and the thoughts. Your reads there are forgotten: read a file again before you edit it.

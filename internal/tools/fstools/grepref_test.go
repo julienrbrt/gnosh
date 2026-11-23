@@ -185,7 +185,8 @@ func refGrep(t *testing.T, root string, files []refFile, q refQuery) string {
 	}
 	re := regexp.MustCompile(expr)
 
-	// The files in the order Grep lists them: newest first, then by path.
+	// The files in the order Grep lists them: files with a match newest
+	// first, then by path; lines and counts by path alone.
 	var searched []refFile
 	for _, f := range files {
 		if q.glob == "" || strings.HasSuffix(f.name, strings.TrimPrefix(q.glob, "*")) {
@@ -193,7 +194,7 @@ func refGrep(t *testing.T, root string, files []refFile, q refQuery) string {
 		}
 	}
 	sort.SliceStable(searched, func(i, j int) bool {
-		if searched[i].seconds != searched[j].seconds {
+		if q.mode == "files_with_matches" && searched[i].seconds != searched[j].seconds {
 			return searched[i].seconds > searched[j].seconds
 		}
 		return searched[i].path < searched[j].path

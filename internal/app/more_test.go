@@ -32,7 +32,7 @@ func TestContextAndRename(t *testing.T) {
 	s.see("The model's window is 100.0K tokens")
 	s.see("In use at the last count: about ")
 	s.see("gnosh's instructions to the model")
-	s.see("what the model is told of its 14 tools")
+	s.see("what the model is told of its 20 tools")
 	s.see("the conversation")
 	s.see("/context all lists each tool and each instruction file.")
 	s.typeLine("/context all")
@@ -58,15 +58,36 @@ func TestContextAndRename(t *testing.T) {
 	has(t, "what the model was sent on resuming by name", string(reqs[len(reqs)-1].Body), "why is the test flaky?", "go on")
 }
 
+// Words that are no id and no name find the session whose name or first
+// prompt has them all, in any case, among every session of the folder (as
+// Claude Code's /resume search); words more than one session has name
+// those, and words none has say so.
+func TestResumeByWords(t *testing.T) {
+	w := apptest.NewWorld(t, apptest.Reply{Text: "One."}, apptest.Reply{Text: "Two."}, apptest.Reply{Text: "Three."})
+	run(t, w, "-p", "fix the flaky timer test").wantCode(t, 0)
+	run(t, w, "-p", "write the release notes for the timer").wantCode(t, 0)
+	run(t, w, "-p", "something else entirely").wantCode(t, 0)
+	w.Model.Add(apptest.Reply{Text: "Back to the flaky one."})
+	run(t, w, "-r", "FLAKY timer", "-p", "go on").wantCode(t, 0)
+	reqs := w.Model.Requests()
+	has(t, "resumed by words", string(reqs[len(reqs)-1].Body), "fix the flaky timer test", "go on")
+	r := run(t, w, "-r", "timer", "-p", "go on").wantCode(t, 1)
+	has(t, "words two sessions have", r.err, `2 sessions have "timer" in their name or first prompt`, "Resume one by its id")
+	r = run(t, w, "-r", "no such words", "-p", "go on").wantCode(t, 1)
+	has(t, "words no session has", r.err, "nor those words in its name or first prompt")
+}
+
 // /resume lists the folder's other sessions and opens one in place of the
-// session that is open, which is kept.
+// session that is open, which is kept. /resume N opens the Nth of the list
+// as it was shown, though a session beside it was written to since (it
+// listed them again, and opened that one).
 func TestResumeInsideASession(t *testing.T) {
 	w := apptest.NewWorld(t, apptest.Reply{Text: "The earlier answer."})
 	run(t, w, "-p", "the earlier session's prompt").wantCode(t, 0)
 	earlier := w.Sessions()[0]
 	id := strings.TrimSuffix(earlier[strings.LastIndex(earlier, "/")+1:], ".jsonl")
 
-	w.Model.Add(apptest.Reply{Text: "A new answer."}, apptest.Reply{Text: "Back in the earlier session."})
+	w.Model.Add(apptest.Reply{Text: "A new answer."}, apptest.Reply{Text: "A third answer."}, apptest.Reply{Text: "Back in the earlier session."})
 	s := sit(t, w)
 	s.see("Type a prompt and Enter.")
 	s.typeLine("a new session's prompt")
@@ -78,6 +99,8 @@ func TestResumeInsideASession(t *testing.T) {
 	s.see("the earlier session's prompt")
 	s.typeLine("/resume 7")
 	s.see("error: ")
+	// A session beside this one is written to: it comes first now.
+	run(t, w, "-p", "a third session's prompt").wantCode(t, 0)
 	s.typeLine("/resume 1")
 	s.see("Session " + id + " is open: the earlier session's prompt. The one before is kept; gnosh -r ")
 	s.typeLine("where were we?")
@@ -90,8 +113,8 @@ func TestResumeInsideASession(t *testing.T) {
 	if code := s.exit(); code != 0 {
 		t.Errorf("exit code %d", code)
 	}
-	if n := len(w.Sessions()); n != 2 {
-		t.Errorf("%d session files, want the two", n)
+	if n := len(w.Sessions()); n != 3 {
+		t.Errorf("%d session files, want the three", n)
 	}
 	for _, path := range w.Sessions() {
 		checkSession(t, w, path)
@@ -152,10 +175,8 @@ func TestBtwSideQuestion(t *testing.T) {
 	run(t, w, "-p", "remember the number seven").wantCode(t, 0)
 	w.Model.Add(apptest.Reply{Text: "It was seven.\n\nNothing else was said."})
 	r := run(t, w, "-c", "-p", "/btw which number was it?").wantCode(t, 0)
-	has(t, "the answer", r.out, "It was seven.", "Nothing else was said.")
-	if strings.Contains(r.out, "\n\n") {
-		t.Errorf("the answer kept an empty line: %q", r.out)
-	}
+	// (Its blank line stays: Jae put them back on 2026-11-19.)
+	has(t, "the answer", r.out, "It was seven.\n\nNothing else was said.")
 	reqs := w.Model.Requests()
 	sent := string(reqs[len(reqs)-1].Body)
 	has(t, "the side question's request", sent, "remember the number seven", "Noted: seven.", "which number was it?", "side question", `"name":"Bash"`)
@@ -174,6 +195,34 @@ func TestBtwSideQuestion(t *testing.T) {
 	has(t, "the recap request", string(reqs[len(reqs)-1].Body), "remember the number seven", "In one line")
 	data, _ = os.ReadFile(w.Sessions()[0])
 	hasNot(t, "the session's file after /recap", string(data), "In one line", "I did.")
+}
+
+// /btw asked while a command runs says the command still runs: the
+// session's own log gives a call with no result yet one that says it was
+// interrupted, and the side question was sent that (the side-request
+// review of 2026-11-19).
+func TestBtwWhileACommandRuns(t *testing.T) {
+	w := apptest.NewWorld(t,
+		apptest.Reply{Calls: []apptest.Call{{ID: "c1", Name: "Bash", Args: `{"command":"sleep 4"}`}}},
+		apptest.Reply{Text: "It is still sleeping."},
+		apptest.Reply{Text: "Slept."},
+	)
+	s := sit(t, w, "-y")
+	s.see("Type a prompt and Enter.")
+	s.typeLine("run the slow thing")
+	s.see("sleep 4")
+	s.typeLine("/btw what is it doing?")
+	s.see("It is still sleeping.")
+	s.see("Slept.")
+	s.typeLine("/exit")
+	s.exit()
+	reqs := w.Model.Requests()
+	if len(reqs) < 2 {
+		t.Fatalf("the model was asked %d times", len(reqs))
+	}
+	side := string(reqs[1].Body)
+	has(t, "the side question", side, "Still running: nobody interrupted this call", "what is it doing?")
+	hasNot(t, "the side question", side, "interrupted before it finished")
 }
 
 // /recap with no conversation yet says so, and asks no model.
@@ -385,6 +434,91 @@ func TestModelSwitchAndDirectoryHooks(t *testing.T) {
 	s.exit()
 }
 
+// PreModelSwitch runs before /model switches the model, with the models
+// and the conversation's size: a refusal (exit 2) keeps the model and
+// says why, and "ask" puts the switch to the person, whose yes makes it.
+func TestPreModelSwitchHook(t *testing.T) {
+	w := apptest.NewWorld(t, apptest.Reply{Text: "Noted."})
+	log := w.Home + "/hook-log"
+	once := w.Home + "/refused-once"
+	pre := w.Script(w.Home+"/hooks/pre.sh", "cat >> "+log+"\necho >> "+log+"\n"+
+		"if [ ! -e "+once+" ]; then touch "+once+"; echo 'not before the release' >&2; exit 2; fi\n"+
+		`echo '{"hookSpecificOutput": {"hookEventName": "PreModelSwitch", "permissionDecision": "ask", "permissionDecisionReason": "the switch sends the whole conversation again"}}'`)
+	post := w.Script(w.Home+"/hooks/post.sh", "cat >> "+log+"\necho >> "+log)
+	w.Settings(`{"hooks": {"PreModelSwitch": [{"matcher": "test-model", "hooks": [{"type": "command", "command": "` + pre + `"}]}],
+		"PostModelSwitch": [{"hooks": [{"type": "command", "command": "` + post + `"}]}]}}`)
+	s := sit(t, w)
+	s.see("Type a prompt and Enter.")
+	s.typeLine("/model local/test-model")
+	s.see("refused the switch to local/test-model. not before the release")
+	if data, _ := os.ReadFile(log); strings.Contains(string(data), "PostModelSwitch") {
+		t.Fatalf("a refused switch ran the PostModelSwitch hooks:\n%s", data)
+	}
+	// (The answer is typed once the question is open: the hook's record,
+	// which says the same words, comes first, and a line typed before the
+	// question is not taken for its answer.)
+	s.typeLine("/model local/test-model")
+	s.see("? Switch the model to local/test-model? A PreModelSwitch hook asks.")
+	s.see("Type a number and Enter.")
+	s.typeLine("2")
+	s.see("the model was not changed")
+	s.typeLine("/model local/test-model")
+	s.see("? Switch the model to local/test-model? A PreModelSwitch hook asks.")
+	s.see("Type a number and Enter.")
+	s.typeLine("1")
+	s.see("The model is local/test-model")
+	data, _ := os.ReadFile(log)
+	has(t, "what the hooks read", string(data), `"hook_event_name":"PreModelSwitch"`, `"to_model":"local/test-model"`,
+		`"requested_model":"local/test-model"`, `"source":"command"`, `"context_tokens":`, `"hook_event_name":"PostModelSwitch"`)
+	if n := strings.Count(string(data), `"hook_event_name":"PostModelSwitch"`); n != 1 {
+		t.Fatalf("PostModelSwitch ran %d times for one switch made:\n%s", n, data)
+	}
+	s.typeLine("/exit")
+	s.exit()
+}
+
+// PostToolBatch runs once after all of a reply's tool calls, told every
+// call and what it returned: what it adds reaches the model with the next
+// request, and a block ends the turn there, its reason kept for the model.
+func TestPostToolBatchHook(t *testing.T) {
+	w := apptest.NewWorld(t,
+		apptest.Reply{Calls: []apptest.Call{{ID: "c1", Name: "Bash", Args: `{"command":"echo one"}`}, {ID: "c2", Name: "Bash", Args: `{"command":"echo two"}`}}},
+		apptest.Reply{Calls: []apptest.Call{{ID: "c3", Name: "Bash", Args: `{"command":"echo three"}`}}},
+		apptest.Reply{Text: "Seen."},
+	)
+	log := w.Home + "/hook-log"
+	once := w.Home + "/once"
+	batch := w.Script(w.Home+"/hooks/batch.sh", "cat >> "+log+"\necho >> "+log+"\n"+
+		"if [ ! -e "+once+" ]; then touch "+once+"; echo '{\"hookSpecificOutput\": {\"hookEventName\": \"PostToolBatch\", \"additionalContext\": \"both echoes ran\"}}'; exit 0; fi\n"+
+		"echo 'stop here and report' >&2\nexit 2")
+	w.Settings(`{"hooks": {"PostToolBatch": [{"hooks": [{"type": "command", "command": "` + batch + `"}]}]}}`)
+	r := run(t, w, "-y", "-p", "go")
+	if n := len(w.Model.Requests()); n != 2 {
+		t.Fatalf("%d requests, want 2: the block comes before a third", n)
+	}
+	has(t, "the second request", string(w.Model.Requests()[1].Body), "both echoes ran")
+	has(t, "the run's output", r.err+r.out, "a PostToolBatch hook stopped the turn: stop here and report")
+	data, _ := os.ReadFile(log)
+	has(t, "what the hook read", string(data), `"hook_event_name":"PostToolBatch"`, `"tool_calls":[{"tool_input":{"command":"echo one"}`,
+		`{"tool_input":{"command":"echo two"}`, `\ntwo","tool_use_id":"call_`, `"tool_calls":[{"tool_input":{"command":"echo three"}`)
+	if n := strings.Count(string(data), `"hook_event_name":"PostToolBatch"`); n != 2 {
+		t.Errorf("the hook ran %d times for two batches", n)
+	}
+	// The reason stays in the conversation, for the model to read next.
+	run(t, w, "-c", "-p", "what stopped you?").wantCode(t, 0)
+	has(t, "the next turn's request", string(w.Model.Requests()[2].Body), "stop here and report")
+}
+
+// A PreModelSwitch hook's "ask" is a refusal in a run, where nobody can
+// answer, as in Claude Code.
+func TestPreModelSwitchAskInARun(t *testing.T) {
+	w := apptest.NewWorld(t)
+	pre := w.Script(w.Home+"/hooks/pre.sh", `cat > /dev/null; echo '{"hookSpecificOutput": {"hookEventName": "PreModelSwitch", "permissionDecision": "ask", "permissionDecisionReason": "costly"}}'`)
+	w.Settings(`{"hooks": {"PreModelSwitch": [{"hooks": [{"type": "command", "command": "` + pre + `"}]}]}}`)
+	r := run(t, w, "-p", "/model local/test-model")
+	has(t, "the run's output", r.out+r.err, "nobody is here to confirm it. costly")
+}
+
 // CwdChanged runs when a command leaves the shell in another directory:
 // it reads the old one and the new one, once per move, and an export it
 // writes to the environment file reaches the next command.
@@ -427,5 +561,71 @@ func TestUserPromptExpansionHook(t *testing.T) {
 	has(t, "stderr", r.err, "a UserPromptExpansion hook the user set up blocked it", "no deploys on Friday")
 	if len(w.Model.Requests()) != n {
 		t.Errorf("the model was asked although the hook blocked the expansion")
+	}
+}
+
+// A session's name keeps no escape sequence, control character or
+// character drawn as nothing, whatever it was made of (the
+// settings-commands review of 2026-11-20).
+func TestCleanTitle(t *testing.T) {
+	for in, want := range map[string]string{
+		"fix the  flaky\ttest":                "fix the flaky test",
+		"fix \x1b[31mthe\x1b[0m bug":          "fix the bug",
+		"title\x1b]0;owned\x07 here":          "title here",
+		"bell\x07 and \u0085next and \u009bx": "bell and next and x",
+		"right\u202eto left":                  "rightto left",
+	} {
+		if got := cleanTitle(in); got != want {
+			t.Errorf("cleanTitle(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// At most 200 characters, as Claude Code caps a name, counted as
+	// characters, not bytes.
+	if got := cleanTitle(strings.Repeat("é", 250)); got != strings.Repeat("é", 200) {
+		t.Errorf("a long name kept %d characters, want 200", len([]rune(got)))
+	}
+}
+
+// A name that is nothing once its invisible characters are taken out is
+// refused wherever a session is named, as Claude Code refuses it; a name
+// not given is no error.
+func TestInvisibleNameRefused(t *testing.T) {
+	if _, err := personsTitle("\u200b\u2060"); err == nil {
+		t.Errorf("an invisible name was taken")
+	}
+	if name, err := personsTitle("   "); err != nil || name != "" {
+		t.Errorf("no name given: %q, %v", name, err)
+	}
+	w := apptest.NewWorld(t)
+	r := run(t, w, "-p", "/rename \u200b\u200b")
+	has(t, "/rename of an invisible name", r.out+r.err, "that name is empty once its invisible characters are taken out")
+	r = run(t, w, "--name", "\u2060", "-p", "/status")
+	has(t, "--name of an invisible name", r.out+r.err, "--name: that name is empty")
+}
+
+// A PostToolUse hook's warning is said once: in the hook's own line with
+// the call, where it is whole there; a warning too long for that line is
+// said in full as well (seen on the devbox's screen: the same words above
+// the call and under it).
+func TestToolHookWarningSaidOnce(t *testing.T) {
+	w := apptest.NewWorld(t)
+	long := strings.Repeat("the lint found a long list of things to look at ", 6)
+	short := w.Script(w.Home+"/hooks/short.sh", `echo '{"systemMessage": "lint: 2 warnings"}'`)
+	lng := w.Script(w.Home+"/hooks/long.sh", `echo '{"systemMessage": "`+long+`"}'`)
+	w.Hook("PostToolUse", "Bash", short)
+	w.Hook("PostToolUse", "Bash", lng)
+	w.Model.Respond(func(n int, r apptest.Request) *apptest.Reply {
+		if !strings.Contains(string(r.Body), `"role":"tool"`) {
+			return &apptest.Reply{Calls: []apptest.Call{{ID: "c1", Name: "Bash", Args: `{"command":"true"}`}}}
+		}
+		return &apptest.Reply{Text: "Done."}
+	})
+	r := run(t, w, "-y", "-p", "go")
+	r.wantCode(t, 0)
+	if n := strings.Count(r.err, "lint: 2 warnings"); n != 1 {
+		t.Errorf("the short warning was said %d times:\n%s", n, r.err)
+	}
+	if n := strings.Count(r.err, strings.TrimSpace(long)); n != 1 {
+		t.Errorf("the long warning was said whole %d times:\n%s", n, r.err)
 	}
 }

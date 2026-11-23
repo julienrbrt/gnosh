@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -150,14 +152,17 @@ func (a *Agent) leaveBusy(release func()) {
 	a.setPhase(PhaseIdle, "")
 	a.emit(&IdleEvent{})
 	a.mu.Lock()
+	var recorded []Note
 	if a.closing || !a.workLocked() {
 		a.busy = false
 		if a.idle != nil {
 			close(a.idle)
 			a.idle = nil
 		}
+		recorded = a.takeRecordedLocked()
 	}
 	a.mu.Unlock()
+	a.writeRecorded(recorded)
 }
 
 // step does the next thing there is to do, and reports false when there is
@@ -244,6 +249,49 @@ func (a *Agent) Compact(instructions string) error {
 	return nil
 }
 
+// SummaryPart is a summary the person asks for of part of the
+// conversation, in place of one of all of it: the rewind's "Summarize up
+// to here" and "Summarize from here".
+type SummaryPart struct {
+	// Messages are what the model is sent ahead of the request: the part
+	// to summarize, or the whole conversation when Ask says which part.
+	Messages []core.Message
+	// Ask is the request for the summary, and Intro the line that stands
+	// before it where it is kept. Empty, they are the usual ones.
+	Ask, Intro string
+	// Covers names the session-file entry the summary stands in for, up to
+	// and including it: the summary is kept in the log, the view starts
+	// with it and goes on after that entry, and the event says "before".
+	// Empty, the summary is not kept: Done is given its text, and the
+	// event says "after".
+	Covers string
+	// Keep is the first of Messages a request too long for the model may
+	// not leave out: where the part to summarize begins. Zero lets any
+	// earlier part go, as a whole conversation's summary does.
+	Keep int
+	// Done, when set, is told the summary's text, or why none was made.
+	Done func(text string, err error)
+}
+
+// CompactPart asks for a summary of part of the conversation, with the
+// person's instructions for it. It runs when the turn in hand has ended,
+// as Compact does; how it went arrives as SummaryEvents, and in part.Done.
+func (a *Agent) CompactPart(instructions string, part SummaryPart) error {
+	if len(part.Messages) == 0 {
+		return errNothingToSummarize
+	}
+	a.mu.Lock()
+	if a.closing {
+		a.mu.Unlock()
+		return ErrClosed
+	}
+	a.commands = append(a.commands, &command{compact: true, instructions: instructions, part: &part})
+	a.markBusyLocked()
+	a.mu.Unlock()
+	a.kick()
+	return nil
+}
+
 // runCommand does one thing that is not a turn.
 func (a *Agent) runCommand(c *command) {
 	ctx, cancel := context.WithCancel(a.root)
@@ -265,13 +313,31 @@ func (a *Agent) runCommand(c *command) {
 	if !c.compact {
 		return
 	}
-	if err := a.settleOnce(); err != nil {
+	var err error
+	if c.part != nil && c.part.Done != nil {
+		// Done is told once, whatever happens: the summary tells it what
+		// it made, and anything else is told here.
+		told, done := false, c.part.Done
+		c.part.Done = func(text string, err error) {
+			told = true
+			done(text, err)
+		}
+		defer func() {
+			if !told {
+				if err == nil {
+					err = errors.New("no summary was made")
+				}
+				done("", err)
+			}
+		}()
+	}
+	if err = a.settleOnce(); err != nil {
 		a.notice(LevelError, "summary", fmt.Sprintf("No summary was made: %v.", err))
 		return
 	}
 	// A summary the person asks for by hand lets automatic ones run again.
 	a.summariesOff = false
-	err := a.summarize(ctx, nil, "manual", c.instructions)
+	err = a.summarize(ctx, nil, "manual", c.instructions, c.part)
 	switch {
 	case err == nil:
 	case ctx.Err() != nil:
@@ -344,6 +410,17 @@ func (a *Agent) admitLoop() {
 			if persisted {
 				_ = a.appendLog(Entry{Kind: EntryUnqueued, Prompt: s.id, Text: "taken back"})
 			}
+			a.emitQueue()
+		case !ok && s.note && why == ReturnStopped:
+			// A note that was to start a turn, stopped in its check (Esc
+			// as the session's start ran for it), is still a note: it goes
+			// with the next request, as Tell promises. It came back as a
+			// hidden prompt nobody shows, and was lost (the agent loop
+			// review of 2026-11-19).
+			a.mu.Lock()
+			a.notes = append(a.notes, Note{Text: s.prompt.Text, Source: s.prompt.Source, Notice: s.prompt.Notice})
+			a.mu.Unlock()
+			s.resolve(TurnResult{Prompts: []string{s.id}, Reason: EndWithdrawn, Detail: reason})
 		case !ok:
 			a.emit(&PromptReturnedEvent{ID: s.id, Prompt: s.prompt, Why: why, Reason: reason})
 			end := EndWithdrawn
@@ -351,6 +428,12 @@ func (a *Agent) admitLoop() {
 				end = EndRefused
 			}
 			s.resolve(TurnResult{Prompts: []string{s.id}, Reason: end, Detail: reason})
+			if why == ReturnRefused && s.prompt.Own && s.prompt.Source == "loop" {
+				// Its next prompt would be refused the same way: it sent
+				// one at once, again and again, until Esc (the agent loop
+				// review of 2026-11-19).
+				a.loopOff("its prompt was refused: " + reason)
+			}
 		case wait:
 			// It waits behind a turn or behind other prompts, and is
 			// shown as waiting.
@@ -366,6 +449,12 @@ func (a *Agent) admitLoop() {
 func (a *Agent) admit(ctx context.Context, s *submission) (bool, ReturnReason, string) {
 	const stopped = "the session was stopped while this prompt was being checked, so it was not sent"
 
+	a.mu.Lock()
+	halted := a.startHalt
+	a.mu.Unlock()
+	if halted != "" {
+		return false, ReturnRefused, halted
+	}
 	if f := a.opts.Moments.SessionStart; f != nil {
 		a.mu.Lock()
 		ran, empty, model := a.startRan, !a.sent, a.model.Info.ID
@@ -380,6 +469,16 @@ func (a *Agent) admit(ctx context.Context, s *submission) (bool, ReturnReason, s
 			})
 			if ctx.Err() != nil || !ok {
 				return false, ReturnStopped, stopped
+			}
+			var h *StopWork
+			if errors.As(err, &h) {
+				// The start said stop: this prompt and every one after it
+				// are refused, with its reason.
+				reason := firstNonEmpty(h.Reason, "the session's start stopped it")
+				a.mu.Lock()
+				a.startRan, a.startHalt = true, reason
+				a.mu.Unlock()
+				return false, ReturnRefused, reason
 			}
 			if err != nil {
 				a.notice(LevelWarning, "session-start", fmt.Sprintf(
@@ -521,7 +620,7 @@ func (a *Agent) settle() error {
 			Kind: EntryResult, ToolUseID: u.ID, ToolName: u.Name,
 			Result: core.ErrorResult(a.texts.Killed), Interrupted: true,
 		})
-		names = append(names, u.Name)
+		names = append(names, openCallName(u.Name, u.Input))
 	}
 	detail := ""
 	if live {
@@ -537,10 +636,18 @@ func (a *Agent) settle() error {
 		entries = append(entries, Entry{Kind: EntryTurn, Reason: EndInterrupted, Text: detail})
 	}
 	var back []Entry
-	for _, id := range order {
-		if e, ok := waiting[id]; ok {
-			back = append(back, e)
-			entries = append(entries, Entry{Kind: EntryUnqueued, Prompt: id, Text: "returned when the session was reopened"})
+	if !a.opened {
+		// (In a session this process opened, a prompt written down as
+		// queued and not sent is still in its line, or in the turn that is
+		// starting: only a process that died leaves one behind. Returned
+		// here after a turn's end could not be written, it went out all
+		// the same, and twice once the person sent it again (the agent
+		// loop review of 2026-11-19).)
+		for _, id := range order {
+			if e, ok := waiting[id]; ok {
+				back = append(back, e)
+				entries = append(entries, Entry{Kind: EntryUnqueued, Prompt: id, Text: "returned when the session was reopened"})
+			}
 		}
 	}
 	if err := a.appendLog(entries...); err != nil {
@@ -571,8 +678,27 @@ func (a *Agent) settle() error {
 		})
 	}
 
+	// A prompt went out before when the log holds a reply, a prompt, a
+	// turn's end or a summary. Notes alone, written between turns (Record),
+	// are not one: the first prompt still carries what a first prompt does.
+	before := false
+	for _, m := range v.Messages {
+		if m.Role == core.RoleAssistant {
+			before = true
+			break
+		}
+	}
+	for _, e := range tail {
+		if before {
+			break
+		}
+		switch e.Kind {
+		case EntryPrompt, EntryAssistant, EntryTurn, EntrySummary:
+			before = true
+		}
+	}
 	a.mu.Lock()
-	a.sent = a.sent || len(v.Messages) > 0
+	a.sent = a.sent || before
 	a.mu.Unlock()
 	a.settled = true
 	return nil
@@ -589,4 +715,27 @@ func promptOf(e Entry) Prompt {
 		p.Attachments = append(p.Attachments, b)
 	}
 	return p
+}
+
+// openCallName names a call left without a result for the person: the
+// tool, and what it was about where its arguments say (the file, the
+// command's first line, the address), cut short. "Write" alone, in the
+// note a resumed session shows, said nothing of which file (seen on the
+// devbox's screen).
+func openCallName(name string, input json.RawMessage) string {
+	var args map[string]any
+	if json.Unmarshal(input, &args) != nil {
+		return name
+	}
+	for _, key := range []string{"file_path", "notebook_path", "command", "url", "pattern", "description", "query", "skill"} {
+		v, _ := args[key].(string)
+		if v = strings.TrimSpace(strings.SplitN(strings.TrimSpace(v), "\n", 2)[0]); v == "" {
+			continue
+		}
+		if r := []rune(v); len(r) > 60 {
+			v = string(r[:57]) + "..."
+		}
+		return name + " (" + v + ")"
+	}
+	return name
 }

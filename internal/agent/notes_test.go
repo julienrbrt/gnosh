@@ -266,6 +266,115 @@ func TestTell(t *testing.T) {
 	r.checkLog()
 }
 
+// Record puts a note in the conversation without starting a turn. In an
+// idle session it is written to the log at once, between turns, so it
+// stands before the next prompt (and is there for a session opened
+// again); while a turn runs it goes out with the next request, as Tell's
+// do.
+func TestRecord(t *testing.T) {
+	bash, started, letGo := heldTool("Bash")
+	r := newRig(t, func(o *Options) { o.Tools = []core.Tool{bash} })
+
+	// Idle: in the log at once, before the prompt that follows.
+	if err := r.a.Record(Note{Text: "<note>$ make\nok</note>", Source: "shell", Notice: "The command is in the conversation."}); err != nil {
+		t.Fatal(err)
+	}
+	if st := r.a.State(); st.Busy || st.Notes != 0 || r.model.count() != 0 {
+		t.Fatalf("a recorded note started something or waits: %+v, %d requests", st, r.model.count())
+	}
+	r.idle()
+	stored := r.log.of(EntryNote)
+	if len(stored) != 1 || stored[0].Source != "shell" || stored[0].Turn != "" {
+		t.Fatalf("note entries = %+v", stored)
+	}
+	if n := eventsOf[*NoteEvent](r.rec); len(n) != 1 || n[0].Note.Source != "shell" {
+		t.Errorf("note events = %+v", n)
+	}
+	if n := notices(r.rec, LevelInfo); len(n) != 1 || n[0] != "The command is in the conversation." {
+		t.Errorf("the quiet line = %v", n)
+	}
+	r.model.push(say("it built"))
+	r.run("did it build?")
+	if got, want := userBlocks(r.model.requests()[0]), []string{"<note>$ make\nok</note>", "did it build?"}; !slices.Equal(got, want) {
+		t.Errorf("the model was sent %q, want %q", got, want)
+	}
+
+	// Busy: it waits for the turn's next request.
+	r.model.push(use(tc("b", "Bash", `{}`)), say("seen"))
+	done := make(chan TurnResult, 1)
+	go func() { done <- r.run("build it") }()
+	<-started
+	if err := r.a.Record(Note{Text: "<note>$ ls\na.go</note>", Source: "shell"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := r.a.State().Notes; n != 1 {
+		t.Errorf("%d notes wait", n)
+	}
+	letGo()
+	if res := <-done; res.Reason != EndCompleted {
+		t.Fatalf("result = %+v", res)
+	}
+	r.idle()
+	if got, want := userBlocks(r.model.requests()[2]), []string{"result:b", "<note>$ ls\na.go</note>"}; !slices.Equal(got, want) {
+		t.Errorf("the model was sent %q, want %q", got, want)
+	}
+	if err := r.a.Record(Note{Text: " "}); !errors.Is(err, ErrBlank) {
+		t.Errorf("an empty note: %v", err)
+	}
+	r.checkLog()
+}
+
+// A note recorded while a turn writes its last reply, which no request of
+// that turn takes, is written to the log as the turn ends, between turns:
+// before the next prompt, and kept when the session ends before one.
+func TestRecordWhileTheLastReplyIsWritten(t *testing.T) {
+	r := newRig(t, nil)
+	reached, release := make(chan struct{}), make(chan struct{})
+	last := say("all done")
+	last.at, last.wait = once(reached), release
+	r.model.push(last)
+	done := make(chan TurnResult, 1)
+	go func() { done <- r.run("finish up") }()
+	<-reached
+	if err := r.a.Record(Note{Text: "<note>$ late\nok</note>", Source: "shell"}); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if res := <-done; res.Reason != EndCompleted {
+		t.Fatalf("result = %+v", res)
+	}
+	r.idle()
+	stored := r.log.of(EntryNote)
+	if len(stored) != 1 || stored[0].Turn != "" || r.a.State().Notes != 0 {
+		t.Fatalf("note entries = %+v, %d waiting", stored, r.a.State().Notes)
+	}
+	r.model.push(say("it printed ok"))
+	r.run("what did it print?")
+	if got, want := userBlocks(r.model.requests()[1]), []string{"<note>$ late\nok</note>", "what did it print?"}; !slices.Equal(got[len(got)-2:], want) {
+		t.Errorf("the model was sent %q, ending with %q", got, want)
+	}
+
+	// Recorded during a turn that the session's end stops: in the log.
+	r2 := newRig(t, nil)
+	reached2 := make(chan struct{})
+	r2.model.push(step{at: once(reached2), stall: true})
+	go func() { _ = r2.run("long work") }()
+	<-reached2
+	if err := r2.a.Record(Note{Text: "<note>$ kept\nok</note>", Source: "shell"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r2.a.End("prompt_input_exit"); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range r2.log.of(EntryNote) {
+		found = found || slices.ContainsFunc(e.Blocks, func(b core.Block) bool { return strings.Contains(b.Text, "$ kept") })
+	}
+	if !found {
+		t.Errorf("the note recorded before the end was lost: %+v", r2.log.of(EntryNote))
+	}
+}
+
 // A note that is to wake the session starts a turn in an idle one. When
 // the person stops that turn before the note went out, the note is kept
 // and waits like any other.

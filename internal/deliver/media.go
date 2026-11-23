@@ -95,3 +95,13 @@ func mediaType(name string) string {
 	}
 	return mediaOther
 }
+
+// scripted reports whether a browser runs scripts in a file of this name
+// when it shows it: a page, a picture drawn in SVG, an XML document.
+func scripted(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".html", ".htm", ".xhtml", ".svg", ".svgz", ".xml", ".xsl":
+		return true
+	}
+	return false
+}

@@ -1,0 +1,1 @@
+Write the prompt the user would most likely send next, as they would type it: a few words, at most fifteen, on one line, and nothing else. If no next step is clear, write nothing. Call no tool and start on nothing: the line is shown to the user to take or leave, and it is not kept in the conversation.

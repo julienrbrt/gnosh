@@ -58,9 +58,7 @@ func (t *tableLeaf) clone() *tableLeaf {
 // the cell's text. The pipes at the two ends of the row are optional.
 func splitRow(line string) []string {
 	line = strings.TrimSpace(line)
-	if strings.HasPrefix(line, "|") {
-		line = line[1:]
-	}
+	line = strings.TrimPrefix(line, "|")
 	var cells []string
 	var cur strings.Builder
 	closed := false // the row ended with a pipe

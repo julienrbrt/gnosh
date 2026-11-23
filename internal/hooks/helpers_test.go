@@ -178,7 +178,7 @@ func input(event Event) Input {
 		in.LoadReason = "session_start"
 	case Notification:
 		in.NotificationType = "idle_prompt"
-	case PostModelSwitch:
+	case PreModelSwitch, PostModelSwitch:
 		in.FromModel, in.ToModel, in.RequestedModel, in.Source = "local/a", "local/b", "local/b", "command"
 	case DirectoryAdded:
 		in.Directory, in.Source = "/project/docs", "slash_command"
@@ -186,9 +186,19 @@ func input(event Event) Input {
 		in.OldCwd, in.NewCwd = "/project", "/project/sub"
 	case UserPromptExpansion:
 		in.ExpansionType, in.CommandName, in.CommandArgs, in.CommandSource, in.Prompt = "slash_command", "deploy", "staging", "project", "Deploy to staging."
+	case ConfigChange:
+		in.Source, in.FilePath = "project_settings", "/project/gnosh.json"
+	case FileChanged:
+		in.FilePath, in.FileEvent = "/project/.envrc", "change"
 	case SubagentStart, SubagentStop:
 		in.AgentID = "agent-1"
 		in.AgentType = "Explore"
+	case Elicitation:
+		in.MCPServerName, in.Message, in.Mode = "issue-tracker", "Which project?", "form"
+		in.RequestedSchema = json.RawMessage(`{"type":"object","properties":{"project_key":{"type":"string","title":"Project key"}},"required":["project_key"]}`)
+	case ElicitationResult:
+		in.MCPServerName, in.Action, in.Mode = "issue-tracker", "accept", "form"
+		in.Content = json.RawMessage(`{"project_key":"WEB"}`)
 	}
 	return in
 }

@@ -199,3 +199,71 @@ func anyRequestHas(w *apptest.World, text string) bool {
 	}
 	return false
 }
+
+// /tasks lists the sub-agents of the session that have ended, as Claude
+// Code's does under "Earlier in this session".
+func TestTasksListsEndedSubAgents(t *testing.T) {
+	w := apptest.NewWorld(t)
+	w.Model.Respond(func(n int, r apptest.Request) *apptest.Reply {
+		body := string(r.Body)
+		switch {
+		case strings.Contains(body, "You are a sub-agent inside gnosh"):
+			return &apptest.Reply{Text: "There are 3 apples."}
+		case strings.Contains(body, `"role":"tool"`):
+			return &apptest.Reply{Text: "Counted."}
+		}
+		return &apptest.Reply{Calls: []apptest.Call{{ID: "c1", Name: "Agent", Args: `{"description":"count apples","prompt":"count the apples"}`}}}
+	})
+	s := sit(t, w)
+	s.see("Type a prompt and Enter.")
+	s.typeLine("count")
+	s.see("Counted.")
+	s.typeLine("/tasks")
+	s.see("Earlier in this session:")
+	s.see("sub-agent (general-purpose), done: ")
+	s.see("more to do (SendMessage to its id)")
+	s.typeLine("/exit")
+	s.exit()
+}
+
+// The sub-agents in the background stopped (Ctrl+X Ctrl+K) while one is
+// being taken up again: it is not started, as Claude Code 2.1.329 fixed
+// for its own, and SendMessage says so; it was not yet among those that
+// were stopped.
+func TestSendMessageStoppedWhileItIsMade(t *testing.T) {
+	old := whileSubIsMade
+	// (Through the control the interface's Ctrl+X Ctrl+K calls, which
+	// with no sub-agent listed yet still stops the one being made.)
+	whileSubIsMade = func(l *live) { (&controls{l: l}).StopBackgroundAgents() }
+	defer func() { whileSubIsMade = old }()
+	w := apptest.NewWorld(t)
+	idRe := regexp.MustCompile(`\[agent id: ([0-9a-f-]+)\]`)
+	sent, resumed := false, false
+	w.Model.Respond(func(n int, r apptest.Request) *apptest.Reply {
+		body := string(r.Body)
+		if strings.Contains(body, "You are a sub-agent inside gnosh") {
+			if strings.Contains(body, "now count the oranges") {
+				resumed = true
+			}
+			return &apptest.Reply{Text: "There are 3 apples."}
+		}
+		switch m := idRe.FindStringSubmatch(body); {
+		case m != nil && !sent:
+			sent = true
+			return &apptest.Reply{Calls: []apptest.Call{{ID: "c2", Name: "SendMessage", Args: fmt.Sprintf(`{"to":%q,"message":"now count the oranges","summary":"count the oranges"}`, m[1])}}}
+		case strings.Contains(body, `"role":"tool"`):
+			return &apptest.Reply{Text: "Stopped, then."}
+		}
+		return &apptest.Reply{Calls: []apptest.Call{{ID: "c1", Name: "Agent", Args: `{"description":"count apples","prompt":"count the apples"}`}}}
+	})
+	run(t, w, "-p", "count").wantCode(t, 0)
+	if !sent {
+		t.Fatal("no SendMessage was sent")
+	}
+	if !anyRequestHas(w, "The sub-agent was not started: the sub-agents in the background were stopped while it was being made ready.") {
+		t.Errorf("SendMessage did not say the sub-agent was not started")
+	}
+	if resumed {
+		t.Errorf("the sub-agent ran on after the background sub-agents were stopped")
+	}
+}

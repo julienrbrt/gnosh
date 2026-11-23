@@ -18,3 +18,10 @@ func hardLinked(p string) bool {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	return ok && st.Nlink > 1
 }
+
+// writable reports whether the person may write the file at p, as the
+// Write tool asks before changing one.
+func writable(p string) bool {
+	const writeAccess = 0x2 // W_OK
+	return syscall.Access(p, writeAccess) == nil
+}

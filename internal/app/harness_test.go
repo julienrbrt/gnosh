@@ -46,14 +46,19 @@ func (s *safeBuffer) String() string {
 // environment and folder, nothing typed, and waits short enough for a
 // test.
 func testOptions(w *apptest.World, args ...string) Options {
+	// (A test types an answer as soon as its question shows, which the
+	// plain front end would take for one typed before the question:
+	// TestPlainAnswerTypedBeforeTheQuestion keeps gnosh's own wait.)
+	noWait := time.Duration(0)
 	return Options{
-		Args:      args,
-		Stdin:     strings.NewReader(""),
-		Environ:   w.Env(),
-		Cwd:       w.Dir,
-		Build:     cli.Build{Commit: "0123456789ab", Time: time.Date(2026, 11, 13, 0, 0, 0, 0, time.UTC)},
-		BuildID:   "test-build",
-		StdinWait: 50 * time.Millisecond,
+		AnswerWait: &noWait,
+		Args:       args,
+		Stdin:      strings.NewReader(""),
+		Environ:    w.Env(),
+		Cwd:        w.Dir,
+		Build:      cli.Build{Commit: "0123456789ab", Time: time.Date(2026, 11, 13, 0, 0, 0, 0, time.UTC)},
+		BuildID:    "test-build",
+		StdinWait:  50 * time.Millisecond,
 		// Long enough that a tool which finishes its work after a stop is
 		// never given up on because the machine is busy.
 		StopGrace: 20 * time.Second,

@@ -96,6 +96,24 @@ type Hook struct {
 	// is read as a command hook's stdout is (Options.MCP calls it).
 	Server, Tool string
 	Input        json.RawMessage
+
+	// Prompt, when it is set, makes the hook a question to the model
+	// (Claude Code's "type": "prompt"): a rule or a condition, in which
+	// $ARGUMENTS stands for the event as JSON (with no $ARGUMENTS the
+	// event follows it), answered with {"ok": ..., "reason": ...}
+	// (prompthook.go). Model names the model it would ask, which gnosh
+	// does not pick per hook: it asks the model the session asks its own
+	// side questions. ContinueOnBlock makes an "ok": false on PreToolUse
+	// and PostToolUse a reason for the model rather than the turn's end.
+	Prompt          string
+	Model           string
+	ContinueOnBlock bool
+	// Agent makes the hook an agent hook (Claude Code's "type": "agent"):
+	// Prompt is then a task for a sub-agent that looks with its tools
+	// before it answers as a prompt hook's model does (agenthook.go in the
+	// app). Its "ok": false is read as a prompt hook's with
+	// ContinueOnBlock, and "impossible" is not read.
+	Agent bool
 }
 
 // label is the hook's name in a sentence: the name it was given, or its
@@ -112,7 +130,13 @@ func (h Hook) label() string {
 // argument quoted where a shell would need it.
 func (h Hook) CommandLine() string {
 	if h.URL != "" {
-		return "POST " + h.URL
+		return "POST " + ShownURL(h.URL)
+	}
+	if h.Prompt != "" && h.Agent {
+		return "agent: " + shorten(h.Prompt, 80)
+	}
+	if h.Prompt != "" {
+		return "prompt: " + shorten(h.Prompt, 80)
 	}
 	if h.Server != "" {
 		return "mcp " + h.Server + "/" + h.Tool
@@ -160,6 +184,12 @@ type Spec struct {
 	// Server, Tool and Input make an MCP tool hook (see Hook).
 	Server, Tool string
 	Input        json.RawMessage
+	// Prompt, Model and ContinueOnBlock make a prompt hook, and Agent
+	// with Prompt and Model an agent hook (see Hook).
+	Prompt          string
+	Model           string
+	ContinueOnBlock bool
+	Agent           bool
 }
 
 // NewHook checks a hook that was read from a settings file by someone else
@@ -182,15 +212,19 @@ func NewHook(s Spec) (Hook, error) {
 
 		StatusMessage: s.StatusMessage,
 
-		URL:            s.URL,
-		Headers:        s.Headers,
-		AllowedEnvVars: s.AllowedEnvVars,
-		Server:         s.Server,
-		Tool:           s.Tool,
-		Input:          s.Input,
-		Source:         s.Source,
-		Global:         s.Global,
-		If:             strings.TrimSpace(s.If),
+		URL:             s.URL,
+		Headers:         s.Headers,
+		AllowedEnvVars:  s.AllowedEnvVars,
+		Server:          s.Server,
+		Tool:            s.Tool,
+		Input:           s.Input,
+		Prompt:          s.Prompt,
+		Model:           s.Model,
+		ContinueOnBlock: s.ContinueOnBlock,
+		Agent:           s.Agent,
+		Source:          s.Source,
+		Global:          s.Global,
+		If:              strings.TrimSpace(s.If),
 	}
 	if msgs := hookProblems(h); len(msgs) > 0 {
 		problems := make([]Problem, len(msgs))
@@ -244,6 +278,29 @@ func hookProblems(h Hook) []string {
 		msgs = append(msgs, eventProblem(string(h.Event)))
 	}
 	switch {
+	case h.Agent && h.Prompt == "":
+		msgs = append(msgs, "the agent hook has no \"prompt\": the task its sub-agent is given.")
+	case h.Agent:
+		if h.Command != "" || h.Args != nil || h.URL != "" || h.Server != "" || h.Tool != "" || h.Async || h.AsyncRewake {
+			msgs = append(msgs, "the hook is both an agent hook and a command, an address or an MCP tool; it is one of them.")
+		}
+		if h.ContinueOnBlock {
+			msgs = append(msgs, "an agent hook takes no \"continueOnBlock\": its \"ok\": false always goes back to the model, and the turn goes on.")
+		}
+		if known && (!promptEvents[h.Event] || h.Event == PermissionRequest) {
+			runs := "command, http and mcp_tool hooks"
+			if h.Event == PermissionRequest {
+				runs = "command, http, mcp_tool and prompt hooks"
+			}
+			msgs = append(msgs, fmt.Sprintf("an agent hook runs on PreToolUse, PostToolUse, PostToolUseFailure, PostToolBatch, Stop, SubagentStop, UserPromptSubmit and UserPromptExpansion, as in Claude Code; %s runs %s.", h.Event, runs))
+		}
+	case h.Prompt != "":
+		if h.Command != "" || h.Args != nil || h.URL != "" || h.Server != "" || h.Tool != "" || h.Async || h.AsyncRewake {
+			msgs = append(msgs, "the hook is both a prompt and a command, an address or an MCP tool; it is one of them.")
+		}
+		if known && !promptEvents[h.Event] {
+			msgs = append(msgs, fmt.Sprintf("a prompt hook runs on PreToolUse, PostToolUse, PostToolUseFailure, PostToolBatch, Stop, SubagentStop, UserPromptSubmit, UserPromptExpansion and PermissionRequest, as in Claude Code; %s runs command, http and mcp_tool hooks.", h.Event))
+		}
 	case h.Server != "" || h.Tool != "":
 		if h.Server == "" || h.Tool == "" {
 			msgs = append(msgs, "an mcp_tool hook names both the \"server\" and the \"tool\" it calls.")
@@ -412,7 +469,8 @@ func (e *ConfigError) Error() string {
 //     relative path.
 //
 // And as warnings: a matcher that fits no tool gnosh has (when
-// Options.ToolNames is given), or none of the values its event can have.
+// Options.ToolNames is given), or none of the values its event can have;
+// an http hook whose URL Options.HTTPURLs does not let it post to.
 func Check(cfg Config, opts Options) []Problem {
 	out := slices.Clone(cfg.problems)
 	tools := newToolNames(opts.Renamed, opts.Guards)
@@ -433,6 +491,9 @@ func Check(cfg Config, opts Options) []Problem {
 			out = append(out, Problem{Source: h.Source, Message: msg + " Remove it until gnosh has the event."})
 			continue
 		}
+		if h.URL != "" && opts.HTTPURLs != nil && !URLAllowed(h.URL, opts.HTTPURLs) {
+			out = append(out, Problem{Source: h.Source, Warning: true, Message: fmt.Sprintf("the http hook %s is at an address allowedHttpHookUrls does not let an http hook post to, so it never runs.", h.label())})
+		}
 		if h.Global && startsWithRelativePath(h.Command) {
 			out = append(out, Problem{Source: h.Source, Message: fmt.Sprintf("the command of the hook %s starts with a relative path. A hook's command is found from the folder a session works in, and this hook applies in every folder. Write the full path, or a command found on PATH.", h.label())})
 		}
@@ -441,6 +502,9 @@ func Check(cfg Config, opts Options) []Problem {
 			continue
 		}
 		switch {
+		case info.subject == toolName && bareServer(h.Matcher) != "":
+			server := bareServer(h.Matcher)
+			out = append(out, Problem{Source: h.Source, Warning: true, Message: fmt.Sprintf("the matcher %s of the hook %s names the MCP server %s, and fits none of its tools, which are named mcp__%s__ and the tool's name: %s fits them all.", quote(h.Matcher), h.label(), server, server, quote("mcp__"+server+"__.*"))})
 		case info.subject == toolName && len(opts.ToolNames) > 0 && !strings.Contains(h.Matcher, "mcp__"):
 			if !slices.ContainsFunc(opts.ToolNames, func(tool string) bool { ok, _ := tools.fit(m, tool); return ok }) {
 				out = append(out, Problem{Source: h.Source, Warning: true, Message: fmt.Sprintf("the matcher %s of the hook %s fits no tool gnosh has, so the hook never runs.", quote(h.Matcher), h.label())})
@@ -463,6 +527,19 @@ func stopping(problems []Problem) []Problem {
 		}
 	}
 	return out
+}
+
+// bareServer returns the server a tool matcher names alone, as
+// "mcp__memory", or "": such a matcher fits none of the server's tools.
+func bareServer(matcher string) string {
+	for _, part := range strings.Split(matcher, "|") {
+		part = strings.TrimSpace(part)
+		name, ok := strings.CutPrefix(part, "mcp__")
+		if ok && name != "" && !strings.Contains(name, "__") && strings.Trim(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == "" {
+			return name
+		}
+	}
+	return ""
 }
 
 // startsWithRelativePath reports whether the first word of a command line

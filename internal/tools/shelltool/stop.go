@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -58,11 +59,11 @@ func toldAll(procs []procInfo) map[procKey]string {
 func (j *job) kill() []procInfo {
 	m := j.m
 	told := j.signalAll(syscall.SIGTERM)
-	if m.outwait(j.pid, j.exited, m.opt.TermGrace, syscall.SIGTERM, told) {
+	if m.outwait(j.pid, j.exited, m.opt.TermGrace, syscall.SIGTERM, told, nil) {
 		return nil
 	}
 	told = j.signalAll(syscall.SIGKILL)
-	if m.outwait(j.pid, j.exited, m.opt.KillWait, syscall.SIGKILL, told) {
+	if m.outwait(j.pid, j.exited, m.opt.KillWait, syscall.SIGKILL, told, nil) {
 		return nil
 	}
 	alive, _ := m.procs(j.pid)
@@ -120,7 +121,9 @@ func (m *Manager) signalGroups(sig syscall.Signal, procs []procInfo, leader int,
 
 // outwait waits up to d for session sid to have no live process left and,
 // when exited is not nil, for the shell that led it to have been reaped.
-// It reports whether that came about.
+// It reports whether that came about. With only set, the session's
+// processes are those only keeps of them, and the others are not counted
+// or signalled.
 //
 // While it waits it looks at the session again and again, at first every
 // millisecond and then less often, and sends sig to each process it finds
@@ -128,13 +131,16 @@ func (m *Manager) signalGroups(sig syscall.Signal, procs []procInfo, leader int,
 // the program it now is: such a one was forked too late for the signal its
 // group got, or changed groups just then, or has become another program
 // since and may have lost the signal in doing so.
-func (m *Manager) outwait(sid int, exited <-chan struct{}, d time.Duration, sig syscall.Signal, told map[procKey]string) bool {
+func (m *Manager) outwait(sid int, exited <-chan struct{}, d time.Duration, sig syscall.Signal, told map[procKey]string, only func([]procInfo) []procInfo) bool {
 	deadline := time.NewTimer(d)
 	defer deadline.Stop()
 	pause := time.Millisecond
 	for {
 		reaped := exited == nil || closed(exited)
 		procs, err := m.procs(sid)
+		if only != nil && err == nil {
+			procs = only(procs)
+		}
 		empty := len(procs) == 0
 		if err != nil {
 			// The session cannot be listed here. The process group is the
@@ -175,21 +181,44 @@ func (m *Manager) outwait(sid int, exited <-chan struct{}, d time.Duration, sig 
 }
 
 // sweep kills what a finished command left running in its session sid:
-// then is what was there when the command ended. By now the session's
-// leader is long gone and its id may have been given to something else,
-// so nothing is signalled unless one of the processes seen then is still
-// there, in that session, started at the same moment; only that proves the
-// session is still the command's.
+// then is what was there when the command ended (or when what held its
+// output let go of it). By now the session's leader is long gone and its id
+// may have been given to something else. When one of the processes seen
+// then is still there, in that session, started at the same moment, the
+// session is still the command's, and all of it is stopped. Otherwise only
+// the processes that carry the manager's mark in their environment are
+// surely the command's: a launcher seen then may have ended after
+// starting a server, which runs on in the session. Those are stopped, and
+// nothing else is touched.
 func (m *Manager) sweep(sid int, then []procInfo) {
 	if sid <= 1 || len(then) == 0 {
 		return
 	}
 	now, err := m.procs(sid)
-	if err != nil || !sameProcess(now, then) {
+	if err != nil || len(now) == 0 {
 		return
 	}
+	var only func([]procInfo) []procInfo
+	if !sameProcess(now, then) {
+		// A process once seen with the mark stays the command's until it
+		// is gone: Linux stops showing the environment of a process on its
+		// way out, and one told to stop is not stopped until it has left.
+		ours := make(map[procKey]bool)
+		only = func(ps []procInfo) []procInfo {
+			return slices.DeleteFunc(ps, func(p procInfo) bool {
+				key := procKey{p.pid, p.start}
+				if !ours[key] && len(m.marked([]procInfo{p})) == 1 {
+					ours[key] = true
+				}
+				return !ours[key]
+			})
+		}
+		if now = only(now); len(now) == 0 {
+			return
+		}
+	}
 	m.signalGroups(syscall.SIGTERM, now, sid, false)
-	if m.outwait(sid, nil, m.opt.TermGrace, syscall.SIGTERM, toldAll(now)) {
+	if m.outwait(sid, nil, m.opt.TermGrace, syscall.SIGTERM, toldAll(now), only) {
 		return
 	}
 	// The processes are the same ones as a moment ago, with whatever they
@@ -197,8 +226,11 @@ func (m *Manager) sweep(sid int, then []procInfo) {
 	if now, err = m.procs(sid); err != nil {
 		return
 	}
+	if only != nil {
+		now = only(now)
+	}
 	m.signalGroups(syscall.SIGKILL, now, sid, false)
-	m.outwait(sid, nil, m.opt.KillWait, syscall.SIGKILL, toldAll(now))
+	m.outwait(sid, nil, m.opt.KillWait, syscall.SIGKILL, toldAll(now), only)
 }
 
 // describeProcs lists processes for a message: "pid 4242 (sleep), pid 4243

@@ -21,8 +21,17 @@ Commands
                           yet.)
   bridge                  Serve the project's machines, mem and frames view to
                           another harness, without a model. (Not built yet.)
-  logs                    Print the end of the project's log, or follow it.
+  prompt <command>        Read gnosh's own words to the model, and make any of
+                          them yours. (Not built yet.)
+  agents                  The sessions that run in the background, and those
+                          that ran: a view of them on a terminal. (Not built
+                          yet.)
+  logs [session]          Print the end of the project's log, or follow it.
                           (Not built yet.)
+  attach <session>        Open the agent view on a session that runs in the
+                          background. (Not built yet.)
+  stop <session>          Stop a session that runs in the background. (Not
+                          built yet.)
   dirs                    Say which config and data folders are in use. (Not
                           built yet.)
   ssh [ssh args]          Run ssh, putting what the far side copies on this
@@ -38,7 +47,8 @@ Which conversation
       working folder, which is --cwd now. So a single word right after -c is
       refused: write -C before a one-word prompt.)
   -r, --resume [session]
-      Resume a session by its ID or its name, or from a transcript file given
+      Resume a session by its ID or its name, or by words in its name or first
+      prompt when one session alone has them, or from a transcript file given
       as an absolute path ending in .jsonl. With nothing after it, show the
       sessions to pick from; in print mode a session must be named. The
       argument after -r is always taken as the session, never as the prompt.
@@ -51,6 +61,14 @@ Which conversation
   -n, --name <name>
       Name the session: the new one, the one resumed, or the --fork-session
       copy. (Not built yet.)
+  --bg, --background
+      Start the session in the background and return at once: it works on the
+      prompt as a run of its own, as /background has a session go on, and
+      gnosh says its ID and how to follow it (gnosh agents, gnosh logs, gnosh
+      stop, gnosh -r). A call that needs a yes waits for one in gnosh agents,
+      listed there under Needs input. With -c, or -r and a session's ID or
+      name, it goes on with that session instead of a new one. Not with -p,
+      --fork-session or --no-session-persistence. (Not built yet.)
 
 Which model
   -m, --model <model>
@@ -59,6 +77,11 @@ Which model
   --reasoning-effort, --effort <level>
       How hard the model thinks in this run. The levels depend on the model.
       (Not built yet.)
+  --fallback-model <models>
+      Models to go on with, tried in order, when the model cannot answer (its
+      server is down, not ready or too busy): up to three, separated by
+      commas. The switch holds for the rest of the turn; the next one asks the
+      model first again. (Not built yet.)
 
 Permissions
   -y, --yolo, --dangerously-skip-permissions
@@ -130,6 +153,15 @@ Settings for this run
       of .mcp.json. A run waits for them before its turn. (Not built yet.)
   --strict-mcp-config
       Use only the MCP servers --mcp-config gives. (Not built yet.)
+  --channels <servers...>
+      MCP servers whose events come into this session as they happen, each as
+      server:<name>: a stdio server of your MCP configuration that declares
+      itself a channel, as Claude Code's do (a CI webhook, a chat bridge). The
+      model sees each event and may answer through the server's own tools.
+      (Not built yet.)
+  --dangerously-load-development-channels <servers...>
+      The same as --channels, which gnosh keeps no list of approved channels
+      for: Claude Code's spelling for a channel of one's own. (Not built yet.)
   --safe-mode
       Start with your customizations off (hooks, MCP servers, context files,
       skills on disk, custom commands), to fix a broken one. Providers, the
@@ -177,6 +209,10 @@ Print mode
       With --output-format stream-json: also write the replies as they arrive,
       as the Messages API's streaming events (stream_event lines). (Not built
       yet.)
+  --include-hook-events
+      With --output-format stream-json: also write each hook's start and end
+      (system lines hook_started and hook_response); the SessionStart hooks'
+      are written without it. (Not built yet.)
   --replay-user-messages
       With --input-format and --output-format stream-json: write each user
       message read back on standard output, as a user line with isReplay. (Not
@@ -206,13 +242,13 @@ Reading the command line
   -- is the prompt, even if it begins with a dash.
 
   A list flag (--allowedTools, --disallowedTools, --tools, --add-dir,
-  --mcp-config) takes the argument after it, and then each argument after that
-  up to the next flag, for as long as the argument has no space in it (spaces
-  inside parentheses do not count). So a prompt of two words or more ends a
-  list (gnosh stops to ask if that prompt reads like more tools), but a
-  one-word prompt right after a list would join it: put the prompt first, put
-  -- before it, or attach the list with an equals sign, as in
-  --tools=Read,Edit.
+  --mcp-config, --channels, --dangerously-load-development-channels) takes the
+  argument after it, and then each argument after that up to the next flag,
+  for as long as the argument has no space in it (spaces inside parentheses do
+  not count). So a prompt of two words or more ends a list (gnosh stops to ask
+  if that prompt reads like more tools), but a one-word prompt right after a
+  list would join it: put the prompt first, put -- before it, or attach the
+  list with an equals sign, as in --tools=Read,Edit.
 
   In a list of tools or rules, commas and spaces separate the items, but not
   inside parentheses: "Bash(git diff *),Edit" is two rules.

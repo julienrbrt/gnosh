@@ -1,0 +1,18 @@
+gnosh prompt export
+
+  Write gnosh's own texts into the folder yours go in, to edit them. With no
+  name, every text. A file that is there is kept unless --force is given. An
+  exported text changes nothing until its words are changed: its first line
+  marks it as gnosh's own, and is never sent.
+
+  Not built yet in this build of gnosh: typing it stops with a message that
+  says so.
+
+Usage
+  gnosh prompt export [flags] [name...]
+
+Flags
+  --force
+      Write over a file of that name that is there already. (Not built yet.)
+  -h, --help
+      Show help: gnosh's, or after a command's name that command's.

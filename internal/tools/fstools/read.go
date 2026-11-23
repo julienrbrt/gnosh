@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,6 +27,8 @@ func (t *readTool) props() []prop {
 		{name: "file_path", kind: "string", desc: "Path of the file to read. Absolute is best; a relative path is taken from the working directory."},
 		{name: "offset", kind: "integer", desc: "Line number to start at; the first line is 1. Leave out to start at the top."},
 		{name: "limit", kind: "integer", desc: fmt.Sprintf("How many lines to read. Leave out for the first %d.", t.opts.ReadDefaultLines)},
+		{name: "pages", kind: "string", desc: fmt.Sprintf("For a PDF: the pages to read, such as \"3\" or \"1-5\", at most %d a call. Needed for a PDF of more than %d pages.", pdfCallMost, pdfWholeMost)},
+		{name: "allow_large", kind: "boolean", desc: "Read the whole file, or a long part of it, in one call, past the usual limits, as far as the context has room for. Only when all of it is needed."},
 	}
 }
 
@@ -38,10 +41,10 @@ Each line comes back as its number, a tab, then the line. The number and the tab
 
 One call shows at most %[2]d lines (or the limit you give) and at most %[3]d bytes of text. When the file has more, a note at the end says so and gives the offset to continue from. A line longer than %[4]d characters is cut and marked. For a large file, read the part you need with offset and limit, or find it first with %[5]s.
 
-PNG, JPEG, GIF and WebP images come back as pictures. A directory, a binary file, a PDF or a notebook is not read: the result says what it is. An empty file and an offset past the end give a short notice, not an error.
+PNG, JPEG, GIF and WebP images come back as pictures, a large one shrunk to fit what a model is shown. A PDF comes back as its text, page by page: one of more than %[7]d pages is read with pages, at most %[8]d at a time. A Jupyter notebook (.ipynb) comes back as its cells, each with its id, and their outputs; change a cell with %[9]s. A directory or a binary file is not read: the result says what it is. An empty file and an offset past the end give a short notice, not an error.
 
 %[1]s and %[6]s only change what this session has been shown, so read a file before changing it.`,
-		o.EditName, o.ReadDefaultLines, o.ReadMaxBytes, o.ReadMaxLineChars, o.GrepName, o.WriteName)
+		o.EditName, o.ReadDefaultLines, o.ReadMaxBytes, o.ReadMaxLineChars, o.GrepName, o.WriteName, pdfWholeMost, pdfCallMost, o.NotebookEditName)
 	return core.ToolSpec{
 		Name:        o.ReadName,
 		Description: desc,
@@ -56,17 +59,17 @@ type readArgs struct {
 	limit  int // lines wanted
 	// ranged says the call asked for a part of the file by offset or limit.
 	ranged bool
-	// pages is the PDF page range, which Read accepts and cannot yet honour.
+	// pages is the PDF page range (pdf.go).
 	pages string
-	// allowLarge is the request to read past the usual limits, likewise.
-	allowLarge bool
+	// allowLarge is the request to read past the usual limits, as far as
+	// the context has room for (Options.ReadRoom); limitGiven says the
+	// call set limit.
+	allowLarge, limitGiven bool
 }
 
 func (t *readTool) parse(call core.ToolCall) (readArgs, *failure) {
 	var r readArgs
-	// pages and allow_large are Claude Code arguments this Read does not
-	// offer but must not choke on.
-	names := append(propNames(t.props()), "pages", "allow_large")
+	names := propNames(t.props())
 	a, f := parseArgs(t.opts.ReadName, call.Input, names...)
 	if f != nil {
 		return r, f
@@ -84,7 +87,8 @@ func (t *readTool) parse(call core.ToolCall) (readArgs, *failure) {
 	}
 	r.offset = max(offset, 1)
 	r.limit = limit
-	if !limitGiven || limit == 0 {
+	r.limitGiven = limitGiven && limit > 0
+	if !r.limitGiven {
 		r.limit = t.opts.ReadDefaultLines
 	}
 	r.ranged = (offsetGiven && offset > 1) || (limitGiven && limit > 0)
@@ -110,7 +114,9 @@ func (t *readTool) Describe(call core.ToolCall, env *core.ToolEnv) (core.Action,
 		return core.Action{}, f
 	}
 	summary := "Read " + loc.abs
-	if args.ranged {
+	if args.pages != "" {
+		summary += ", pages " + args.pages
+	} else if args.ranged {
 		summary += fmt.Sprintf(", %s from line %d", countOf(args.limit, "line", "lines"), args.offset)
 	}
 	return core.Action{Kind: core.ActionRead, Paths: loc.paths(), Summary: summary}, nil
@@ -156,11 +162,11 @@ func (t *readTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEn
 
 	switch {
 	case isPDF(head) || ext == ".pdf":
-		return refused(failf("%s is a PDF, which %s cannot read yet. Turn it into text with a shell command (pdftotext, for one) and read that.", loc.abs, o.ReadName))
+		return t.readPDF(ctx, &loc, args.pages)
 	case args.pages != "":
 		return refused(failf("%s: pages is for PDF files, and %s is not one. Use offset and limit to read part of a text file.", o.ReadName, loc.abs))
 	case ext == ".ipynb":
-		return refused(failf("%s is a Jupyter notebook, which %s cannot read yet. Look at its cells with a shell command (jq, for one).", loc.abs, o.ReadName))
+		return t.readNotebook(ctx, env, &loc, file, info, head, atEnd)
 	}
 	if media := imageType(head); media != "" {
 		return t.readImage(ctx, env, &loc, file, info, head, atEnd, media)
@@ -183,12 +189,28 @@ func (t *readTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEn
 		return refused(failf("%s looks like a binary file (%s) and is not shown as text. %s", loc.abs, byteSize(info.Size()), hint))
 	}
 
+	// allow_large: the whole file, or as much as the context has room for,
+	// past the usual limits.
+	maxBytes, large, used := o.ReadMaxBytes, false, 0
+	if args.allowLarge && o.ReadRoom != nil {
+		room, done := o.ReadRoom(ctx)
+		defer func() { done(used) }()
+		if room = min(room, readLargeMost); room > maxBytes {
+			maxBytes, large = room, true
+			if !args.limitGiven {
+				args.limit = math.MaxInt32
+			}
+		}
+	}
 	tr := &textRead{
 		first:    args.offset,
 		limit:    args.limit,
-		maxBytes: o.ReadMaxBytes,
+		maxBytes: maxBytes,
 		maxChars: o.ReadMaxLineChars,
 		sum:      sha256.New(),
+	}
+	if o.ReadResultMost != nil {
+		tr.maxOut = o.ReadResultMost(ctx)
 	}
 	tr.sum.Write(head)
 	if bytes.HasPrefix(head, []byte(utf8BOM)) {
@@ -251,6 +273,7 @@ func (t *readTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEn
 		total = tr.lineNo
 	}
 	more := !atEnd || tr.lastShown < tr.lineNo
+	used = tr.out.Len()
 	var out strings.Builder
 	out.WriteString(tr.out.String())
 	var notes []string
@@ -268,12 +291,17 @@ func (t *readTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEn
 		} else {
 			note += fmt.Sprintf("; the file goes on (it is %s, and its lines were not all counted).", byteSize(info.Size()))
 		}
-		if tr.stoppedByBytes {
+		switch {
+		case tr.stoppedByOut:
+			note += fmt.Sprintf(" This call stopped at the %s one result may hold for this model.", byteSize(int64(tr.maxOut)))
+		case tr.stoppedByBytes && large:
+			note += fmt.Sprintf(" This call stopped at the %s the context has room for now, with allow_large.", byteSize(int64(maxBytes)))
+		case tr.stoppedByBytes:
 			note += fmt.Sprintf(" This call stopped at the %d bytes one call may show.", o.ReadMaxBytes)
 		}
 		note += fmt.Sprintf(" To read on, call %s again with offset=%d.", o.ReadName, tr.lastShown+1)
-		if args.allowLarge {
-			note += " (allow_large is not supported here.)"
+		if args.allowLarge && !large {
+			note += " (allow_large finds no more room than that here.)"
 		}
 		notes = append(notes, note)
 	case tr.firstShown > 1:
@@ -335,36 +363,65 @@ func readMeta(loc *location, shown, start, total int, more bool) map[string]any 
 // readImage returns an image file as a picture.
 func (t *readTool) readImage(ctx context.Context, env *core.ToolEnv, loc *location, file *os.File, info os.FileInfo, head []byte, atEnd bool, media string) (core.ToolResult, error) {
 	o := t.opts
-	tooBig := failf("%s is an image of %s, more than the %s that %s hands to a model, and %s does not shrink images. Make a smaller copy with an image tool and read that.",
-		loc.abs, byteSize(max(info.Size(), int64(len(head)))), byteSize(o.ReadMaxImageBytes), o.ReadName, o.ReadName)
-	if info.Size() > o.ReadMaxImageBytes {
-		return refused(tooBig)
+	tooBig := func(why string) (core.ToolResult, error) {
+		return refused(failf("%s is an image of %s, more than the %s that %s hands to a model, and %s. Make a smaller copy with an image tool and read that.",
+			loc.abs, byteSize(max(info.Size(), int64(len(head)))), byteSize(o.ReadMaxImageBytes), o.ReadName, why))
+	}
+	readMost := max(o.ReadMaxImageBytes, imageReadMost)
+	if info.Size() > readMost {
+		return tooBig("it is too large to shrink here")
 	}
 	data := append([]byte(nil), head...)
 	if !atEnd {
 		if err := ctx.Err(); err != nil {
 			return core.ToolResult{}, fmt.Errorf("%s of %s stopped: %w", o.ReadName, loc.abs, context.Cause(ctx))
 		}
-		rest, err := io.ReadAll(io.LimitReader(file, o.ReadMaxImageBytes-int64(len(data))+1))
+		rest, err := io.ReadAll(io.LimitReader(file, readMost-int64(len(data))+1))
 		if err != nil {
 			return refused(failf("%s could not be read: %v.", loc.abs, underlying(err)))
 		}
 		data = append(data, rest...)
 	}
-	if int64(len(data)) > o.ReadMaxImageBytes {
-		return refused(tooBig)
+	if int64(len(data)) > readMost {
+		return tooBig("it is too large to shrink here")
 	}
 	sum := sha256.Sum256(data)
-	sessionOf(env).saw(loc.real, sighting{info: info, sum: &sum, lines: -1, whole: true})
 	kind := strings.ToUpper(strings.TrimPrefix(media, "image/"))
-	res := core.ToolResult{Content: []core.Block{
-		core.Text(fmt.Sprintf("[%s: a %s image, %s.]", loc.abs, kind, byteSize(int64(len(data))))),
-		{Type: core.BlockImage, MediaType: media, Data: data},
-	}}
-	res.Meta = map[string]any{
-		"type": "image",
-		"file": map[string]any{"filePath": loc.abs, "type": media, "originalSize": len(data)},
+	said := fmt.Sprintf("[%s: a %s image, %s.]", loc.abs, kind, byteSize(int64(len(data))))
+	sent, sentMedia := data, media
+	// Larger than a model takes, or than a model is shown: shrunk
+	// (shrink.go), as Claude Code shrinks it.
+	small, shrank, err := shrinkImage(ctx, data, media, o.ReadMaxImageBytes)
+	switch {
+	case shrank:
+		sent, sentMedia = small.data, small.media
+		how := "shrunk to"
+		switch {
+		case small.turned && small.width == small.fromW && small.height == small.fromH:
+			how = "turned upright, as its EXIF orientation says, at"
+		case small.turned:
+			how = "turned upright, as its EXIF orientation says, and shrunk to"
+		}
+		said = fmt.Sprintf("[%s: a %s image, %s, %dx%d, shown %s %dx%d (%s, %s).]", loc.abs, kind, byteSize(int64(len(data))),
+			small.fromW, small.fromH, how, small.width, small.height, strings.ToUpper(strings.TrimPrefix(small.media, "image/")), byteSize(int64(len(small.data))))
+		if media == "image/gif" {
+			said = strings.TrimSuffix(said, ".]") + "; of a GIF, the first frame only.]"
+		}
+	case int64(len(data)) > o.ReadMaxImageBytes && err != nil:
+		return tooBig("it could not be shrunk: " + err.Error())
+	case int64(len(data)) > o.ReadMaxImageBytes:
+		return tooBig(o.ReadName + " does not shrink a " + kind + " image")
 	}
+	sessionOf(env).saw(loc.real, sighting{info: info, sum: &sum, lines: -1, whole: true})
+	res := core.ToolResult{Content: []core.Block{
+		core.Text(said),
+		{Type: core.BlockImage, MediaType: sentMedia, Data: sent},
+	}}
+	about := map[string]any{"filePath": loc.abs, "type": sentMedia, "originalSize": len(data)}
+	if shrank {
+		about["dimensions"] = map[string]any{"originalWidth": small.fromW, "originalHeight": small.fromH, "displayWidth": small.width, "displayHeight": small.height}
+	}
+	res.Meta = map[string]any{"type": "image", "file": about}
 	if loc.real != loc.abs {
 		res.Meta["realPath"] = loc.real
 	}
@@ -433,6 +490,7 @@ type textRead struct {
 	limit    int // most lines to show
 	maxBytes int // most bytes of text to show
 	maxChars int // most characters of one line to show
+	maxOut   int // most bytes of the page, line numbers and all (0: none)
 
 	// The page.
 	out            strings.Builder
@@ -442,6 +500,7 @@ type textRead struct {
 	shownBytes     int
 	full           bool // the page takes no more lines
 	stoppedByBytes bool // ... because of maxBytes
+	stoppedByOut   bool // ... because of maxOut
 	crlf, lf       int  // line endings among the lines shown
 	bom            bool // the file starts with a byte order mark
 	bad            int  // stretches of bytes shown as U+FFFD
@@ -537,11 +596,16 @@ func (r *textRead) endLine(terminated bool) {
 			text += cutMark(dropped)
 		}
 		cost := len(text) + 1
-		if r.shown > 0 && r.shownBytes+cost > r.maxBytes {
+		num := strconv.Itoa(r.lineNo)
+		switch {
+		case r.shown > 0 && r.shownBytes+cost > r.maxBytes:
 			r.full = true
 			r.stoppedByBytes = true
-		} else {
-			r.out.WriteString(strconv.Itoa(r.lineNo))
+		case r.shown > 0 && r.maxOut > 0 && r.out.Len()+len(num)+1+cost > r.maxOut:
+			r.full = true
+			r.stoppedByOut = true
+		default:
+			r.out.WriteString(num)
 			r.out.WriteByte('\t')
 			r.out.WriteString(text)
 			r.out.WriteByte('\n')

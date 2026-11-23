@@ -148,3 +148,54 @@ func TestTranscriptViewNeeds(t *testing.T) {
 	}
 	g.liveHas("not joined to this build")
 }
+
+// v in the transcript view with the side panel on gives the editor the
+// screen: the panel steps aside while the editor runs, and comes back
+// after, as it does for Ctrl+G. The editor ran under the panel (the TUI
+// review of 2026-11-19).
+func TestTranscriptInEditorWithThePanel(t *testing.T) {
+	g := newRig(t, 100, 24, text.NoColor)
+	g.free = true
+	g.c.mu.Lock()
+	g.c.trans = []app.TranscriptEntry{{Kind: "prompt", Message: core.UserText("fix the test")}}
+	g.c.mu.Unlock()
+	g.keys(`"/panel" <Enter>`)
+	if g.s.panel == nil {
+		t.Fatal("/panel did not open the panel")
+	}
+	panelDuringEdit := true
+	g.editor = func(s string) (string, error) { panelDuringEdit = g.s.panel != nil; return s, nil }
+	g.keys(`<Ctrl+O> "v"`)
+	if panelDuringEdit {
+		t.Error("the editor ran with the side panel on the screen")
+	}
+	if g.s.panel == nil {
+		t.Error("the side panel did not come back after the editor")
+	}
+}
+
+// The keys of every state work in the transcript view too: Ctrl+Z stops
+// gnosh and the view is there after, Ctrl+L draws it again. They did
+// nothing there (the TUI review of 2026-11-19).
+func TestEveryStateKeysInTheTranscriptView(t *testing.T) {
+	g := newRig(t, 100, 24, text.NoColor)
+	g.free = true
+	g.c.mu.Lock()
+	g.c.trans = []app.TranscriptEntry{{Kind: "prompt", Message: core.UserText("fix the test")}}
+	g.c.mu.Unlock()
+	g.keys(`<Ctrl+O>`)
+	if g.s.view == nil {
+		t.Fatal("Ctrl+O did not open the view")
+	}
+	g.keys(`<Ctrl+Z>`)
+	if g.suspends != 1 {
+		t.Errorf("Ctrl+Z in the view stopped gnosh %d times", g.suspends)
+	}
+	if g.s.view == nil {
+		t.Fatal("the view was gone after Ctrl+Z")
+	}
+	g.keys(`<Ctrl+L>`)
+	if g.s.view == nil || !strings.Contains(strings.Join(g.scr.Lines(), "\n"), "fix the test") {
+		t.Errorf("after Ctrl+L the view shows:\n%s", strings.Join(g.scr.Lines(), "\n"))
+	}
+}

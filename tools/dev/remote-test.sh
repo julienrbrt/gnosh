@@ -60,7 +60,9 @@ done
 	exit 2
 }
 
-SSH="ssh ${KEY:+-i $KEY -o IdentitiesOnly=yes} -o BatchMode=yes -o ConnectTimeout=20"
+# (Keepalives: a connection that dies on the way fails the run within two
+# minutes instead of hanging it.)
+SSH="ssh ${KEY:+-i $KEY -o IdentitiesOnly=yes} -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=4"
 
 mk=""
 pkgs=""

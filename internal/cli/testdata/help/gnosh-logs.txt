@@ -1,12 +1,15 @@
 gnosh logs
 
-  Print the end of the project's log, or follow it.
+  Print the end of the project's log, or follow it. With a session's ID (or
+  the start of one), what that session printed as a run in the background
+  (gnosh --bg, /background, /fork; gnosh agents lists them); --follow follows
+  it until the run is done.
 
   Not built yet in this build of gnosh: typing it stops with a message that
   says so.
 
 Usage
-  gnosh logs [flags]
+  gnosh logs [flags] [session]
 
 Flags
   -f, --follow

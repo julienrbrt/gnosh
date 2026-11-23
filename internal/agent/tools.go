@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gnosh-ai/gnosh/internal/core"
 )
@@ -36,6 +38,9 @@ type callState struct {
 	dur         time.Duration
 	parts       []Part // what AfterTool added for the model
 	gone        *late  // set when the loop gave up waiting for the tool
+	// rerouted is the note a call made in place of the model's (Reroute)
+	// starts its result with.
+	rerouted string
 }
 
 // execDone is what the goroutine that ran a tool reports.
@@ -54,6 +59,7 @@ type roundOutcome struct {
 	stopped bool   // the person stopped the turn
 	halt    string // why the turn must end, or empty
 	haltBy  string
+	planned bool  // the end is what the call that asked for it was for
 	err     error // the log could not be written
 }
 
@@ -78,6 +84,7 @@ type round struct {
 	gaveUp  bool
 	halt    string
 	haltBy  string
+	planned bool
 	err     error
 	timer   *time.Timer
 	grace   <-chan time.Time
@@ -87,6 +94,7 @@ type round struct {
 func (a *Agent) runTools(ctx context.Context, t *turn, rep *reply) roundOutcome {
 	su := a.setup()
 	uses := rep.msg.ToolUses()
+	a.newRoomRound()
 	r := &round{a: a, t: t, ctx: ctx, done: make(chan execDone, len(uses))}
 	r.rctx, r.cancel = context.WithCancel(ctx)
 	defer r.cancel()
@@ -115,15 +123,34 @@ func (a *Agent) runTools(ctx context.Context, t *turn, rep *reply) roundOutcome 
 				list = sortedNames(names)
 			}
 			c.res = core.ErrorResult(fmt.Sprintf(a.texts.UnknownTool, u.Name, list))
+			// (The screen says the first sentence alone: the list of the
+			// tools is the model's.)
+			c.res.Meta = map[string]any{"unknownTool": true}
 			c.done = true
 		case bad:
 			c.res = core.ErrorResult(fmt.Sprintf(a.texts.BadInput, clip(raw, 400)))
 			c.done = true
 		default:
 			r.prepare(c)
+			if !c.done {
+				r.reroute(c, su)
+			}
 		}
 		r.calls = append(r.calls, c)
 	}
+	a.mu.Lock()
+	a.unfinished = map[string]bool{}
+	for _, c := range r.calls {
+		if !c.done {
+			a.unfinished[c.call.ID] = true
+		}
+	}
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.unfinished = nil
+		a.mu.Unlock()
+	}()
 
 	a.setPhase(PhaseTools, "running tool calls")
 	for i := 0; i < len(r.calls); {
@@ -150,7 +177,55 @@ func (a *Agent) runTools(ctx context.Context, t *turn, rep *reply) roundOutcome 
 		}
 		r.err = a.appendLog(notes...)
 	}
-	return roundOutcome{calls: r.calls, stopped: r.stopped || ctx.Err() != nil, halt: r.halt, haltBy: r.haltBy, err: r.err}
+	if f := a.opts.Moments.AfterRound; f != nil && r.err == nil && r.halt == "" && !r.stopped && ctx.Err() == nil {
+		r.afterRound(f)
+	}
+	return roundOutcome{calls: r.calls, stopped: r.stopped || ctx.Err() != nil, halt: r.halt, haltBy: r.haltBy, planned: r.planned, err: r.err}
+}
+
+// afterRound tells the AfterRound moment how the round's calls went, once
+// they are all stored and the model is about to be asked again; what it
+// adds is stored after them, and it may end the turn there.
+func (r *round) afterRound(f func(context.Context, RoundDone) (ToolVerdict, error)) {
+	a, t := r.a, r.t
+	info := RoundDone{Turn: t.id, Session: a.session, AgentID: a.agentID, AgentType: a.agentType, ParentCall: a.parentCall}
+	for _, c := range r.calls {
+		call := c.call
+		call.Input = c.input
+		info.Calls = append(info.Calls, ToolDone{
+			Call: call, Tool: c.tool, Result: c.res, Duration: c.dur, Interrupted: c.interrupted,
+			Turn: t.id, Session: a.session, AgentID: a.agentID, AgentType: a.agentType, ParentCall: a.parentCall,
+		})
+	}
+	v, err := afterRoundSafely(r.ctx, f, info)
+	if r.ctx.Err() != nil {
+		// (Stopped while it ran: the turn ends as stopped.)
+		r.stopped = true
+		return
+	}
+	if err != nil {
+		a.notice(LevelWarning, "after-round", fmt.Sprintf("A check that runs after a round of tool calls could not run (%v), so the turn ends here.", err))
+		v.Halt, v.Reason = true, firstNonEmpty(v.Reason, fmt.Sprintf("a check after the round of tool calls could not run (%v)", err))
+	}
+	var notes []Entry
+	for _, p := range v.Context {
+		if strings.TrimSpace(p.Text) != "" {
+			notes = append(notes, Entry{Kind: EntryNote, Turn: t.id, Source: firstNonEmpty(p.Source, "after-round"), Blocks: []core.Block{core.Text(p.Text)}})
+		}
+	}
+	if r.err = a.appendLog(notes...); r.err == nil && v.Halt {
+		r.halt, r.haltBy = firstNonEmpty(v.Reason, "a check after the round of tool calls ended the turn"), "after-round"
+	}
+}
+
+// afterRoundSafely calls the AfterRound moment and catches a panic in it.
+func afterRoundSafely(ctx context.Context, f func(context.Context, RoundDone) (ToolVerdict, error), info RoundDone) (v ToolVerdict, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("it crashed: %v", p)
+		}
+	}()
+	return f(ctx, info)
 }
 
 // prepare readies a call's arguments for everything that reads them: the
@@ -180,6 +255,42 @@ func (r *round) prepare(c *callState) {
 	if p, ok := c.tool.(Concurrent); ok {
 		c.parallel = safely(func() bool { return p.Parallel(c.call) })
 	}
+}
+
+// reroute makes, in place of a call the model meant for another of the
+// session's tools, that tool's call (Options.Reroute): Gno for mem typed
+// into the shell runs in mem, not as a command no shell has, which only
+// taught a small model nothing (FrontierHarness on box 2, 2026-11-19: in
+// one trial 315 of 320 calls). The call keeps the model's id.
+func (r *round) reroute(c *callState, su setup) {
+	f := r.a.opts.Reroute
+	if f == nil {
+		return
+	}
+	to, note, ok := rerouteSafely(f, core.ToolCall{ID: c.call.ID, Name: c.call.Name, Input: c.input})
+	if !ok {
+		return
+	}
+	tool := su.index[to.Name]
+	in, good := jsonObject(to.Input)
+	if tool == nil || !good {
+		return
+	}
+	c.call.Name, c.call.Input, c.input, c.tool, c.changed, c.rerouted = to.Name, in, in, tool, true, note
+	c.parallel = false
+	if p, ok := tool.(Concurrent); ok {
+		c.parallel = safely(func() bool { return p.Parallel(c.call) })
+	}
+}
+
+// rerouteSafely calls Reroute and takes a panic for no.
+func rerouteSafely(f func(core.ToolCall) (core.ToolCall, string, bool), call core.ToolCall) (to core.ToolCall, note string, ok bool) {
+	defer func() {
+		if recover() != nil {
+			to, note, ok = core.ToolCall{}, "", false
+		}
+	}()
+	return f(call)
 }
 
 // cleanInput passes a call's arguments through the wiring's filter. What
@@ -223,6 +334,7 @@ func (r *round) group(g []*callState) {
 			continue
 		}
 		dec := r.ask(c)
+		c.parts = append(c.parts, dec.Context...)
 		if why, over := r.over(); over {
 			r.skip(c, why)
 			continue
@@ -494,16 +606,16 @@ func (r *round) refuse(c *callState, dec Decision) {
 		Reason: reason, Unattended: dec.Unattended,
 	})
 	if dec.Halt {
-		r.haltNow("the person refused permission for "+c.call.Name, "permission")
+		r.haltNow("the person refused permission for "+c.call.Name, "permission", false)
 	}
 	r.record(c)
 }
 
 // haltNow ends the turn once this round's results are stored. Calls that
 // are running are told to stop, and calls that have not started do not.
-func (r *round) haltNow(why, by string) {
+func (r *round) haltNow(why, by string, planned bool) {
 	if r.halt == "" {
-		r.halt, r.haltBy = why, by
+		r.halt, r.haltBy, r.planned = why, by, planned
 	}
 	r.cancel()
 	r.startGrace()
@@ -528,7 +640,7 @@ func (r *round) start(c *callState) {
 // (stopped ends then too) and when the round is ended for another reason.
 func (a *Agent) exec(stopped, ctx context.Context, turn string, idx int, tool core.Tool, call core.ToolCall, env *core.ToolEnv, began time.Time, gone *late, out chan<- execDone) {
 	d := execDone{idx: idx}
-	res, err, crash, stack := runTool(ctx, tool, call, env)
+	res, crash, stack, err := runTool(ctx, tool, call, env)
 	switch {
 	case crash != nil:
 		a.panicked("the tool "+call.Name, crash, stack)
@@ -562,13 +674,91 @@ func (a *Agent) exec(stopped, ctx context.Context, turn string, idx int, tool co
 		if ctx.Err() != nil {
 			d.hookErr = nil
 		}
+		if r := d.verdict.Replace; r != nil {
+			// What the model reads, and what is kept, in place of what
+			// the tool returned: through the same filter (gnosh's own
+			// marks broken, the size cut), as a hook's text is a page's
+			// text passed on.
+			rep := *r
+			if f := a.opts.CleanResult; f != nil {
+				rep = cleanResult(f, call, rep)
+			}
+			rep.Content = sayable(rep.Content)
+			d.res = rep
+		}
+		if len(d.verdict.Notes) > 0 {
+			d.res.Notes = append(slices.Clip(d.res.Notes), d.verdict.Notes...)
+		}
 	}
+
+	d.res = a.fitResultToWindow(d.res)
 
 	if !gone.deliver(func() { out <- d }) {
 		a.notice(LevelWarning, "tools", fmt.Sprintf(
 			"%s finished %s after the turn was stopped. Its result was not recorded, because gnosh had already gone on without it.",
 			call.Name, span(a.clock.Now().Sub(began))))
 	}
+}
+
+// resultShare is the most of the model's window one tool result may take:
+// a quarter. A result that fills the window makes each summary after it
+// in vain, since the model reads it again and fills the window again, and
+// one bigger than the room a summary leaves can never be sent at all (the
+// compaction review of 2026-11-19, on a model with a 32K window: Read
+// gives up to 25,000 tokens).
+const resultShare = 4
+
+// fitResultToWindow cuts a tool result's text to a quarter of the model's
+// window, with a line that says it was cut and how to have the rest. On a
+// model with a large window the tools' own limits are smaller than that,
+// and nothing is cut here.
+func (a *Agent) fitResultToWindow(res core.ToolResult) core.ToolResult {
+	window := a.setup().model.Info.ContextWindow
+	if window <= 0 {
+		return res
+	}
+	most := window / resultShare
+	total := a.estBlocks(res.Content, false)
+	if total <= most {
+		return res
+	}
+	out := make([]core.Block, 0, len(res.Content)+1)
+	left := most
+	for _, b := range res.Content {
+		if b.Type != core.BlockText {
+			out = append(out, b)
+			continue
+		}
+		n := a.est(b.Text)
+		switch {
+		case n <= left:
+			out = append(out, b)
+			left -= n
+		case left > 0:
+			b.Text = cutTo(b.Text, len(b.Text)*left/max(n, 1))
+			out = append(out, b)
+			left = 0
+		}
+	}
+	out = append(out, core.Text(fmt.Sprintf("[The output was cut here, to about %d tokens, a quarter of the model's window: it went on for about %d tokens in all. Read the rest in parts (offset and limit), or narrow what the call asks for.]", most, total)))
+	res.Content = out
+	return res
+}
+
+// cutTo cuts text to at most n bytes, at the end of a line when there is
+// one in the last tenth, and never inside a character.
+func cutTo(text string, n int) string {
+	if n >= len(text) {
+		return text
+	}
+	n = max(n, 0)
+	for n > 0 && !utf8.RuneStart(text[n]) {
+		n--
+	}
+	if i := strings.LastIndexByte(text[:n], '\n'); i >= n*9/10 {
+		n = i + 1
+	}
+	return text[:n]
 }
 
 // sayable returns a tool result's content as a model can be sent it: no
@@ -588,14 +778,14 @@ func sayable(content []core.Block) []core.Block {
 }
 
 // runTool calls a tool and catches a panic in it.
-func runTool(ctx context.Context, tool core.Tool, call core.ToolCall, env *core.ToolEnv) (res core.ToolResult, err error, crash any, stack []byte) {
+func runTool(ctx context.Context, tool core.Tool, call core.ToolCall, env *core.ToolEnv) (res core.ToolResult, crash any, stack []byte, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			crash, stack = p, debug.Stack()
 		}
 	}()
 	res, err = tool.Run(ctx, call, env)
-	return res, err, nil, nil
+	return res, nil, nil, err
 }
 
 // cleanResult passes a result through the wiring's function, and keeps the
@@ -635,7 +825,7 @@ func (r *round) finish(d execDone) {
 	}
 	c.parts = append(c.parts, d.verdict.Context...)
 	if d.verdict.Halt {
-		r.haltNow(firstNonEmpty(d.verdict.Reason, "a hook ended the turn after "+c.call.Name), "after-tool")
+		r.haltNow(firstNonEmpty(d.verdict.Reason, "a hook ended the turn after "+c.call.Name), "after-tool", false)
 	}
 	r.record(c)
 }
@@ -701,11 +891,19 @@ func (r *round) record(c *callState) {
 		}
 		c.res.Content = sayable(c.res.Content)
 	}
+	if c.rerouted != "" {
+		c.res.Content = append([]core.Block{core.Text(a.mark(c.rerouted))}, c.res.Content...)
+		c.rerouted = ""
+	}
 	if c.ran {
 		if why, ok := c.res.Meta[MetaHalt].(string); ok && strings.TrimSpace(why) != "" {
-			r.haltNow(why, c.call.Name)
+			planned, _ := c.res.Meta[MetaPlanned].(bool)
+			r.haltNow(why, c.call.Name, planned)
 		}
 	}
+	a.mu.Lock()
+	delete(a.unfinished, c.call.ID)
+	a.mu.Unlock()
 	a.emit(&ToolEndEvent{
 		CallID: c.call.ID, Name: c.call.Name, Input: c.input, Result: c.res, Duration: c.dur,
 		Denied: c.denied, Unattended: c.unattended, Interrupted: c.interrupted, Ran: c.ran,

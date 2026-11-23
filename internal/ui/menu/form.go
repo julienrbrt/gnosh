@@ -49,6 +49,10 @@ func (a Answer) Empty() bool { return len(a.Picked) == 0 && a.Other == "" }
 type FormOptions struct {
 	// Questions are the questions, in order.
 	Questions []Question
+	// Lead stands at the top of every tab: who asks and why, when that is
+	// not the model (an MCP server's message). At most leadRows rows of it
+	// are drawn.
+	Lead string
 	// ReviewTitle and ReviewNote stand at the top of the last tab, where
 	// the answers are looked over before they are sent: "Review your
 	// answers" and nothing, when empty.
@@ -59,6 +63,9 @@ type FormOptions struct {
 	Metrics   text.Metrics
 }
 
+// leadRows is the most rows a form's lead takes.
+const leadRows = 4
+
 // Form asks several questions at once, one tab each, with a last tab on
 // which the answers are looked over and sent. It is what the model's
 // question tool shows. A form of one question has no tabs and no review:
@@ -67,6 +74,7 @@ type Form struct {
 	frame
 	qs                      []Question
 	reviewTitle, reviewNote string
+	lead                    string
 	st                      []qstate
 	tab                     int  // the question in front; len(qs) is the review
 	typing                  bool // the keys go to the text field of the question in front
@@ -88,6 +96,7 @@ func NewForm(o FormOptions) *Form {
 		qs:          make([]Question, len(o.Questions)),
 		reviewTitle: lines(o.ReviewTitle),
 		reviewNote:  lines(o.ReviewNote),
+		lead:        lines(o.Lead),
 		st:          make([]qstate, len(o.Questions)),
 	}
 	if f.reviewTitle == "" {
@@ -421,6 +430,13 @@ func (f *Form) Render(width int) View {
 		return v
 	}
 	inner := max(width-f.gutter(), 1)
+	if f.lead != "" {
+		lead := f.wrap(f.th.Description.Render(f.lead), width, "", "")
+		if len(lead) > leadRows {
+			lead = append(lead[:leadRows-1:leadRows-1], f.th.Description.Render("…"))
+		}
+		v.Lines = append(v.Lines, lead...)
+	}
 	if len(f.qs) > 1 {
 		v.Lines = append(v.Lines, f.tabsLine(width))
 	}

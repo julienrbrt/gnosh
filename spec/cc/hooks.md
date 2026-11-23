@@ -801,49 +801,68 @@ second model consulted from settings.
 
 ## What gnosh adopts
 
+Checked against the code on 16 November 2026. `[x]` is built, `[~]` is
+built in part (what is missing is said), `[ ]` is not built.
+
 **P0**
 
-- [ ] The `hooks` settings shape (event → matcher group → handlers), merged
+- [x] The `hooks` settings shape (event → matcher group → handlers), merged
       across settings files, duplicates run once.
-- [ ] `type: "command"`, shell form and exec form (`args`), `timeout`,
+- [x] `type: "command"`, shell form and exec form (`args`), `timeout`,
       `${CLAUDE_PROJECT_DIR}` substitution and export.
-- [ ] Matcher rules of 2.1 (exact / list / unanchored regex / match-all).
-- [ ] Common input fields: `session_id`, `transcript_path`, `cwd`,
+- [x] Matcher rules of 2.1 (exact / list / unanchored regex / match-all).
+- [x] Common input fields: `session_id`, `transcript_path`, `cwd`,
       `hook_event_name`, `permission_mode`, `agent_id`, `agent_type`.
-- [ ] Exit-code contract (0 / 2 / other), the stdout-JSON recognition rule,
-      the stdout × exit table.
-- [ ] Universal JSON fields `continue`, `stopReason`, `systemMessage`.
-- [ ] Events `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+- [x] Exit-code contract (0 / 2 / other), the stdout-JSON recognition rule,
+      the stdout × exit table. (gnosh is stricter: a hook that could not
+      evaluate blocks, `spec/gnosh/harness-hooks.md`.)
+- [x] Universal JSON fields `continue`, `stopReason`, `systemMessage`.
+- [x] Events `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
       `PostToolUse`, `PostToolUseFailure`, `Stop`, `SessionEnd` with the
       inputs and outputs above, including `updatedInput`,
       `additionalContext`, `stop_hook_active`, `last_assistant_message`.
-- [ ] Parallel execution; no controlling terminal for hook processes.
-- [ ] `disableAllHooks`.
-- [ ] Unknown names and unbuilt observation-only events are skipped with a
+- [x] Parallel execution; no controlling terminal for hook processes.
+- [x] `disableAllHooks`.
+- [x] Unknown names and unbuilt observation-only events are skipped with a
       notice; an unbuilt event that can block, or an unrunnable handler on
       one, stops startup (fail closed); an unevaluable `if` runs the hook.
+      (gnosh: every unknown or unbuilt event stops startup, HOOK-2.)
 
 **P1**
 
-- [ ] `if` filter with permission-rule matching.
-- [ ] `PermissionRequest` (with permission update entries), `Notification`
+- [x] `if` filter with permission-rule matching.
+- [~] `PermissionRequest` (with permission update entries), `Notification`
       (`permission_prompt` at 6 s, `idle_prompt` at 60 s), `SubagentStart`,
       `SubagentStop`, `PreCompact`, `PostCompact`, `StopFailure`,
-      `InstructionsLoaded`.
-- [ ] `async`, `asyncRewake`, `onFailure`, `statusMessage`.
-- [ ] `terminalSequence` with its allowlist; `CLAUDE_ENV_FILE`.
-- [ ] `updatedToolOutput`; the 10,000-character cap with file overflow.
-- [ ] `/hooks` browser; hooks in skill and sub-agent frontmatter; `once`.
-- [ ] Debug-log lines; `hook_*` stream-json events.
-- [ ] Hooks held until workspace trust in interactive sessions.
+      `InstructionsLoaded`. (All built; a PermissionRequest allow that
+      changes the input or the permissions is not applied, and the
+      question is shown instead.)
+- [~] `async`, `asyncRewake`, `onFailure`, `statusMessage`. (`onFailure`:
+      only "continue" is taken; a failing hook already blocks.)
+- [~] `terminalSequence` with its allowlist; `CLAUDE_ENV_FILE`.
+      (`CLAUDE_ENV_FILE` is built; a terminal sequence is noted and not
+      written.)
+- [~] `updatedToolOutput`; the 10,000-character cap with file overflow.
+      (`updatedToolOutput` and `updatedMCPToolOutput` are built, read as
+      text; one gnosh cannot read withholds the output, DECISIONS 70. The
+      cap with file overflow is not.)
+- [~] `/hooks` browser; hooks in skill and sub-agent frontmatter; `once`.
+      (`/hooks` is a read-only browser, DECISIONS 78; skills' hooks and
+      `once` are built.)
+- [~] Debug-log lines; `hook_*` stream-json events. (Each hook's record
+      is in the log; no stream-json events.)
+- [x] Hooks held until workspace trust in interactive sessions.
 
 **P2**
 
-- [ ] `PostToolBatch`, `UserPromptExpansion`, `CwdChanged`, `FileChanged`,
+- [~] `PostToolBatch`, `UserPromptExpansion`, `CwdChanged`, `FileChanged`,
       `DirectoryAdded`, `ConfigChange`, `Setup`, `PreModelSwitch`,
       `PostModelSwitch`, `MessageDisplay`, `WorktreeCreate`,
-      `WorktreeRemove`, `Elicitation`, `ElicitationResult`.
-- [ ] `type: "http"`, `"mcp_tool"`, `"prompt"`, `"agent"`.
+      `WorktreeRemove`, `Elicitation`, `ElicitationResult`. (Built: all but
+      `Setup`, `MessageDisplay`, `WorktreeCreate`, `WorktreeRemove`,
+      `Elicitation` and `ElicitationResult`.)
+- [~] `type: "http"`, `"mcp_tool"`, `"prompt"`, `"agent"`. (`http` and
+      `mcp_tool` are built; `prompt` and `agent` need a second model.)
 - [ ] `permissionDecision: "defer"`.
 
 ## Deliberately not adopted

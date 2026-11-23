@@ -35,7 +35,7 @@ What it promises:
 - **One memory, one task list.** A plan, a checklist and a "todo list" all
   go to mem. There is no separate session todo tool: the earlier one was
   removed outright ("one task list"), because a list made there was gone in
-  the next session. The task list the user sees under the prompt is drawn
+  the next session. The task list the user sees above the prompt is drawn
   from mem (§15).
 - **Typed, not prose.** Four kinds of thing: a **Todo** (work, or a question
   or request for the user), a **Fact**, a **Rule**, and an **Op** (one
@@ -1391,7 +1391,7 @@ landed; it crosses the harness's tool-output trust line. See
 
 ---
 
-## 15. The task list under the prompt
+## 15. The task list above the prompt
 
 "mem is the one task list": the session's visible task list is only ever
 written from mem. After each kept mem call, the result names the top-level

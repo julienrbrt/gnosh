@@ -50,11 +50,15 @@ const hostMarker = "gnosh-host-cwd:"
 // prints arrives as one stream in the order written, and whatever comes
 // down ssh's standard error after the report is ssh's own word; and the
 // command is given the same few variables as a command here (fixedEnv), so
-// that a script there can also tell an AI agent is running it.
+// that a script there can also tell an AI agent is running it. In zsh, the
+// login shell of a Mac, a word that begins with "=" stands for a command's
+// path, so "[ a == b ]" and "echo ====" failed with "= not found"; that is
+// turned off first, as Claude Code 2.1.328 does, and the other shells pass
+// over it.
 //
 // It needs a login shell that reads sh: sh, bash, dash, ksh or zsh.
 func remoteLead() string {
-	return `printf '` + hostMarker + `%s\n' "$PWD" >&2; exec 2>&1; export ` + strings.Join(fixedEnv(), " ") + `; eval `
+	return `[ -n "${ZSH_VERSION-}" ] && setopt no_equals; printf '` + hostMarker + `%s\n' "$PWD" >&2; exec 2>&1; export ` + strings.Join(fixedEnv(), " ") + `; eval `
 }
 
 // remoteScript is the one argument ssh is given after the destination: what
@@ -75,18 +79,31 @@ func remoteScript(command string) string {
 //	                                 keys are known stays ssh's own business; that an unknown one
 //	                                 is refused is gnosh's rule
 //	-o ConnectTimeout=20             reaching the machine and logging in may take this long
+//	-a -x                            no agent and no X display are lent to the other machine,
+//	-o ClearAllForwardings=yes       and no port is forwarded either way, whatever the person's
+//	-o PermitLocalCommand=no         ssh configuration says: with the person's agent a command
+//	                                 there could log in, with the person's keys, to machines
+//	                                 nobody declared, and a forward back would open a way into
+//	                                 this one; and nothing runs here after the login
+//	-o ControlMaster=no              a connection the person shares is used, but gnosh's never
+//	                                 becomes one: it would outlive the command, or end with it
+//	                                 for the person's own sessions (the hosts review of
+//	                                 2026-11-19)
 //	--                               nothing after it is read as an option, whatever it looks like
 //	destination                      as the person declared it
 //	the command                      one argument, read only by the shell of the other machine
 //
-// Keys, agents, ports, jump hosts and shared connections are left to the
-// person's ssh configuration.
+// Keys and jump hosts are left to the person's ssh configuration.
 func (m *Manager) sshArgs(h *Host, command string) []string {
 	return []string{
 		"-T",
 		"-o", "BatchMode=yes",
 		"-o", "StrictHostKeyChecking=yes",
 		"-o", "ConnectTimeout=" + strconv.Itoa(max(int(math.Ceil(m.opt.ConnectTimeout.Seconds())), 1)),
+		"-a", "-x",
+		"-o", "ClearAllForwardings=yes",
+		"-o", "PermitLocalCommand=no",
+		"-o", "ControlMaster=no",
 		"--",
 		h.Target,
 		remoteScript(command),
@@ -418,9 +435,12 @@ func (j *job) farEnd(e *ending) farEnd {
 	h := j.host
 	started, dir, before, after := j.side.read()
 	f := farEnd{started: started, dir: dir}
+	// (What came on the error stream around the command is ssh's on this
+	// machine, or the login's on the other one, whose startup files may
+	// print: it was all called ssh's. The hosts review of 2026-11-19.)
 	said := func(text string) {
 		if line := oneLine(text, 700); line != "" {
-			f.notes = append(f.notes, "ssh on this machine said: "+line)
+			f.notes = append(f.notes, "ssh on this machine, or the login on "+h.Name+", said: "+line)
 		}
 	}
 	switch {

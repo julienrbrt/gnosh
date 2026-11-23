@@ -6,8 +6,8 @@ Thoughts kept on it:
 What the user asked in this turn:
 {{ask}}]]
 
-Files the agent's edits and writes changed in the todo: [[{{files}}]][[{{no_files?}}none]]
-Commands it ran there:
+Files the agent's edits and writes changed in the todo: [[{{files}}]][[{{no_files?}}none]][[, and {{more_files}} more]]
+Commands it ran there[[ ({{left_out}} earlier ones are not listed)]]:
 [[{{commands}}]][[{{no_commands?}}none]]
 
 The result the agent is closing the todo with, which is its claim:

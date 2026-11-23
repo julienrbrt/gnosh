@@ -130,10 +130,15 @@
 // there), a device, socket or pipe, and a file that looks binary (a NUL
 // byte in its first 8 KiB) are errors that say what the thing is. PNG,
 // JPEG, GIF and WebP files, told by their first bytes, come back as an
-// image block after a line of text, up to Options.ReadMaxImageBytes;
-// Read does not shrink a larger one. PDFs and notebooks are refused as
-// not supported yet. The arguments pages and allow_large, which Claude
-// Code's Read takes, are accepted and not acted on.
+// image block after a line of text, up to Options.ReadMaxImageBytes; a
+// PNG, JPEG or GIF longer than 1568 pixels on a side or larger than that
+// is shrunk to fit (shrink.go), and a WebP larger than that is refused.
+// A PDF comes back as its text by pages (pdf.go), a notebook as its cells
+// (notebook.go). allow_large, as Claude Code's Read takes it, reads past
+// the usual limits as far as Options.ReadRoom says the context has room
+// for. Every text Read stops short of Options.ReadResultMost, line
+// numbers and all: the loop would cut a longer result, and the lines Read
+// records as read must be the lines the model is shown.
 //
 // # Write
 //
@@ -179,9 +184,13 @@
 // is found (left to right, none overlapping) is replaced. An empty
 // old_string, and one equal to new_string, are refused.
 //
-// The session must have been shown every line the edit touches, and the
-// file must not have changed on disk since. A file read only in part can
-// be edited in the part that was read.
+// The session must have been shown every line the edit touches. A file
+// read only in part can be edited in the part that was read. A file that
+// has changed on disk since can still be edited where old_string matches
+// it as it is now, at one place: the reply says the rest holds changes
+// the session has not seen, and only the lines the edit put in count as
+// seen afterwards. Not found, or found more than once, it is to be read
+// again.
 //
 // Edit keeps everything it does not replace exactly as it was: the bytes
 // before, between and after the replacements, the byte order mark, a
@@ -228,7 +237,10 @@
 // Options.GlobSkipHidden change the last two. (Claude Code's Glob does
 // not honour ignore rules by default; this one does because the brief for
 // this package asks for it.) A directory named outright, in path or at
-// the start of the pattern, is searched whatever the rules say about it.
+// the start of the pattern, is searched whatever the rules say about it,
+// and so is a name the pattern spells out in full anywhere in it: .env,
+// **/.env and **/dist/app.js list those files though .gitignore names
+// them.
 //
 // # Grep
 //
@@ -250,8 +262,11 @@
 // options turn the first, second and fourth of those off. A file or
 // directory given as path is searched whatever it is called. glob keeps
 // the files whose name matches (or, for a glob with a slash, whose path
-// below the search directory does; a leading "!" turns it round); type
-// keeps one kind of file from the table in filetypes.go.
+// below the search directory does), and reaches them even where they are
+// hidden or ignored, as ripgrep's glob does; a leading "!" turns it round,
+// and then leaves out directories it names as well ("!vendor"; "!vendor/"
+// directories only). type keeps one kind of file from the table in
+// filetypes.go.
 //
 // The three modes: files_with_matches lists the files that have a match;
 // count lists each such file with its number of matching lines (of

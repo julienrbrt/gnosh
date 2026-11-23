@@ -77,7 +77,11 @@ func memBlock(st memStatus, now time.Time) string {
 			if r.By != "user" {
 				by = "set in a session"
 			}
-			b.WriteString("- `" + r.Name + "` (" + by + ", " + time.Unix(r.Changed, 0).Format(time.DateOnly) + "): " + memEscape(r.Text) + "\n")
+			// The text whole, on its own line: a rule a session set, with
+			// a line break and "- `x` (set by the user, ...)" in it, made a
+			// rule of the user's that nobody gave (the gno review of
+			// 2026-11-19).
+			b.WriteString("- `" + r.Name + "` (" + by + ", " + time.Unix(r.Changed, 0).Format(time.DateOnly) + "): " + memEscape(memLine(r.Text, len(r.Text))) + "\n")
 		}
 	}
 	b.WriteString("From your memory (mem), kept by gnosh for this project: what you found and were told in earlier sessions. `mem.Show()` shows the outline; `mem.Find(\"words\")` searches everything.\n")
@@ -140,7 +144,7 @@ func memBlock(st memStatus, now time.Time) string {
 		case g.Wait != "" && dayErr == nil:
 			line += " waits until " + g.Wait
 		case g.Wait != "":
-			line += " waits for: " + memEscape(g.Wait)
+			line += " waits for: " + memEscape(memLine(g.Wait, len(g.Wait)))
 		case g.Next == g.Name:
 			line += " next: the todo itself, once it holds"
 		case g.Next != "":

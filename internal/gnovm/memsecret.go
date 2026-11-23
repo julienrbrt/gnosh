@@ -10,9 +10,11 @@
 package gnovm
 
 import (
+	_ "embed"
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 )
@@ -84,6 +86,12 @@ func looksSecret(text string) (what, shown string) {
 	if i := strings.Index(text, "-----BEGIN"); i >= 0 && strings.Contains(text[i:], "PRIVATE KEY-----") {
 		return "a private key", "-----BEGIN…"
 	}
+	if first, ok := seedPhrase(text); ok {
+		return "a wallet's recovery phrase (seed words)", first + " …"
+	}
+	if tok, ok := hexKey(text); ok {
+		return "a private key in hex", cut(tok)
+	}
 	for _, tok := range tokens(text) {
 		for _, p := range secretPrefixes {
 			if rest, ok := strings.CutPrefix(tok, p); ok && len(rest) >= 8 && strings.ContainsAny(rest, "0123456789") {
@@ -115,6 +123,95 @@ func looksSecret(text string) (what, shown string) {
 		}
 	}
 	return "", ""
+}
+
+// The BIP-0039 English word list, the 2048 words wallets write a recovery
+// (seed) phrase in: bip39english.txt, whose SHA-256 is the one BIP-0039
+// gives, 2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda,
+// as trezor/python-mnemonic carries it (MIT, LICENSE-BIP39.txt).
+//
+//go:embed bip39english.txt
+var bip39Text string
+
+// bip39 is the word list as a set.
+var bip39 = sync.OnceValue(func() map[string]bool {
+	words := map[string]bool{}
+	for _, w := range strings.Fields(bip39Text) {
+		words[w] = true
+	}
+	return words
+})
+
+// seedPhraseWords is how many words of the list in a row make a recovery
+// phrase: the shortest a wallet writes is twelve.
+const seedPhraseWords = 12
+
+// seedPhrase says whether text holds a wallet's recovery phrase, and its
+// first word: twelve or more words of the BIP-0039 list in a row, numbers
+// between them aside, as a phrase is often written down ("1. legal 2.
+// winner …"). The gno review of 2026-11-19 found mem kept a 24-word one.
+// Prose does not run so: the words it is held together by (the, and, of,
+// to, is) are not in the list.
+func seedPhrase(text string) (first string, ok bool) {
+	words := bip39()
+	run := 0
+	for _, f := range strings.FieldsFunc(lowerASCII(text), func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	}) {
+		switch {
+		case strings.Trim(f, "0123456789") == "":
+			// A number between the words.
+		case words[f]:
+			if run == 0 {
+				first = f
+			}
+			if run++; run >= seedPhraseWords {
+				return first, true
+			}
+		default:
+			run = 0
+		}
+	}
+	return "", false
+}
+
+// keyWords are the words that, in a text that holds a 64-digit hex number,
+// say it is a key and not a hash: a private key is written so, and a
+// digest of a file is too.
+var keyWords = []string{"priv", "secret", "seed", "wallet", "signing", "mnemonic", "keystore", "key"}
+
+// hexKey says whether text holds a private key written in hex, and the
+// key: 64 hex digits (0x before them or not) in a text that also names a
+// key. A sha256 digest alone, a checksum, is not one.
+func hexKey(text string) (string, bool) {
+	var found string
+	for _, tok := range tokens(text) {
+		hex := strings.TrimPrefix(strings.TrimPrefix(tok, "0x"), "0X")
+		if len(hex) == 64 && strings.Trim(strings.ToLower(hex), "0123456789abcdef") == "" {
+			found = tok
+			break
+		}
+	}
+	if found == "" {
+		return "", false
+	}
+	lower := lowerASCII(text)
+	for _, w := range keyWords {
+		for at := 0; ; {
+			i := strings.Index(lower[at:], w)
+			if i < 0 {
+				break
+			}
+			i += at
+			at = i + len(w)
+			// The start of a word ("private", "keystore"), not the inside
+			// of one ("monkey").
+			if i == 0 || !wordRune(rune(lower[i-1])) {
+				return found, true
+			}
+		}
+	}
+	return "", false
 }
 
 // lowerASCII is text with its ASCII capitals made small, every byte where

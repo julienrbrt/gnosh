@@ -1,6 +1,10 @@
 package prompt
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
 
 // Mark is the one character Defuse puts into a control sequence to make it
 // harmless: U+200B, the zero-width space. It takes no room on a screen, a
@@ -159,21 +163,64 @@ func templateTag(rest string) bool {
 	return false
 }
 
-// ownTag reports whether rest goes on as one of gnosh's own tags: blanks,
-// an optional "/", blanks, the tag's name in any letter case, blanks, and
-// the closing ">".
+// ownTag reports whether rest goes on as one of gnosh's own tags.
 func ownTag(rest string) bool {
-	i := skipBlanks(rest, 0)
-	if i < len(rest) && rest[i] == '/' {
-		i = skipBlanks(rest, i+1)
-	}
-	return closesTag(rest[i:], tagName) || closesTag(rest[i:], memTag)
+	return tagNamed(rest, tagName) || tagNamed(rest, memTag) || tagNamed(rest, agentMemoryTag)
 }
 
-// closesTag reports whether s is name, in any letter case, then blanks,
-// then ">".
-func closesTag(s, name string) bool {
-	if len(s) <= len(name) {
+// tagNamed reports whether rest, the text that follows a "<", goes on as a
+// tag called name, opening or closing, in any letter case: blanks, an
+// optional "/", blanks, the name, blanks and the closing ">", as in
+// "< / gnosh >"; or, with nothing between the "<" or "</" and the name,
+// the name and a blank or a "/", as a tag with more in it begins:
+// <gnosh source="x">, <gnosh/>. A blank between the "<" and a name that
+// some other character follows is a comparison, as in "if used < mem {".
+// After the name, a blank is any space Unicode has (a no-break space, a
+// vertical tab) or a character that cannot be seen: a model reads past
+// them, and <gnosh` + bs + `u00a0source="x"> reads as gnosh's tag.
+func tagNamed(rest, name string) bool {
+	i := skipBlanks(rest, 0)
+	tight := i == 0
+	if i < len(rest) && rest[i] == '/' {
+		j := skipBlanks(rest, i+1)
+		tight = tight && j == i+1
+		i = j
+	}
+	s := rest[i:]
+	if !hasName(s, name) {
+		return false
+	}
+	after := s[len(name):]
+	if j := skipWide(after); j < len(after) && after[j] == '>' {
+		return true
+	}
+	if !tight || after == "" {
+		return false
+	}
+	r, _ := utf8.DecodeRuneInString(after)
+	return r == '/' || wideBlank(r)
+}
+
+// wideBlank reports whether r is a blank after a tag's name: a space of
+// any kind Unicode has, or a character that takes no room and is not seen.
+func wideBlank(r rune) bool {
+	return unicode.IsSpace(r) || unicode.Is(unicode.Zs, r) || unicode.Is(unicode.Cf, r)
+}
+
+// skipWide returns the index of the first rune of s that is not a
+// wideBlank.
+func skipWide(s string) int {
+	for i, r := range s {
+		if !wideBlank(r) {
+			return i
+		}
+	}
+	return len(s)
+}
+
+// hasName reports whether s begins with name, in any letter case.
+func hasName(s, name string) bool {
+	if len(s) < len(name) {
 		return false
 	}
 	for j := 0; j < len(name); j++ {
@@ -185,8 +232,7 @@ func closesTag(s, name string) bool {
 			return false
 		}
 	}
-	i := skipBlanks(s, len(name))
-	return i < len(s) && s[i] == '>'
+	return true
 }
 
 // skipBlanks returns the index of the first byte of s at or after i that

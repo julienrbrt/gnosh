@@ -350,22 +350,23 @@ func TestTooManyProcessesLeftRunning(t *testing.T) {
 	}
 }
 
-func TestDaemonThatLetsGoIsNotReported(t *testing.T) {
+func TestDaemonThatLetsGoIsReported(t *testing.T) {
 	t.Parallel()
 	m := newManager(t, Options{})
 	env := newEnv(t)
-	// A process that does not hold the command's output is none of the
-	// tool's business: the command ends cleanly and nothing is said.
+	// A process that does not hold the command's output does not hold the
+	// call up: the command ends cleanly, and is no failure. It goes on
+	// running, and the result says so and how to stop it (Close stops it:
+	// TestLetGoIsStoppedAtClose).
 	res := run(t, t.Context(), m, BashName, env, args{argCommand: `sleep 300 >/dev/null 2>&1 & echo "daemon=$!"`, argTimeout: 60_000})
 	_, body, notes := parts(res)
 	pids := pidsIn(body)
-	if len(notes) != 0 || res.IsError || len(pids) != 1 {
-		t.Fatalf("result = %q with notes %q; want a clean end", body, notes)
+	if res.IsError || len(pids) != 1 || len(notes) != 1 || !strings.Contains(notes[0], "let go of its output") || !strings.Contains(notes[0], "kill -- -") {
+		t.Fatalf("result = %q with notes %q; want a clean end that says what runs on", body, notes)
 	}
 	if !alive(pids["daemon"]) {
 		t.Error("a process that let go of the output was killed")
 	}
-	// It is this test's to clean up, since the manager rightly leaves it.
 	syscall.Kill(pids["daemon"], syscall.SIGKILL)
 	allGone(t, pids)
 }

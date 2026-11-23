@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gnosh-ai/gnosh/internal/core"
+	"github.com/gnosh-ai/gnosh/internal/shellquote"
 )
 
 // The few rules about commands that are the shell tool's own, and the notes
@@ -191,37 +192,71 @@ func reaches(command string) string {
 	return ""
 }
 
-// heredocRe finds where a here-document begins on a line: << or <<-, and
-// the word that ends it, quoted or not.
-var heredocRe = regexp.MustCompile(`<<(-?)\s*(?:'([^']*)'|"([^"]*)"|\\?([A-Za-z0-9_]+))`)
+// gnokeyPassword reports whether a command hands gnokey a password on its
+// standard input: gnokey's -insecure-password-stdin, in either spelling and
+// wherever it stands (behind a pipe, in quotes, split by them), which is
+// the one way gnokey takes a password without a terminal. Only gnosh's
+// gnokey tool uses it, for a password the user typed at its masked prompt
+// (spec/gnosh/harness-tools.md, TOOL-41).
+// GnokeyPassword reports whether a command gives gnokey a password on its
+// standard input (-insecure-password-stdin), which no command here may
+// do: for the person's own commands, which are kept in the session's file
+// and shown to the model, it is caught before either.
+func GnokeyPassword(command string) bool { return gnokeyPassword(command) }
 
-// commandLines are the lines of a command that hold commands: not blank,
-// not comments, and not the text of a here-document.
+func gnokeyPassword(command string) bool {
+	// The flag's letters in order, once what a shell fills in with nothing
+	// or takes out is gone: $() and ${X} when nothing is in them, $X,
+	// quotes and backslashes. -insecure-pass$()word-stdin was let through
+	// (the gno review of 2026-11-19). (A shell can build any word; this
+	// keeps the plain ways from working, and the gnokey tool's prompt is
+	// the way that signs.)
+	plain := shellFills.ReplaceAllString(command, "")
+	var b strings.Builder
+	for _, r := range plain {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r - 'A' + 'a')
+		}
+	}
+	return strings.Contains(b.String(), "insecurepasswordstdin")
+}
+
+// shellFills finds what a shell fills in when the command runs: a command
+// substitution, a ${...}, a $NAME, a `...`.
+var shellFills = regexp.MustCompile("\\$\\([^()]*\\)|\\$\\{[^{}]*\\}|\\$[A-Za-z_][A-Za-z0-9_]*|`[^`]*`")
+
+// commandLines are the lines of a command where the shell starts reading
+// a command (shellquote.CommandStarts: not the text of a here-document or
+// a line inside quotes), each with the lines it goes on into by a
+// backslash at its end, and that are not blank or comments.
 func commandLines(command string) []string {
 	var out []string
-	var ends []string // the words that end the open here-documents, in order
-	var dash []bool   // each may stand indented by tabs (<<-)
-	for _, line := range strings.Split(command, "\n") {
-		if len(ends) > 0 {
-			l := line
-			if dash[0] {
-				l = strings.TrimLeft(l, "\t")
-			}
-			if l == ends[0] {
-				ends, dash = ends[1:], dash[1:]
-			}
+	lines := strings.Split(command, "\n")
+	starts := shellquote.CommandStarts(command)
+	for i := 0; i < len(lines); i++ {
+		if !starts[i] {
 			continue
+		}
+		line := lines[i]
+		for i+1 < len(lines) && !starts[i+1] && continues(line) {
+			i++
+			line = line[:len(line)-1] + lines[i]
 		}
 		if t := strings.TrimSpace(line); t == "" || strings.HasPrefix(t, "#") {
 			continue
 		}
 		out = append(out, line)
-		for _, m := range heredocRe.FindAllStringSubmatch(line, -1) {
-			ends = append(ends, m[2]+m[3]+m[4])
-			dash = append(dash, m[1] == "-")
-		}
 	}
 	return out
+}
+
+// continues reports whether a line ends with a backslash that is not
+// itself escaped: the shell reads on into the next line.
+func continues(line string) bool {
+	return (len(line)-len(strings.TrimRight(line, `\`)))%2 == 1
 }
 
 // leadingSleep returns how long a command only sleeps before it does
@@ -290,9 +325,15 @@ func (m *Manager) rules(a bashArgs, env *core.ToolEnv, person bool) error {
 				argBackground, argHost, h.Name)
 		}
 		if n := len(remoteScript(a.command)); n > maxRemoteCommand {
-			return fmt.Errorf("the command is %s long, and a command for another machine goes to ssh as one argument, of at most %s. Send it in parts: a long file can be written on %s by several commands that each add to it (cat >> FILE <<'EOF' ... EOF)",
-				byteSize(int64(len(a.command))), byteSize(maxRemoteCommand), h.Name)
+			return fmt.Errorf("the command is %s long, %s as it goes to ssh, quoted, as one argument, of at most %s. Send it in parts: a long file can be written on %s by several commands that each add to it (cat >> FILE <<'EOF' ... EOF)",
+				byteSize(int64(len(a.command))), byteSize(int64(n)), byteSize(maxRemoteCommand), h.Name)
 		}
+	}
+	if gnokeyPassword(a.command) {
+		if person {
+			return errors.New("the command gives gnokey a password on its standard input, and a command typed here is kept in the session's file with the password in it. Sign in a terminal of your own")
+		}
+		return errors.New("the command gives gnokey a password on its standard input (-insecure-password-stdin), which no command here may do: a key's password is typed by the user, at a masked prompt that only the gnokey tool opens. Call that tool with the gnokey command instead, without the flag; where there is no such tool (nobody is at the terminal), give the user the exact command to run in their own terminal, and stop. Never ask for a password, and do not look for another way to give one")
 	}
 	if person {
 		return nil
@@ -439,6 +480,81 @@ func (m *Manager) hints(a bashArgs, e *ending, body string, own bool) []string {
 		}
 	case e.code == 0 && a.host != nil && onlyChangesDirectory(a.command):
 		notes = append(notes, "a change of directory does not carry over on a host: the next command on "+a.host.Name+" starts in the account's home directory again. Put the cd and the work in one command")
+	case e.code != 0 && strings.Contains(a.command, "gnokey") && strings.Contains(body, "inappropriate ioctl for device"):
+		// (gnokey asked for a password at a terminal: the old fork's
+		// Qwen, told only that it could not sign, spent its whole window
+		// in the shell looking for another way, TOOL-41.)
+		notes = append(notes, "gnokey asked for the key's password, and a command here has no terminal to type it in, nor may it be given one: signing goes through the gnokey tool, which asks the user for the password at a masked prompt. If you have that tool, call it with this gnokey command; if not, give the user the exact command to run in their own terminal, and stop. Do not look for another way")
 	}
 	return notes
+}
+
+// writeSigns are what a command says when the sandbox stopped a write
+// outside the folders it may write in; netSigns, when it stopped a
+// connection; trustSigns, when a program could not check a certificate
+// with macOS's trust service, out of the sandbox's reach.
+var (
+	writeSigns = []string{"Read-only file system", "Operation not permitted"}
+	netSigns   = []string{"Could not resolve host", "Temporary failure in name resolution", "Name or service not known",
+		"nodename nor servname provided", "Network is unreachable", "Couldn't connect to server", "Connection refused",
+		"no such host", "dial tcp", "gnosh's sandbox did not let the command reach", "CONNECT tunnel failed"}
+	trustSigns = []string{"x509: ", "tls: failed to verify certificate"}
+	// (The error gnosh's filter gives a Unix socket on Linux, which
+	// nothing else in the sandbox gives.)
+	unixSigns = []string{"Address family not supported by protocol"}
+)
+
+// sandboxHint is the note under a sandboxed command that failed the way
+// the sandbox makes commands fail: what of the sandbox stopped it (the
+// writes, the network, or both; the rest of the sandbox is not said, as
+// it did not stop it), and the way out of it, where there is one. A line
+// of output the settings say not to report for the command
+// (ignoreViolations) is no sign.
+func (m *Manager) sandboxHint(a bashArgs, e *ending, body string) string {
+	sb := m.opt.Sandbox
+	if !a.sandboxed || sb == nil || e.reason != endExited || e.code == 0 {
+		return ""
+	}
+	var ignore []string
+	for _, ig := range sb.Ignored {
+		if ig.Command == "*" || strings.Contains(a.command, ig.Command) {
+			ignore = append(ignore, ig.What)
+		}
+	}
+	in := func(signs []string) bool {
+		for line := range strings.Lines(body) {
+			if slices.ContainsFunc(signs, func(s string) bool { return strings.Contains(line, s) }) &&
+				!slices.ContainsFunc(ignore, func(w string) bool { return strings.Contains(line, w) }) {
+				return true
+			}
+		}
+		return false
+	}
+	var lets []string
+	if sb.Writes != "" && in(writeSigns) {
+		w := "write only in " + sb.Writes
+		if sb.HidesReads && !in(writeSigns[:1]) {
+			// (Not "Read-only file system": it may as well have been a
+			// read the settings refuse, which is told the same way.)
+			w += ", and read nothing the settings keep from it"
+		}
+		lets = append(lets, w)
+	}
+	if in(netSigns) {
+		lets = append(lets, sb.network())
+	}
+	if sb.NoTrust && in(trustSigns) {
+		lets = append(lets, "check no certificate with macOS's trust service (Go's programs check them with it)")
+	}
+	if in(unixSigns) {
+		lets = append(lets, "open no Unix socket (an agent's, a database's, docker's)")
+	}
+	if len(lets) == 0 {
+		return ""
+	}
+	said := "it ran in the sandbox, which lets it " + strings.Join(lets, ", and ")
+	if sb.Unsandboxed {
+		return said + ": if that is what stopped it, run it again with " + argNoSandbox + " set to true (that call is judged as any command is)"
+	}
+	return said + ", and which cannot be left in this session: if that is what stopped it, tell the person"
 }

@@ -132,7 +132,7 @@ func statusText(s string) string {
 				switch {
 				case r == '\t':
 					b.WriteByte(' ')
-				case r < 0x20 || r == 0x7f || r >= 0x80 && r < 0xa0:
+				case r < 0x20 || r == 0x7f || r >= 0x80 && r < 0xa0, bidiMark(r):
 				default:
 					b.WriteRune(r)
 				}
@@ -140,7 +140,7 @@ func statusText(s string) string {
 		case tok.Complete && tok.IsSGR():
 			b.WriteString(tok.Text)
 			styled = true
-		case tok.IsHyperlink():
+		case tok.IsHyperlink() && plainLink(tok.Text):
 			b.WriteString(tok.Text)
 			uri := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(tok.Text, "\x07"), "\x1b\\"), "\x9c")
 			if i := strings.IndexByte(uri[4:], ';'); i >= 0 {
@@ -155,6 +155,31 @@ func statusText(s string) string {
 		b.WriteString("\x1b[0m")
 	}
 	return b.String()
+}
+
+// plainLink reports whether a link's sequence holds nothing between its
+// start and its end but printable characters: a control or C1 character
+// inside it (U+009C) is one a terminal may take for the end, and what
+// follows then acts on the screen (the status line review of 2026-11-19).
+func plainLink(seq string) bool {
+	body := strings.TrimPrefix(seq, "\x1b]8;")
+	switch {
+	case strings.HasSuffix(body, "\x1b\\"):
+		body = strings.TrimSuffix(body, "\x1b\\")
+	case strings.HasSuffix(body, "\x07"):
+		body = strings.TrimSuffix(body, "\x07")
+	}
+	for _, r := range body {
+		if r < 0x20 || r == 0x7f || r >= 0x80 && r < 0xa0 || bidiMark(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// bidiMark reports whether r changes the order text is drawn in.
+func bidiMark(r rune) bool {
+	return r >= 0x202a && r <= 0x202e || r >= 0x2066 && r <= 0x2069 || r == 0x200e || r == 0x200f || r == 0x061c
 }
 
 // count writes a number with its noun: "1 line", "3 lines".

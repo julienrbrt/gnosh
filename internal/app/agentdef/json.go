@@ -13,8 +13,9 @@ const ScopeCommandLine = "command line"
 // FromJSON reads the definitions of --agents: a JSON object whose keys are
 // the agents' names, each holding the settings a definition file's
 // frontmatter has (description, tools, disallowedTools, model,
-// permissionMode, maxTurns, omitClaudeMd, background, and those this
-// package only notes in Other), with prompt for the file's body. color and
+// permissionMode, maxTurns, omitClaudeMd, background, hooks, skills,
+// effort, mcpServers, memory, autoCompactWindow and the rest), with prompt
+// for the file's body. color and
 // experimental are ignored, as Claude Code ignores them, and any other key
 // is a mistake. Each definition comes back with the scope "command line"
 // and the source "--agents", in the order of their names. An error says
@@ -108,10 +109,23 @@ func FromJSON(text string) ([]Def, error) {
 				if len(events) > 0 {
 					d.Hooks = val
 				}
-			case "mcpServers", "memory", "autoCompactWindow":
-				if string(val) != "null" {
-					d.Other = append(d.Other, key)
+			case "mcpServers":
+				servers, why := mcpServers(val)
+				if why != "" {
+					return nil, fmt.Errorf("the agent %q's mcpServers %s", name, why)
 				}
+				d.MCPServers = servers
+			case "memory":
+				var s string
+				if string(val) != "null" && json.Unmarshal(val, &s) != nil {
+					return nil, bad("user, project or local")
+				}
+				if why := memoryScope(s); why != "" {
+					return nil, fmt.Errorf("the agent %q: %s", name, why)
+				}
+				d.Memory = s
+			case "autoCompactWindow":
+				d.compactWindow(strings.TrimSpace(string(val)))
 			case "color", "experimental":
 			default:
 				return nil, fmt.Errorf("the agent %q has %q, which is not a setting of an agent", name, key)

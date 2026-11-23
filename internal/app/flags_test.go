@@ -310,3 +310,29 @@ func TestEffortAndCwd(t *testing.T) {
 	r := run(t, w, "--cwd", "is/not/there", "-p", "hello").wantCode(t, 1)
 	has(t, "stderr", r.err, "is not a directory that is there")
 }
+
+// After a summary the system prompt is made again, as at the start, so
+// what it is made of now is what the model is told: here the file of
+// --append-system-prompt-file, changed during the session. Claude Code
+// 2.1.328 does so after an automatic summary as after /compact.
+func TestSummaryMakesTheSystemPromptAgain(t *testing.T) {
+	w := apptest.NewWorld(t, apptest.Reply{Text: "First."}, apptest.Reply{Text: "SUMMARY: little."}, apptest.Reply{Text: "Second."})
+	w.Write("more.txt", "FIRST EXTRA\n")
+	s := sit(t, w, "--append-system-prompt-file", "more.txt")
+	s.see("Type a prompt and Enter.")
+	s.typeLine("hello")
+	s.see("First.")
+	w.Write("more.txt", "SECOND EXTRA\n")
+	s.typeLine("/compact")
+	s.see("The conversation was summarized")
+	s.typeLine("go on")
+	s.see("Second.")
+	reqs := w.Model.Requests()
+	if first, last := systemText(t, reqs[0]), systemText(t, reqs[len(reqs)-1]); !strings.HasSuffix(first, "FIRST EXTRA") || !strings.HasSuffix(last, "SECOND EXTRA") {
+		t.Errorf("the system prompt before the summary ends ...%s, after ...%s", first[max(0, len(first)-40):], last[max(0, len(last)-40):])
+	}
+	s.typeLine("/exit")
+	if code := s.exit(); code != 0 {
+		t.Errorf("exit code %d", code)
+	}
+}

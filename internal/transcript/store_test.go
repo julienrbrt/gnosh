@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1134,5 +1135,151 @@ func TestIDs(t *testing.T) {
 		if validID(bad) {
 			t.Errorf("validID(%q) is true", bad)
 		}
+	}
+}
+
+// Move puts a session with another folder's, as /cd does: its file goes
+// under that folder's project directory, a meta entry says so, and the
+// session is listed with that folder's sessions from then on, with new
+// entries stamped with it. A branch of it is listed there too.
+// A session whose file a move put in another folder's directory, cut short
+// before the move was written down (gnosh killed in the middle of /cd), is
+// listed with the sessions of the folders of that directory: it was listed
+// with none (the session store review of 2026-11-19). A session of another
+// folder whose name comes to the same directory is still that folder's
+// alone.
+func TestListAMoveCutShort(t *testing.T) {
+	st, _ := newStore(t)
+	s, _ := st.Create("/work/app")
+	mustAppend(t, s, PromptEntry("fix the flaky test"))
+	s.Close()
+	to := filepath.Join(st.ProjectDir("/work/lib"), s.ID()+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(to), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(s.Path(), to); err != nil {
+		t.Fatal(err)
+	}
+	if Slug("/work/lib") != Slug("/work-lib") {
+		t.Fatalf("the test needs two folders of one directory: %s, %s", Slug("/work/lib"), Slug("/work-lib"))
+	}
+	twin, _ := st.Create("/work-lib")
+	mustAppend(t, twin, PromptEntry("the twin's"))
+	twin.Close()
+	ids := func(dir string) []string {
+		list, err := st.List(ctx, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, info := range list {
+			out = append(out, info.ID)
+		}
+		return out
+	}
+	if got := ids("/work/lib"); !slices.Equal(got, []string{s.ID()}) {
+		t.Errorf("List(/work/lib) = %v, want the session whose move was cut short alone", got)
+	}
+	if got := ids("/work-lib"); !slices.Contains(got, twin.ID()) {
+		t.Errorf("List(/work-lib) = %v, want its own session in it", got)
+	}
+	if got := ids("/work/app"); len(got) != 0 {
+		t.Errorf("List(/work/app) = %v, want none", got)
+	}
+}
+
+func TestMove(t *testing.T) {
+	st, _ := newStore(t)
+	s, _ := st.Create("/work/app")
+	mustAppend(t, s, PromptEntry("fix the flaky test"))
+	// The shell went into a folder below; the session is still the app's.
+	s.SetCwd("/work/app/sub")
+	mustAppend(t, s, AssistantEntry(core.AssistantText("on it"), core.StopEndTurn))
+	old := s.Path()
+
+	if err := s.Move("/work/lib"); err != nil {
+		t.Fatal(err)
+	}
+	if s.Path() == old || filepath.Dir(s.Path()) != st.ProjectDir("/work/lib") {
+		t.Errorf("the file is at %s, want it under %s", s.Path(), st.ProjectDir("/work/lib"))
+	}
+	if _, err := os.Stat(old); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the file is still at %s: %v", old, err)
+	}
+	if s.Cwd() != "/work/lib" {
+		t.Errorf("new entries are stamped with %s", s.Cwd())
+	}
+	mustAppend(t, s, PromptEntry("now the lib"))
+	es := s.Entries()
+	if m := es[len(es)-2]; m.Type != TypeMeta || m.Key != MovedKey || m.Value != "/work/lib" || m.Cwd != "/work/lib" {
+		t.Errorf("the move was recorded as %+v", m)
+	}
+	if got := es[len(es)-1].Cwd; got != "/work/lib" {
+		t.Errorf("an entry after the move is stamped with %s", got)
+	}
+
+	// Branched now, the copy is one of the lib's sessions too.
+	br, err := st.Branch(s, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	br.Close()
+	for dir, want := range map[string]int{"/work/lib": 2, "/work/app": 0, "/work/app/sub": 0} {
+		list, err := st.List(ctx, dir)
+		if err != nil || len(list) != want {
+			t.Errorf("List(%s) = %d sessions (%v), want %d", dir, len(list), err, want)
+		}
+	}
+	// It opens by its id wherever it is, and goes on in the lib.
+	again, err := st.Open(ctx, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Path() != s.Path() || again.Cwd() != "/work/lib" || again.StartCwd() != "/work/app" {
+		t.Errorf("opened again: path %s, cwd %s, start %s", again.Path(), again.Cwd(), again.StartCwd())
+	}
+
+	// A file of the same id where it would go stops a move, and nothing
+	// moves; so does a folder that is not absolute.
+	if err := os.MkdirAll(st.ProjectDir("/work/third"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	clash := filepath.Join(st.ProjectDir("/work/third"), again.ID()+".jsonl")
+	if err := os.WriteFile(clash, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := again.Move("/work/third"); err == nil || !strings.Contains(err.Error(), "is there already") {
+		t.Errorf("a move onto a file of the same id: %v", err)
+	}
+	if err := again.Move("work/third"); err == nil {
+		t.Error("a move to a relative folder was made")
+	}
+	if again.Path() != s.Path() || again.Cwd() != "/work/lib" {
+		t.Errorf("a refused move changed the session: %s, %s", again.Path(), again.Cwd())
+	}
+	again.Close()
+
+	// A session that wrote nothing makes its file in the folder it moved to.
+	fresh, _ := st.Create("/work/app")
+	if err := fresh.Move("/work/lib"); err != nil {
+		t.Fatal(err)
+	}
+	mustAppend(t, fresh, PromptEntry("first words"))
+	fresh.Close()
+	if filepath.Dir(fresh.Path()) != st.ProjectDir("/work/lib") || fresh.StartCwd() != "/work/lib" {
+		t.Errorf("a fresh session moved to %s, starting in %s", fresh.Path(), fresh.StartCwd())
+	}
+	if list, _ := st.List(ctx, "/work/lib"); len(list) != 3 {
+		t.Errorf("the lib lists %d sessions, want 3", len(list))
+	}
+
+	// A read-only session does not move.
+	ro, err := st.OpenReadOnly(ctx, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ro.Move("/work/app"); !errors.Is(err, ErrReadOnly) {
+		t.Errorf("a read-only session moved: %v", err)
 	}
 }

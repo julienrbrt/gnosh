@@ -11,6 +11,7 @@ import (
 
 	"github.com/gnosh-ai/gnosh/internal/app/apptest"
 	"github.com/gnosh-ai/gnosh/internal/core"
+	"github.com/gnosh-ai/gnosh/internal/transcript"
 )
 
 // boomTool is a tool that panics.
@@ -92,4 +93,36 @@ func TestOwnFaultIsWrittenDown(t *testing.T) {
 		t.Fatalf("the crash file: %v", err)
 	}
 	has(t, "the crash file", string(data), "a fault in the wiring", "goroutine ")
+}
+
+// An empty crash file that nobody holds is a run's that ended without
+// closing it (killed, or the machine went down): the next session in the
+// folder removes it, and says nothing. One a running session holds stays.
+func TestAbandonedEmptyCrashFilesGo(t *testing.T) {
+	w := apptest.NewWorld(t, apptest.Reply{Text: "ok"}, apptest.Reply{Text: "ok"})
+	run(t, w, "-p", "hello").wantCode(t, 0)
+	dir := filepath.Dir(w.Sessions()[0])
+	left := filepath.Join(dir, "crash-20261115T024309-01a1dced.log")
+	held := filepath.Join(dir, "crash-20261116T044219-01a1dd44.log")
+	for _, path := range []string{left, held} {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f, err := os.OpenFile(held, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if !transcript.Hold(f) {
+		t.Fatal("the crash file could not be held")
+	}
+	r := run(t, w, "-p", "hello again").wantCode(t, 0)
+	hasNot(t, "stderr", r.err, "crashed")
+	if _, err := os.Stat(left); !os.IsNotExist(err) {
+		t.Errorf("the empty crash file nobody holds is still there (%v)", err)
+	}
+	if _, err := os.Stat(held); err != nil {
+		t.Errorf("the crash file a session holds was removed: %v", err)
+	}
 }

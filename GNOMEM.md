@@ -262,7 +262,7 @@ anywhere, with `mem.Later("…")`.
 
 You see every pop in the chat as the tool's result (the removed
 rows stay there and in the session's file; only the model's view loses them), the
-frame the agent is in in the task list under the prompt box, `/mem log` lists
+frame the agent is in in the task list above the prompt box, `/mem log` lists
 each push and pop, and `gnosh -p` prints what a pop took out of the
 context. A frame a session holds is its own: no other session, and not
 `/mem`, closes, drops or takes it; the session pops it, resumed by id if it

@@ -29,6 +29,7 @@ const (
 	bText      uint8 = iota // prose
 	bHeading                // a heading
 	bTableHead              // the header row of a table
+	bQuote                  // prose inside a block quote
 )
 
 // A style is the look of one piece of inline text: the block it stands in,
@@ -54,7 +55,11 @@ func (cfg *config) seq(st style) string {
 	}
 	t := &cfg.theme
 	var b strings.Builder
-	b.WriteString(t.Text.Sequence())
+	if st.base == bQuote {
+		b.WriteString(t.Quote.Sequence())
+	} else {
+		b.WriteString(t.Text.Sequence())
+	}
 	switch st.base {
 	case bHeading:
 		b.WriteString(t.Heading.Sequence())

@@ -93,7 +93,10 @@ type join struct {
 	dir    string
 	listen string
 	// hosts are the machines the session may name, by name, with the
-	// destination ssh is given for each; hostNames keeps their order.
+	// destination ssh is given for each, as the session began; hostNames
+	// keeps their order. The shell's table, which a settings change
+	// replaces while the session runs, is read instead where there is
+	// one (hostTable).
 	hosts     map[string]string
 	hostNames []string
 
@@ -290,7 +293,7 @@ func (j *join) server() *server {
 		switch {
 		case srv != nil && srv.moved:
 			j.s.Notice(agent.LevelInfo, source, fmt.Sprintf(
-				"The port of %s is taken on this machine, so the files gnosh delivers are served at %s/ in this session, to this machine only.", srv.asked, srv.base))
+				"The port of %s is taken on this machine, so the files gnosh delivers are served at %s/ in this session, to this machine only. An address handed out earlier at %s now reaches whatever holds that port: another gnosh session, or a program that is not gnosh, which would see the address.", srv.asked, srv.base, srv.asked))
 		case srv == nil && j.listen != "":
 			j.s.Notice(agent.LevelWarning, source, fmt.Sprintf(
 				"The files gnosh delivers cannot be served in this session: %s. Each is still listed with its path.", strings.TrimSuffix(unserved, ".")))

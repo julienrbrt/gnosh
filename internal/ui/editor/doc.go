@@ -209,8 +209,7 @@
 //     can put typed text out of reach. Sending is what begins a new undo
 //     history.
 //   - Removing invisible characters from a prompt on Enter (spec/cc 2.7)
-//     is not done here: it is not in that spec's list of what gnosh
-//     adopts. The box shows such characters instead, and the application
+//     is not done here but by the application (ui/invisible.go), which
 //     has what it needs to clean a prompt and put it back (Result.Text,
-//     SetDraft).
+//     SetDraft). Until then the box shows such characters.
 package editor

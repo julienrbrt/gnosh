@@ -2,11 +2,44 @@ package app
 
 import (
 	"bufio"
+	"errors"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// gitFileMost is the most of a repository's .git file, commondir or
+// config that is read.
+const gitFileMost = 1 << 20
+
+// openGitFile opens one of a repository's small files for reading, only
+// when it is a regular file: a named pipe at .git, in an archive unpacked
+// with it, blocked every run of the status line, /statusline and gnosh's
+// exit for good (the status line review of 2026-11-19). Read it through
+// io.LimitReader(f, gitFileMost).
+func openGitFile(path string) (*os.File, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New(path + " is not a file")
+	}
+	return os.Open(path)
+}
+
+// readGitFile reads at most gitFileMost of one of a repository's small
+// files (openGitFile).
+func readGitFile(path string) ([]byte, error) {
+	f, err := openGitFile(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, gitFileMost))
+}
 
 // originRepo reads the address of the origin remote from the git
 // repository at root, from its own config file (no git is run, so it may
@@ -35,7 +68,7 @@ func gitConfigPath(dot string) string {
 	}
 	dir := dot
 	if !info.IsDir() {
-		b, err := os.ReadFile(dot)
+		b, err := readGitFile(dot)
 		if err != nil {
 			return ""
 		}
@@ -47,7 +80,7 @@ func gitConfigPath(dot string) string {
 		if !filepath.IsAbs(dir) {
 			dir = filepath.Join(filepath.Dir(dot), dir)
 		}
-		if common, err := os.ReadFile(filepath.Join(dir, "commondir")); err == nil {
+		if common, err := readGitFile(filepath.Join(dir, "commondir")); err == nil {
 			c := strings.TrimSpace(string(common))
 			if !filepath.IsAbs(c) {
 				c = filepath.Join(dir, c)
@@ -60,13 +93,13 @@ func gitConfigPath(dot string) string {
 
 // originURL is the url of [remote "origin"] in a git config file, or "".
 func originURL(path string) string {
-	f, err := os.Open(path)
+	f, err := openGitFile(path)
 	if err != nil {
 		return ""
 	}
 	defer f.Close()
 	in := false
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(io.LimitReader(f, gitFileMost))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if strings.HasPrefix(line, "[") {

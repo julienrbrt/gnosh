@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -38,4 +39,24 @@ func TestRecapOfASessionOpenedAgain(t *testing.T) {
 		c.trans = trans
 	})
 	g.committedLacks("Where this session left off", "why is the test flaky?")
+}
+
+// The recap shows what was typed, as the transcript view does, not what
+// came with it, and a long prompt (a big paste) only to its first lines.
+func TestRecapOfALongPrompt(t *testing.T) {
+	var long []string
+	for i := 1; i <= 2000; i++ {
+		long = append(long, fmt.Sprintf("pasted line %d", i))
+	}
+	prompt := core.UserText("look at this log:\n" + strings.Join(long, "\n"))
+	prompt.Blocks = append(prompt.Blocks, core.Block{Type: core.BlockText, Text: "what a hook added"})
+	g := newRig(t, 100, 24, text.NoColor, func(c *controls) {
+		c.info.ID, c.info.ShowPast = "s1", true
+		c.trans = []app.TranscriptEntry{
+			{Kind: "prompt", Message: prompt},
+			{Kind: "reply", Message: core.AssistantText("The log ends early.")},
+		}
+	})
+	g.committedHas("> look at this log:", "pasted line 9", "… (Ctrl+O shows the rest)", "The log ends early.")
+	g.committedLacks("pasted line 10", "pasted line 2000", "what a hook added")
 }

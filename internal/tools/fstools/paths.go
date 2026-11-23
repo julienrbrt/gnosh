@@ -135,6 +135,12 @@ func (e *followError) Error() string { return "at " + e.at + ": " + e.err.Error(
 // Unwrap returns the system's error.
 func (e *followError) Unwrap() error { return e.err }
 
+// FollowLinks is followLinks, for the permission engine's Resolve: a
+// link's target is walked piece by piece from where the link is, as the
+// system walks it, never tidied as text first ("a/../x" with a a link is
+// not "x").
+func FollowLinks(p string) (real string, exists bool, err error) { return followLinks(p) }
+
 // followLinks resolves every symbolic link in the absolute, clean path p.
 // Where the path stops existing, what is left of it is appended as it is
 // written, and exists is false: that is the path a new file would be made

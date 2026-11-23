@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -96,6 +97,62 @@ func TestWorktreeFlagLinks(t *testing.T) {
 	}
 }
 
+// git in a session's own work tree may not change what the work tree
+// shares with the person's checkout: the branches by name, the git
+// settings, a push into the repository itself. git that keeps to the work
+// tree runs. Permissions are skipped, so the work tree is all that stands
+// in the way (Claude Code 2.1.326 refuses the like for its sub-agents).
+func TestWorktreeFlagSharedGit(t *testing.T) {
+	w := repoWorld(t)
+	before := gitIn(t, w.Dir, "rev-parse", "main")
+	// A folder outside the work tree whose .git file names the checkout's
+	// git folder: git there opens the checkout's repository (review, 17
+	// November).
+	elsewhere := t.TempDir()
+	if err := os.WriteFile(filepath.Join(elsewhere, ".git"), []byte("gitdir: "+filepath.Join(w.Dir, ".git")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tree := filepath.Join(w.Dir, ".gnosh", "worktrees", "shared")
+	cmds := []string{
+		"git update-ref refs/heads/main HEAD",
+		"git config core.fsmonitor 'touch fsmonitor-ran'",
+		"git branch -m main trunk",
+		"git push . HEAD:main",
+		"git branch --show-current && git config --get-regexp '^core\\.'",
+		"git -C " + elsewhere + " update-ref refs/heads/main HEAD",
+		"printf 'gitdir: " + filepath.Join(w.Dir, ".git") + "\\n' > .git",
+		"git status --short && git log --oneline -1",
+	}
+	for i, cmd := range cmds {
+		w.Model.Add(apptest.Reply{Calls: []apptest.Call{{ID: fmt.Sprintf("c%d", i+1), Name: "Bash", Args: fmt.Sprintf(`{"command":%q}`, cmd)}}})
+	}
+	w.Model.Add(apptest.Reply{Calls: []apptest.Call{{ID: "c9", Name: "Write", Args: fmt.Sprintf(`{"file_path":%q,"content":"gitdir: %s\n"}`, filepath.Join(tree, ".git"), filepath.Join(w.Dir, ".git"))}}})
+	w.Model.Add(apptest.Reply{Text: "Done."})
+	run(t, w, "--trust-folder", "--worktree", "shared", "-y", "-p", "go").wantCode(t, 0)
+	has(t, "update-ref", toolResult(t, w, 1, "c1"), "This call did not run", "may change what your work tree shares with the person's checkout", "git update-ref is not one gnosh lets run in a work tree of your own")
+	has(t, "a setting", toolResult(t, w, 2, "c2"), "This call did not run", "git config writes the repository's git settings", "git -c user.name=... -c user.email=... commit")
+	has(t, "a rename", toolResult(t, w, 3, "c3"), "This call did not run", "git branch: its option -m is not one")
+	has(t, "a push into itself", toolResult(t, w, 4, "c4"), "This call did not run", "git push to . may push into a repository on this machine")
+	if got := toolResult(t, w, 5, "c5"); strings.Contains(got, "did not run") || !strings.Contains(got, "worktree-shared") {
+		t.Errorf("git that keeps to the work tree: %q", got)
+	}
+	has(t, "a .git file that names the checkout's", toolResult(t, w, 6, "c6"), "This call did not run", "would open the repository at", "not your work tree's own")
+	has(t, "a write of the work tree's .git", toolResult(t, w, 7, "c7"), "This call did not run", "is a .git file or folder")
+	if got := toolResult(t, w, 8, "c8"); strings.Contains(got, "did not run") {
+		t.Errorf("reading git in the work tree: %q", got)
+	}
+	has(t, "Write to the work tree's .git", toolResult(t, w, 9, "c9"), "This call did not run", "is a .git file or folder")
+	if after := gitIn(t, w.Dir, "rev-parse", "main"); after != before {
+		t.Errorf("the checkout's branch moved: %s, then %s", before, after)
+	}
+	if got := w.Read(".git/config"); strings.Contains(got, "fsmonitor") {
+		t.Errorf("a setting went into the checkout's git settings:\n%s", got)
+	}
+	if branch := gitIn(t, w.Dir, "branch", "--show-current"); branch != "main" {
+		t.Errorf("the checkout's branch is %q, want main", branch)
+	}
+}
+
 // A skill's own commands (!`cmd`) in a session with a work tree of its own
 // keep to the work tree as its tool calls do (review, 16 November).
 func TestWorktreeFlagSkillCommands(t *testing.T) {
@@ -175,5 +232,69 @@ func TestWorktreeFlagCommandsStay(t *testing.T) {
 	}
 	if got := toolResult(t, w, 7, "c7"); strings.Contains(got, "work tree of your own") {
 		t.Errorf("a copy from the checkout into the work tree was held to the work tree: %q", got)
+	}
+}
+
+// A --worktree session's new work tree gets the copies .worktreeinclude
+// names, and says so; left as it was made, copies and all, it goes at the
+// end.
+func TestWorktreeFlagInclude(t *testing.T) {
+	w := repoWorld(t, apptest.Reply{Text: "Nothing to do."})
+	w.Write(".gitignore", ".env\n")
+	w.Write(".worktreeinclude", ".env\n")
+	gitIn(t, w.Dir, "add", ".gitignore", ".worktreeinclude")
+	gitIn(t, w.Dir, "commit", "-q", "-m", "ignore")
+	w.Write(".env", "TOKEN=kz-1\n")
+	r := run(t, w, "--trust-folder", "--worktree", "-p", "look").wantCode(t, 0)
+	m := regexp.MustCompile(`work tree (\S+), made, on the branch worktree-\S+ at \S+, with copies of \.env \(\.worktreeinclude\)`).FindStringSubmatch(r.err)
+	if m == nil {
+		t.Fatalf("no copies were said:\n%s", r.err)
+	}
+	has(t, "stderr", r.err, "the work tree "+m[1]+" was left as it was made, and is removed with its branch")
+	if fileExists(m[1]) {
+		t.Errorf("the work tree %s is left", m[1])
+	}
+}
+
+// /restart in a work tree --worktree made under a made-up name starts
+// again in it, and it is still one made here: left as it was made, it goes
+// when the session ends (the cd review of 2026-11-19: found again by its
+// name, it was taken for one named and kept for good).
+func TestRestartKeepsAMadeUpTreeOneMadeHere(t *testing.T) {
+	w := repoWorld(t)
+	var started, envs []string
+	s := sitWith(t, w, func(o *Options) {
+		o.Relaunch = func(args, env []string) error {
+			started, envs = args, env
+			return os.ErrPermission
+		}
+	}, "--trust-folder", "--worktree")
+	s.see("Type a prompt and Enter.")
+	m := regexp.MustCompile(`work tree (\S+), made, on the branch`).FindStringSubmatch(s.errs.String() + s.out.String())
+	if m == nil {
+		t.Fatalf("no work tree was made:\n%s%s", s.errs.String(), s.out.String())
+	}
+	tree := strings.TrimSuffix(m[1], ",")
+	s.typeLine("/restart")
+	s.see("gnosh starts again")
+	s.exit()
+	if !fileExists(tree) {
+		t.Fatalf("the work tree %s went at the restart", tree)
+	}
+	var markers []string
+	for _, kv := range envs {
+		if strings.HasPrefix(kv, RestartedEnv+"=") || strings.HasPrefix(kv, TreeMoveEnv+"=") {
+			markers = append(markers, kv)
+		}
+	}
+	if !slices.ContainsFunc(markers, func(kv string) bool { return strings.Contains(kv, `"made"`) }) {
+		t.Fatalf("the start /restart makes is not told the tree was made here: %q", markers)
+	}
+	s = sitWith(t, w, func(o *Options) { o.Environ = append(slices.Clone(o.Environ), markers...) }, started...)
+	s.see("Type a prompt and Enter.")
+	s.typeLine("/exit")
+	s.exit()
+	if fileExists(tree) {
+		t.Errorf("the work tree %s, made under a made-up name and left as made, is kept after the restarted session", tree)
 	}
 }

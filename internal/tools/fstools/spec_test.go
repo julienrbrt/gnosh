@@ -10,22 +10,24 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/core"
 )
 
-func TestNewReturnsTheFiveTools(t *testing.T) {
+func TestNewReturnsTheSixTools(t *testing.T) {
 	tools := New(Options{})
-	wantNames := []string{"Read", "Write", "Edit", "Glob", "Grep"}
+	wantNames := []string{"Read", "Write", "Edit", "Glob", "Grep", "NotebookEdit"}
 	wantArgs := map[string][]string{
-		"Read":  {"file_path", "offset", "limit"},
-		"Write": {"file_path", "content"},
-		"Edit":  {"file_path", "old_string", "new_string", "replace_all"},
-		"Glob":  {"pattern", "path"},
-		"Grep":  {"pattern", "path", "glob", "type", "output_mode", "-i", "-n", "-o", "-A", "-B", "-C", "context", "multiline", "head_limit", "offset"},
+		"Read":         {"file_path", "offset", "limit", "pages", "allow_large"},
+		"Write":        {"file_path", "content"},
+		"Edit":         {"file_path", "old_string", "new_string", "replace_all"},
+		"Glob":         {"pattern", "path"},
+		"Grep":         {"pattern", "path", "glob", "type", "output_mode", "-i", "-n", "-o", "-A", "-B", "-C", "context", "multiline", "head_limit", "offset"},
+		"NotebookEdit": {"notebook_path", "cell_id", "new_source", "cell_type", "edit_mode"},
 	}
 	wantRequired := map[string][]string{
-		"Read":  {"file_path"},
-		"Write": {"file_path", "content"},
-		"Edit":  {"file_path", "old_string", "new_string"},
-		"Glob":  {"pattern"},
-		"Grep":  {"pattern"},
+		"Read":         {"file_path"},
+		"Write":        {"file_path", "content"},
+		"Edit":         {"file_path", "old_string", "new_string"},
+		"Glob":         {"pattern"},
+		"Grep":         {"pattern"},
+		"NotebookEdit": {"notebook_path", "new_source"},
 	}
 	if len(tools) != len(wantNames) {
 		t.Fatalf("New returned %d tools, want %d", len(tools), len(wantNames))
@@ -142,12 +144,12 @@ func TestDescriptionsStateTheLimits(t *testing.T) {
 func TestDefaults(t *testing.T) {
 	d := Defaults()
 	want := Options{
-		ReadName: "Read", WriteName: "Write", EditName: "Edit", GlobName: "Glob", GrepName: "Grep",
+		ReadName: "Read", WriteName: "Write", EditName: "Edit", GlobName: "Glob", GrepName: "Grep", NotebookEditName: "NotebookEdit",
 		ReadDefaultLines: 2000, ReadMaxBytes: 100000, ReadMaxLineChars: 2000, ReadCountBytes: 64 << 20, ReadMaxImageBytes: 5 << 20,
 		EditMaxBytes: 32 << 20, DiffMaxBytes: 10 << 20, EditContextLines: 3,
 		GlobMaxResults: 100,
 		GrepHeadLimit:  250, GrepMaxContext: 1000, GrepMaxOutputBytes: 40 << 10, GrepMaxColumns: 500, GrepMaxLineBytes: 1 << 20, GrepMaxMultilineBytes: 32 << 20,
-		SearchTimeout: 20 * time.Second, SearchWorkers: d.SearchWorkers, IgnoreFiles: []string{".gitignore"},
+		SearchTimeout: 20 * time.Second, SearchWorkers: d.SearchWorkers, IgnoreFiles: []string{".gitignore", ".ignore", ".rgignore"},
 	}
 	if !reflect.DeepEqual(d, want) {
 		t.Errorf("Defaults() =\n%+v\nwant\n%+v", d, want)

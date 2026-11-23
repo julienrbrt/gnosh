@@ -269,7 +269,9 @@ func TestTimeoutAfterTheHooksOwnProcessHasExited(t *testing.T) {
 	child := filepath.Join(dir, "child")
 	opts := options(t)
 	opts.PipeWait = time.Minute // the hook's timeout comes first
-	r := newRunner(t, opts, Hook{Event: Stop, Timeout: 300 * time.Millisecond, Command: script(t, `sleep 600 &
+	// (Time enough for a shell to start the child and write its pid on a
+	// box busy with every package's tests.)
+	r := newRunner(t, opts, Hook{Event: Stop, Timeout: 2 * time.Second, Command: script(t, `sleep 600 &
 echo $! > `+shq(child)+`
 exit 0`)})
 	began := time.Now()
@@ -277,7 +279,7 @@ exit 0`)})
 	if !out.Blocked || !out.CouldNotEvaluate {
 		t.Errorf("Blocked %v, CouldNotEvaluate %v", out.Blocked, out.CouldNotEvaluate)
 	}
-	contains(t, "the reason", out.Reason, "did not finish within 300ms and was stopped")
+	contains(t, "the reason", out.Reason, "did not finish within 2 seconds and was stopped")
 	if took := time.Since(began); took > 20*time.Second {
 		t.Errorf("Run took %v", took)
 	}

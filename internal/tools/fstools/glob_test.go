@@ -85,6 +85,12 @@ func TestGlobPatterns(t *testing.T) {
 		{"dot directories are entered", in{"pattern": "**/h.go"}, []string{".hidden/h.go"}},
 		{"ignored files are left out", in{"pattern": "**/*.js"}, nil},
 		{"ignored files are left out by name", in{"pattern": "*.log"}, nil},
+		// A name spelled out is listed whatever the rules say (the
+		// search-tools review of 2026-11-20).
+		{"an ignored file spelled out is listed", in{"pattern": "debug.log"}, []string{"debug.log"}},
+		{"an ignored file spelled out at any depth", in{"pattern": "**/debug.log"}, []string{"debug.log"}},
+		{"an ignored file spelled out with its path", in{"pattern": "{debug.log,main.go}"}, []string{"debug.log", "main.go"}},
+		{"an ignored directory spelled out on the way", in{"pattern": "**/node_modules/pkg/index.js"}, []string{"node_modules/pkg/index.js"}},
 		{"an ignored directory named in the pattern is searched", in{"pattern": "node_modules/**/*.js"}, []string{"node_modules/pkg/index.js"}},
 		{"an ignored directory named in path is searched", in{"pattern": "**/*.js", "path": f.path("node_modules")}, []string{"node_modules/pkg/index.js"}},
 		{"nothing in .git", in{"pattern": "**/x.go"}, nil},

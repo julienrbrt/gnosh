@@ -49,6 +49,12 @@ type Model struct {
 	// a local server.
 	MaxTokens int
 
+	// ThinkingBudget caps how many tokens a main reply may think, when the
+	// model thinks; zero sends no cap. BudgetNote is put at the end of the
+	// thinking when the cap is reached, where the provider can.
+	ThinkingBudget int
+	BudgetNote     string
+
 	// Temperature and TopP are sent on main requests when not nil.
 	Temperature *float64
 	TopP        *float64
@@ -339,9 +345,13 @@ type Entry struct {
 	Reason EndReason
 
 	// Trigger is "auto" or "manual" for an EntrySummary, and PreTokens is
-	// about how long the conversation was before it.
+	// about how long the conversation was before it. Covers names the
+	// session-file entry a summary of part of the conversation stands in
+	// for, up to and including it (SummaryPart); empty, the summary stands
+	// in for everything before it.
 	Trigger   string
 	PreTokens int
+	Covers    string
 }
 
 // Gate answers one question: may this tool call run? Behind it are the
@@ -414,6 +424,9 @@ type Decision struct {
 	Halt bool
 	// Unattended marks a refusal made only because nobody could be asked.
 	Unattended bool
+	// Context is what the model reads about the call beside its result,
+	// whatever was decided: a PreToolUse hook's added text.
+	Context []Part
 }
 
 // Concurrent is a Tool that can say whether one of its calls may run beside
@@ -433,6 +446,24 @@ type Concurrent interface {
 // sent.
 const MetaHalt = "gnosh.halt"
 
+// MetaPlanned is the key of core.ToolResult.Meta by which a tool that ends
+// the turn (MetaHalt) says that the end is what the call was for, not
+// something gone wrong: a /loop's run that has scheduled the next one, a
+// move into or out of a work tree. Its value is true. The turn's result
+// says so (TurnResult.Planned), its notice is information, not a warning,
+// and the front ends show the turn as done. Only the harness's own tools
+// set it.
+const MetaPlanned = "gnosh.planned"
+
+// StopWork is the error a moment returns to stop the work it stands before,
+// as a hook's "continue": false does: the session's start refuses the
+// prompt it stands before and every one after it (a sub-agent's start, its
+// task), and the end of a summary made in a turn ends that turn. Reason is
+// what the person and the model are told.
+type StopWork struct{ Reason string }
+
+func (h *StopWork) Error() string { return h.Reason }
+
 // Part is a piece of hidden text that rides on a prompt or is put between
 // two rounds. It is stored exactly as given, so its author marks it the way
 // the harness marks its own words.
@@ -441,6 +472,9 @@ type Part struct {
 	Source string
 	// Text is what the model reads.
 	Text string
+	// Images go with Text, as image blocks: a picture an @ mention of the
+	// prompt brought. (Only a prompt's lines carry them.)
+	Images []core.Block
 	// Before puts a prompt's part ahead of the prompt's own text. It is
 	// for what belongs at the very start of a conversation, such as the
 	// working directory and the date.
@@ -487,6 +521,14 @@ type Moments struct {
 	// without that provider's lines.
 	PromptLines []func(ctx context.Context, info LineInfo) ([]Part, error)
 
+	// MoreRounds, when set, is asked after a round's tool calls, before
+	// what the person queued meanwhile is handed to the turn and the model
+	// asked again, with the number of requests the turn has made: false
+	// ends the turn there, halted, with why as its detail, and what was
+	// queued goes out as a turn of its own. (The cap on a run's replies,
+	// --max-turns: one that stopped the next request instead had the
+	// queued words handed to a turn that never answered them.)
+	MoreRounds func(turn string, rounds int) (more bool, why string)
 	// BeforeRequest are asked, in order, before every request of a turn
 	// for reminders to put in front of the model. An error is a warning.
 	BeforeRequest []func(ctx context.Context, info RequestInfo) ([]Part, error)
@@ -496,6 +538,14 @@ type Moments struct {
 	// the model, which is stored after the round's results, and it may end
 	// the turn. An error is told to the model as feedback.
 	AfterTool func(ctx context.Context, done ToolDone) (ToolVerdict, error)
+
+	// AfterRound is called once after every tool call of a reply has
+	// finished and its result is stored, when the model is about to be
+	// asked again: not when the round ends the turn (a halt, a stop). It
+	// may add context for the model, stored after the round's results, and
+	// it may end the turn before the next request. An error ends the turn
+	// too: a check that could not run has not passed.
+	AfterRound func(ctx context.Context, done RoundDone) (ToolVerdict, error)
 
 	// BeforeSummary is called before a summary is asked for. What it
 	// returns is added to the instructions for the summary. It cannot stop
@@ -542,6 +592,7 @@ type Moments struct {
 //	PreCompact          Moments.BeforeSummary
 //	PostCompact         Moments.AfterSummary
 //	SessionEnd          Moments.SessionEnd
+//	PostToolBatch       Moments.AfterRound
 //
 // The loop fires nothing for Notification (a front end times it from
 // QuestionEvent and IdleEvent) or for InstructionsLoaded.
@@ -549,7 +600,7 @@ func Fires() []string {
 	return []string{
 		"PreToolUse", "PermissionRequest", "PostToolUse", "PostToolUseFailure",
 		"UserPromptSubmit", "SessionStart", "Stop", "SubagentStart", "SubagentStop",
-		"StopFailure", "PreCompact", "PostCompact", "SessionEnd",
+		"StopFailure", "PreCompact", "PostCompact", "SessionEnd", "PostToolBatch",
 	}
 }
 
@@ -601,6 +652,18 @@ type RequestInfo struct {
 	Point int
 }
 
+// RoundDone is what AfterRound is told: the tool calls of one reply, in
+// the order the model wrote them, each with what it returned, and where
+// they ran.
+type RoundDone struct {
+	Calls      []ToolDone
+	Turn       string
+	Session    string
+	AgentID    string
+	AgentType  string
+	ParentCall string
+}
+
 // ToolDone is what AfterTool is told about a call.
 type ToolDone struct {
 	// Call is the call as it ran, with the arguments the gate left it.
@@ -627,10 +690,18 @@ type ToolDone struct {
 type ToolVerdict struct {
 	// Context is stored after the round's results for the model to read.
 	Context []Part
+	// Replace, when not nil, is what the model reads in place of what the
+	// tool returned (a PostToolUse hook's "updatedToolOutput"). The call
+	// has run all the same.
+	Replace *core.ToolResult
 	// Halt ends the turn once the round's results are stored, and Reason
 	// says why, for the person.
 	Halt   bool
 	Reason string
+	// Notes are lines for the person, shown under the call
+	// (core.ToolResult.Notes): placed there, and not given as notices,
+	// which would stand above the call, drawn once it is done.
+	Notes []string
 }
 
 // SummaryInfo is what BeforeSummary and AfterSummary are told.
@@ -643,6 +714,9 @@ type SummaryInfo struct {
 	Summary string
 	// PreTokens is about how long the conversation was before it.
 	PreTokens int
+	// Window is the model's window as the loop believes it: what is given
+	// back after the summary keeps to a small share of it.
+	Window int
 }
 
 // EndInfo is what SessionEnd is told.

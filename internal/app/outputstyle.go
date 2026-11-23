@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,6 +14,7 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/app/agentdef"
 	"github.com/gnosh-ai/gnosh/internal/config"
 	"github.com/gnosh-ai/gnosh/internal/prompt"
+	"github.com/gnosh-ai/gnosh/internal/trust"
 )
 
 // This file is the output styles: Claude Code's outputStyle setting and its
@@ -30,24 +32,35 @@ const defaultStyle = "default"
 type outputStyle struct {
 	prompt.Style
 	source string
+	// project says the style is the project's own: its text is put to the
+	// model as text from outside.
+	project bool
 }
 
 // maxStyleBytes is the most of a style file that is read.
 const maxStyleBytes = 64 << 10
 
-// loadOutputStyles reads the styles there are: the project's, when the
-// folder is trusted, the closest folder first, then the person's, then
-// gnosh's own. The first of a name wins. Files that cannot be used are
-// said in problems.
+// loadOutputStyles reads the styles there are: the person's, then the
+// project's, when the folder is trusted, the closest folder first, then
+// gnosh's own. The first of a name wins, in any case: a project's style
+// does not stand in for one of the person's own (the status line review
+// of 2026-11-19: a repository's concise.md replaced the person's
+// Concise). A project's file that leads out of the project is not read,
+// as a project's skill is not. Files that cannot be used are said in
+// problems.
 func loadOutputStyles(texts *prompt.Set, cfg *config.Config, trusted bool, more []string) (styles []outputStyle, problems []string) {
 	seen := map[string]bool{defaultStyle: true}
 	var dirs []string
-	if trusted && !cfg.Switches.SafeMode.V {
-		dirs = append(dirs, projectDefDirs(cfg, "output-styles", more)...)
-	}
+	project := map[string]bool{}
 	if !cfg.Switches.SafeMode.V {
 		dirs = append(dirs, userDefDirs(cfg, "output-styles")...)
 	}
+	if trusted && !cfg.Switches.SafeMode.V {
+		for _, d := range projectDefDirs(cfg, "output-styles", more) {
+			dirs, project[d] = append(dirs, d), true
+		}
+	}
+	inside := projectInside(cfg, more)
 	for _, dir := range dirs {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -62,21 +75,27 @@ func loadOutputStyles(texts *prompt.Set, cfg *config.Config, trusted bool, more 
 		sort.Strings(names)
 		for _, n := range names {
 			path := filepath.Join(dir, n)
+			if project[dir] {
+				if target, out := trust.LeadsOut(path, inside...); out {
+					problems = append(problems, fmt.Sprintf("the output style %s is not read: it leads out of the project, to %s", path, firstOf(target, "a place that is not there")))
+					continue
+				}
+			}
 			st, why := readOutputStyle(path)
 			if why != "" {
 				problems = append(problems, fmt.Sprintf("the output style %s cannot be used: %s", path, why))
 				continue
 			}
-			if seen[st.Name] {
-				continue
+			st.project = project[dir]
+			if key := strings.ToLower(st.Name); !seen[key] {
+				seen[key] = true
+				styles = append(styles, st)
 			}
-			seen[st.Name] = true
-			styles = append(styles, st)
 		}
 	}
 	for _, b := range texts.BuiltinStyles() {
-		if !seen[b.Name] {
-			seen[b.Name] = true
+		if key := strings.ToLower(b.Name); !seen[key] {
+			seen[key] = true
 			styles = append(styles, outputStyle{Style: b, source: "gnosh"})
 		}
 	}
@@ -88,7 +107,22 @@ func loadOutputStyles(texts *prompt.Set, cfg *config.Config, trusted bool, more 
 // name with none.
 func readOutputStyle(path string) (outputStyle, string) {
 	st := outputStyle{source: path}
-	data, err := os.ReadFile(path)
+	// A regular file, and no more of it read than a style may hold: one
+	// linked to /dev/zero was read until memory ran out (the status line
+	// review of 2026-11-19).
+	info, err := os.Stat(path)
+	if err != nil {
+		return st, err.Error()
+	}
+	if !info.Mode().IsRegular() {
+		return st, "it is not a file"
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return st, err.Error()
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxStyleBytes+1))
+	f.Close()
 	if err != nil {
 		return st, err.Error()
 	}
@@ -154,6 +188,12 @@ func (l *live) currentStyle() *prompt.Style {
 		return nil
 	}
 	if st, ok := findStyle(l.styles, l.styleName, true); ok {
+		if st.project {
+			// A repository's text, as its GNOSH.md is: a <gnosh> or <mem>
+			// block in it is not read as gnosh's own (the status line
+			// review of 2026-11-19).
+			st.Text = prompt.Untrusted(st.Text)
+		}
 		return &st.Style
 	}
 	return nil
@@ -172,7 +212,7 @@ func (l *live) styleNow() string {
 // the configuration names. A name no style has is said, and the default is
 // used.
 func (l *live) loadStyles() {
-	styles, problems := loadOutputStyles(l.texts, l.cfg, l.st.trusted, l.moreRoots())
+	styles, problems := loadOutputStyles(l.texts, l.cfg, l.st.trusted, l.defRoots())
 	for _, p := range problems {
 		l.notice(agent.LevelWarning, "output-style", p+".")
 	}
@@ -197,11 +237,25 @@ func (l *live) setStyle(name string) error {
 	if err != nil {
 		return err
 	}
+	l.putSystem(parts)
+	return nil
+}
+
+// putSystem makes parts the system prompt, from the next request on.
+func (l *live) putSystem(parts []string) {
+	l.systemMu.Lock()
 	l.system = parts
+	l.systemMu.Unlock()
 	if l.agent != nil {
 		l.agent.SetSystem(parts)
 	}
-	return nil
+}
+
+// systemNow is the system prompt in force.
+func (l *live) systemNow() []string {
+	l.systemMu.Lock()
+	defer l.systemMu.Unlock()
+	return l.system
 }
 
 // slashOutputStyle is /output-style: with nothing after it, the styles
@@ -247,12 +301,11 @@ func (l *live) slashOutputStyle(ctx context.Context, c *SlashContext) error {
 				return fmt.Errorf("its \"options\" is not an object (%v)", err)
 			}
 		}
-		if name == defaultStyle {
-			delete(opts, "outputStyle")
-		} else {
-			raw, _ := json.Marshal(name)
-			opts["outputStyle"] = raw
-		}
+		// "default" is kept as a choice like any other: taken off, a
+		// style the person's gnosh.json or /config names won the next
+		// session (the settings-commands review of 2026-11-20).
+		raw, _ := json.Marshal(name)
+		opts["outputStyle"] = raw
 		if len(opts) == 0 {
 			delete(doc, "options")
 			return nil

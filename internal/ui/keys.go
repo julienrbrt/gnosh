@@ -3,8 +3,8 @@ package ui
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -12,6 +12,7 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/app"
 	"github.com/gnosh-ai/gnosh/internal/core"
 	"github.com/gnosh-ai/gnosh/internal/term"
+	"github.com/gnosh-ai/gnosh/internal/text"
 	"github.com/gnosh-ai/gnosh/internal/ui/editor"
 	"github.com/gnosh-ai/gnosh/internal/ui/menu"
 )
@@ -35,9 +36,11 @@ type sheller interface {
 }
 
 // backgrounder is what a session's controls may also be: able to move the
-// running command of a tool call to the background, as Ctrl+B asks.
+// running command of a tool call to the background, as Ctrl+B asks. tool
+// is the call's tool, which the screen knows from the moment the call
+// starts: a command call may not have reached its command yet.
 type backgrounder interface {
-	Background(callID string) bool
+	Background(callID, tool string) bool
 }
 
 // withdrawer is what a session's controls may also be: able to take one
@@ -75,6 +78,13 @@ type historian interface {
 	History() []string
 }
 
+// resizeTeller is what a session's controls may also be: told that the
+// terminal's size changed, for the status line command, which is told the
+// size.
+type resizeTeller interface {
+	Resized()
+}
+
 // vimTeller is what a session's controls may also be: told the mode of
 // the box's vim keys, for the status line command (Claude Code's vim.mode).
 type vimTeller interface {
@@ -103,7 +113,7 @@ var atOnce = map[string]bool{
 	"help": true, "hooks": true, "context": true, "doctor": true, "mem": true,
 	"cost": true, "usage": true, "stats": true, "agents": true, "memory": true, "bashes": true, "diff": true, "mcp": true, "copy": true,
 	"think": true, "no_think": true, "nothink": true, "no-think": true, "effort": true, "btw": true, "recap": true, "reload-skills": true, "skills": true,
-	"loop": true, "noloop": true, "no_loop": true, "no-loop": true,
+	"loop": true, "noloop": true, "no_loop": true, "no-loop": true, "focus": true,
 	"exit": true, "quit": true,
 }
 
@@ -113,6 +123,14 @@ var commandWord = regexp.MustCompile(`^/[a-z][a-z0-9_-]*$`)
 
 // input takes in one thing the terminal reported.
 func (s *session) input(ev term.Event) {
+	switch ev.(type) {
+	case term.Key, term.Mouse, term.Paste, term.Resume:
+		// The person is here, in the transcript view, at the side panel's
+		// wheel or back from Ctrl+Z as well as at the box: the time without
+		// them (a question's time to close by itself, the note for one who
+		// is away) starts again.
+		s.lastInput = s.now()
+	}
 	switch ev := ev.(type) {
 	case term.Resize:
 		s.resize(ev.Cols, ev.Rows)
@@ -120,23 +138,80 @@ func (s *session) input(ev term.Event) {
 		// The terminal is gnosh's again after the process was stopped:
 		// what was on the screen is no longer what the renderer left.
 		s.r.Reset()
+		if s.panel != nil {
+			// The terminal took the whole screen back for the panel as it
+			// was taken back itself (term.Terminal.noteScreen): the panel
+			// is drawn anew.
+			s.keep(s.panel.Clear())
+		}
 		if s.view != nil {
 			s.keep(s.view.p.Clear())
 		}
+		if o := s.agents; o != nil {
+			o.scr.drawn = nil
+			s.keep(o.scr.p.Clear())
+		}
 		s.dirty = true
 	case term.Key, term.Mouse, term.Paste:
+		if s.listing {
+			// A picker's list is being read (loadThen): what is typed
+			// meanwhile is for the list, as had it come at once. Ctrl+C
+			// lets a list that is slow to come go.
+			if k, ok := ev.(term.Key); ok && k.Is('c', term.ModCtrl) {
+				s.dropList("The list was not opened: " + s.listAgain + " opens it again.")
+				return
+			}
+			s.heldInput = append(s.heldInput, ev)
+			return
+		}
 		if k, ok := ev.(term.Key); ok && s.rebound(k) {
 			return
 		}
+		if _, key := ev.(term.Key); !key {
+			s.dropHeldKey()
+		}
+		if s.agents != nil {
+			// The agent view takes every key, and pastes, while it is
+			// open.
+			s.agentsInput(ev)
+			return
+		}
 		if s.view != nil {
-			// The transcript view takes every key while it is open.
-			if _, paste := ev.(term.Paste); !paste {
+			// The transcript view takes every key while it is open. A
+			// paste goes into the prompt box, where it is when the view
+			// is closed: it was lost (the TUI review of 2026-11-19).
+			k, key := ev.(term.Key)
+			switch {
+			case !key:
+				if _, paste := ev.(term.Paste); paste {
+					s.pasteAside(ev)
+					s.flash("The paste went into the prompt box.")
+					return
+				}
+				s.viewInput(ev)
+			case k.Is('l', term.ModCtrl):
+				// Draw the view again.
+				s.keep(s.view.p.Clear())
+			case k.Is('z', term.ModCtrl), k.Is('t', term.ModCtrl), k.Is('t', term.ModAlt), k.Is('b', term.ModCtrl):
+				// The keys of every state (doc.go) work here too: they did
+				// nothing (the TUI review of 2026-11-19). A stop gives the
+				// view's screen back, and the terminal takes it again.
+				s.global(k)
+			default:
 				s.viewInput(ev)
 			}
 			return
 		}
 		s.typedOrMouse(ev)
 	}
+}
+
+// pasteAside puts a paste into the prompt box while something else has the
+// keys: the box takes it as it takes any paste, and is locked again after.
+func (s *session) pasteAside(ev term.Event) {
+	s.ed.SetLocked(false)
+	s.box(ev, nil)
+	s.lock()
 }
 
 // typedOrMouse takes in a key, a paste or the mouse.
@@ -161,7 +236,9 @@ func (s *session) typedOrMouse(ev term.Event) {
 // typed takes in a key or a paste. k is the key, or nil for a paste.
 func (s *session) typed(ev term.Event, k *term.Key) {
 	now := s.now()
-	defer func() { s.lastInput = now }()
+	// (Taken when the key is done with: Ctrl+Z comes back here only once
+	// the shell has given the terminal back.)
+	defer func() { s.lastInput = s.now() }()
 	s.dirty = true
 	if k != nil && s.global(*k) {
 		return
@@ -185,6 +262,22 @@ func (s *session) typed(ev term.Event, k *term.Key) {
 		return
 	}
 	res := q.ui.Handle(ev)
+	if k != nil && !res.Handled && k.Mod&term.ModAlt != 0 && (k.Code == term.KeyRune || k.Code == term.KeyEscape) {
+		// Esc with a key typed straight after it reaches gnosh, from a
+		// terminal that sends Alt as Esc and the key, as that key with
+		// Alt: a key the question has no use for, it is the Esc it began
+		// with, which was lost (Claude Code 2.1.328 declines with such a
+		// key too).
+		res = q.ui.Handle(term.Key{Code: term.KeyEscape})
+	}
+	if k == nil && !res.Handled {
+		// A paste the question has no field open for goes into the
+		// prompt box, in sight under the question, instead of nowhere
+		// (the TUI review of 2026-11-19).
+		s.pasteAside(ev)
+		s.flash("The paste went into the prompt box: the question takes keys, and words only in a field it opens.")
+		return
+	}
 	if !res.Done {
 		return
 	}
@@ -195,16 +288,45 @@ func (s *session) typed(ev term.Event, k *term.Key) {
 		return
 	}
 	ans, record, how := q.answer(res)
-	s.record(q, record)
-	q.answered = true
 	if how == endLeft {
 		// Esc on a question that has no "no": the turn is stopped, in
 		// plain words, and the session takes its question back.
+		s.record(q, record)
+		q.answered = true
 		s.interrupt()
-	} else if err := s.c.Answer(q.q.ID, ans); err != nil {
-		s.say("That question is no longer waiting for an answer.")
+		s.closeQuestion()
+		return
 	}
+	if err := s.c.Answer(q.q.ID, ans); err != nil {
+		// Answered a moment before from elsewhere (a channel that relays
+		// the questions): this answer did not count, and the question's
+		// end, on its way, says what did.
+		return
+	}
+	s.record(q, record)
+	q.answered = true
 	s.closeQuestion()
+}
+
+// suspendNow stops the process, as Ctrl+Z does to any program: the shell
+// has the screen while gnosh is stopped. When it is continued the live
+// region is drawn afresh, at the cursor. The side panel gives the screen
+// back first, and comes back after.
+func (s *session) suspendNow() {
+	panel := s.panel != nil
+	s.closePanel()
+	s.frame()
+	s.keep(s.r.Clear())
+	if err := s.host.suspend(); err != nil {
+		// Nothing was stopped, and nothing else has written to the
+		// terminal: the region is drawn again where it was.
+		s.flash("Ctrl+Z: " + err.Error() + ".")
+	} else {
+		s.r.Reset()
+	}
+	if panel {
+		s.openPanel()
+	}
 }
 
 // global carries out the keys that are the session's own in every state,
@@ -219,23 +341,7 @@ func (s *session) global(k term.Key) bool {
 		}
 		s.keep(s.r.Clear())
 	case k.Is('z', term.ModCtrl):
-		// The shell has the screen while gnosh is stopped. When it is
-		// continued the live region is drawn afresh, at the cursor. The
-		// side panel gives the screen back first, and comes back after.
-		panel := s.panel != nil
-		s.closePanel()
-		s.frame()
-		s.keep(s.r.Clear())
-		if err := s.host.suspend(); err != nil {
-			// Nothing was stopped, and nothing else has written to the
-			// terminal: the region is drawn again where it was.
-			s.flash("Ctrl+Z: " + err.Error() + ".")
-		} else {
-			s.r.Reset()
-		}
-		if panel {
-			s.openPanel()
-		}
+		s.suspendNow()
 	case s.panel != nil && k.IsKey(term.KeyPageUp, 0):
 		s.scrollPanel(s.panel.Page())
 	case s.panel != nil && k.IsKey(term.KeyPageDown, 0):
@@ -255,7 +361,11 @@ func (s *session) global(k term.Key) bool {
 			s.hideTasks = false
 		default:
 			s.hideTasks = true
-			s.flash("The task list is out of sight. Ctrl+T shows it again.")
+			if k := s.keyHint("app:toggleTodos", "Ctrl+T"); k != "" {
+				s.flash("The task list is out of sight. " + k + " shows it again.")
+			} else {
+				s.flash("The task list is out of sight.")
+			}
 		}
 	case k.Is('b', term.ModCtrl):
 		s.background()
@@ -307,8 +417,27 @@ func (s *session) stopAgentsKey() {
 // box gives a key or a paste to the prompt box and acts on what the box
 // asks for.
 func (s *session) box(ev term.Event, k *term.Key) {
+	if s.suggestion != "" {
+		// Tab or the right arrow in the empty box takes the suggested
+		// prompt, as in Claude Code; anything else drops it.
+		take := k != nil && s.ed.IsEmpty() && (k.IsKey(term.KeyTab, 0) || k.IsKey(term.KeyRight, 0))
+		text := s.suggestion
+		s.suggestion = ""
+		if take {
+			s.ed.SetText(text)
+			return
+		}
+	}
+	if k != nil && !k.IsKey(term.KeyLeft, 0) {
+		s.leftAt = time.Time{}
+	}
 	if k != nil {
 		switch {
+		case !s.chord && k.IsKey(term.KeyLeft, 0) && s.ed.IsEmpty() && s.agentsOffered():
+			// ← in the empty box, twice, opens the agent view, as it
+			// does in Claude Code (agentsover.go).
+			s.leftKey()
+			return
 		case s.chord:
 			// The key after Ctrl+X.
 			s.chord = false
@@ -341,6 +470,19 @@ func (s *session) box(ev term.Event, k *term.Key) {
 		case k.IsKey(term.KeyTab, term.ModShift):
 			s.cycleMode()
 			return
+		case k.Is('v', term.ModCtrl) && s.ed.Mode() == editor.ModePrompt && !s.ed.Searching():
+			// (Not into the history search, which would take @image-N
+			// for what to look for.)
+			s.pastePicture()
+			return
+		}
+	}
+	if p, ok := ev.(term.Paste); ok && s.ed.Mode() == editor.ModePrompt && !s.ed.Searching() {
+		// Files dragged in: their paths become @ mentions (picture.go).
+		if text, ok := s.picturePaths(p.Text); ok {
+			p.Text = s.spaced(text)
+			ev = p
+			s.flash("The picture goes with the prompt.")
 		}
 	}
 	s.ed.SetBusy(s.busy || s.cmdRun != "")
@@ -357,13 +499,17 @@ func (s *session) box(ev term.Event, k *term.Key) {
 	switch res.Action {
 	case editor.ActionSubmit:
 		d := editor.Draft{Text: res.Text, Pastes: res.Pastes}
+		if !s.cleanToSend(&d, res.Mode) {
+			break
+		}
+		s.failHint = ""
 		switch res.Mode {
 		case editor.ModeShell:
 			s.shell(d)
 		case editor.ModeCommand:
 			s.command(d)
 		default:
-			if w := strings.ToLower(strings.TrimSpace(d.Text)); (w == "exit" || w == "quit") && len(d.Pastes) == 0 {
+			if leaveWord(d.Text) && len(d.Pastes) == 0 {
 				// The one word leaves, as /exit does and as it does in
 				// Claude Code. To send the word to the model, say more.
 				s.command(editor.Draft{Text: "/exit"})
@@ -394,10 +540,7 @@ func (s *session) box(ev term.Event, k *term.Key) {
 // queues it. Either way it shows as queued until it is seen going out,
 // so it is never out of sight.
 func (s *session) send(d editor.Draft) {
-	p := agent.Prompt{Text: d.Text, Attachments: s.attach}
-	if len(d.Pastes) > 0 {
-		p.Meta = map[string]any{metaPastes: d.Pastes}
-	}
+	p := agent.Prompt{Text: d.Text, Attachments: s.attach, Meta: pastedMeta(d.Pastes)}
 	id, err := s.c.Submit(p)
 	if err != nil {
 		s.restore(d)
@@ -457,6 +600,7 @@ var ownCommands = []struct {
 		}
 		return ok
 	}},
+	{themeWords, func(s *session, line string) bool { return s.q == nil && s.chooseTheme(line) }},
 	{configWords, func(s *session, line string) bool {
 		// (Asked before the picker opens: the picker is a question too.)
 		if _, ok := s.c.(configChooser); !ok || s.q != nil {
@@ -469,9 +613,20 @@ var ownCommands = []struct {
 	{memoryWords, func(s *session, line string) bool { return s.q == nil && s.chooseMemory(line) }},
 	{keybindingsWords, func(s *session, line string) bool { return s.q == nil && s.openKeybindings(line) }},
 	{mcpWords, func(s *session, line string) bool { return s.q == nil && s.chooseMCP(line) }},
+	{hooksWords, func(s *session, line string) bool { return s.q == nil && s.chooseHooks(line) }},
+	{agentsWords, func(s *session, line string) bool { return s.q == nil && s.chooseAgents(line) }},
 	{permissionsWords, func(s *session, line string) bool { return s.q == nil && s.choosePermissions(line) }},
 	{skillsWords, func(s *session, line string) bool { return s.q == nil && s.chooseSkills(line) }},
 	{effortWords, func(s *session, line string) bool { return s.q == nil && s.chooseEffort(line) }},
+	{focusWords, func(s *session, line string) bool {
+		// Turned over by what the screen shows.
+		arg := "on"
+		if s.focus {
+			arg = "off"
+		}
+		s.run(line + " " + arg)
+		return true
+	}},
 	{panelWords, func(s *session, line string) bool {
 		s.ed.AddHistory(editor.Draft{Text: line})
 		s.togglePanel()
@@ -525,12 +680,29 @@ func shownCommand(line string) (shown string, held bool) {
 // and Esc stops it.
 func (s *session) run(line string) {
 	if s.cmdRun != "" {
+		if sideCommand(s.cmdRun) && exitCommand(line) {
+			// /exit does not wait behind a side question, which may take
+			// minutes: that is let go, and /exit is next.
+			if s.cmdStop != nil {
+				s.cmdStop()
+			}
+			s.cmdq = append([]string{line}, s.cmdq...)
+			s.queued()
+			return
+		}
 		s.cmdq = append(s.cmdq, line)
 		s.queued()
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cmdRun, s.cmdStop = line, cancel
+	// A command of the session's is shown as typed when it starts, as a
+	// prompt is: what it says meanwhile (the notes of a summary it waits
+	// for, minutes on a local model) comes after it. A line that may be no
+	// command is shown once it has run (ran).
+	if s.cmdShown = s.isCommand(line); s.cmdShown {
+		s.showTyped(line)
+	}
 	c := s.c
 	s.host.spawn(func() func() {
 		res, err := c.Command(ctx, line)
@@ -539,6 +711,48 @@ func (s *session) run(line string) {
 			s.ran(line, res, err)
 		}
 	})
+}
+
+// sideCommand reports whether line is a side question's command: /btw or
+// /recap, which only wait for the model's answer.
+func sideCommand(line string) bool {
+	word, _, _ := strings.Cut(strings.TrimPrefix(strings.TrimSpace(line), "/"), " ")
+	switch strings.ToLower(word) {
+	case "btw", "recap":
+		return true
+	}
+	return false
+}
+
+// exitCommand reports whether line ends the session: /exit or /quit.
+func exitCommand(line string) bool {
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "/exit", "/quit":
+		return true
+	}
+	return false
+}
+
+// isCommand reports whether line names one of the session's commands, by
+// its name or one of its aliases.
+func (s *session) isCommand(line string) bool {
+	word, _, _ := strings.Cut(strings.TrimPrefix(strings.TrimSpace(line), "/"), " ")
+	word = strings.ToLower(word)
+	for _, c := range s.info.CommandList {
+		if c.Name == word || slices.Contains(c.Aliases, word) {
+			return true
+		}
+	}
+	return false
+}
+
+// showTyped puts a command line into the scrollback as the person typed
+// it, with what is not to be kept of it held back (shownCommand).
+func (s *session) showTyped(line string) {
+	th := &s.th
+	shown, _ := shownCommand(line)
+	s.begin(blkPrompt)
+	s.put(wrap(s.m, th.PromptText.Render(oneLine(shown)), s.cols, th.Prompt.Render(th.PromptMark), strings.Repeat(" ", s.m.Width(th.PromptMark)))...)
 }
 
 // verboseSet reads a /config line for the verbose option set true or
@@ -571,7 +785,8 @@ func configSet(line, key string) (string, bool) {
 
 // ran takes in what a slash command came to.
 func (s *session) ran(line string, res app.CommandResult, err error) {
-	s.cmdRun, s.cmdStop = "", nil
+	shown := s.cmdShown
+	s.cmdRun, s.cmdStop, s.cmdShown = "", nil, false
 	s.dirty = true
 	word, _, _ := strings.Cut(line, " ")
 	switch {
@@ -583,10 +798,15 @@ func (s *session) ran(line string, res app.CommandResult, err error) {
 		// A prompt that happens to begin with a slash, such as a path.
 		s.send(editor.Draft{Text: line})
 	default:
-		th := &s.th
-		shown, held := shownCommand(line)
-		s.begin(blkPrompt)
-		s.put(wrap(s.m, th.PromptText.Render(oneLine(shown)), s.cols, th.Prompt.Render(th.PromptMark), strings.Repeat(" ", s.m.Width(th.PromptMark)))...)
+		_, held := shownCommand(line)
+		switch {
+		case !shown:
+			s.showTyped(line)
+		case s.last != blkPrompt && strings.TrimSpace(res.Text) != "":
+			// Something came between: what the command says is a block
+			// of its own.
+			s.begin(blkText)
+		}
 		for _, l := range safeLines(res.Text) {
 			s.put(wrap(s.m, l, s.cols, "", "")...)
 		}
@@ -604,12 +824,36 @@ func (s *session) ran(line string, res app.CommandResult, err error) {
 		if on, ok := verboseSet(line); ok && err == nil && res.Name == "config" {
 			// The verbose option is the interface's own: what /config set
 			// is in force here at once.
-			s.detail = on
+			if on {
+				s.setView("verbose")
+			} else {
+				s.detail = false
+			}
+		}
+		if mode, ok := configSet(line, "viewMode"); ok && err == nil && res.Name == "config" {
+			// So is the viewMode option, and /focus, which sets it; set to
+			// nothing, verbose decides.
+			s.setView(firstNonEmpty(mode, s.unfocused()))
+		}
+		if on, ok := focusSet(line); ok && err == nil && res.Name == "focus" {
+			switch {
+			case on:
+				s.setView("focus")
+			case s.focus:
+				s.setView(s.unfocused())
+			}
 		}
 		if mode, ok := configSet(line, "editorMode"); ok && mode != "" && err == nil && res.Name == "config" {
 			// So is the editorMode option.
 			s.ed.SetVim(mode == "vim")
 			s.reportVim()
+		}
+		if name, ok := configSet(line, "theme"); ok && err == nil && res.Name == "config" {
+			// And the theme option: the colours change at once.
+			s.setTheme(name)
+		}
+		if name, ok := themeSet(line); ok && err == nil && res.Name == "theme" {
+			s.setTheme(name)
 		}
 		if res.Quit {
 			// (/restart and /background: the session goes on in another
@@ -624,6 +868,7 @@ func (s *session) ran(line string, res app.CommandResult, err error) {
 			// was under way is any more.
 			s.busy, s.stopping, s.ph = false, false, phIdle
 			s.reply, s.calls, s.queue, s.sending = reply{}, nil, nil, nil
+			s.fold = fold{}
 			s.q, s.qwait = nil, nil
 			s.loop = false
 			s.closeView()
@@ -665,6 +910,14 @@ func (s *session) nextCommand() {
 // slash command that is running. The line above the box says so until
 // the turn's end arrives.
 func (s *session) interrupt() {
+	if s.cmdStop != nil && sideCommand(s.cmdRun) {
+		// A side question (/btw, /recap) waits: Esc lets it go, and the
+		// turn goes on; Esc again stops the turn (the side-request review
+		// of 2026-11-19).
+		s.cmdStop()
+		s.dirty = true
+		return
+	}
 	if s.cmdStop != nil {
 		s.cmdStop()
 	}
@@ -695,8 +948,7 @@ func (s *session) takeBack() {
 		}
 	}
 	for _, p := range s.c.TakeQueued() {
-		spans, _ := p.Meta[metaPastes].([]editor.Span)
-		add(p.Text, spans)
+		add(p.Text, pastesOf(p.Meta))
 		s.attach = append(s.attach, p.Attachments...)
 		for i, x := range s.sending {
 			if x.draft.Text == p.Text {
@@ -770,7 +1022,11 @@ func (s *session) cycleMode() {
 		if next == "bypassPermissions" {
 			s.notice(agent.LevelWarning, "The permission mode is now BYPASS PERMISSIONS: nothing asks before it runs, except what a deny rule or an ask rule names and the removals gnosh always asks about. Shift+Tab leaves it.")
 		} else {
-			s.flash("Permission mode: " + modeNames[next] + ". Shift+Tab goes on to the next.")
+			if k := s.keyHint("chat:cycleMode", "Shift+Tab"); k != "" {
+				s.flash("Permission mode: " + modeNames[next] + ". " + k + " goes on to the next.")
+			} else {
+				s.flash("Permission mode: " + modeNames[next] + ".")
+			}
 		}
 		s.dirty = true
 		return
@@ -811,7 +1067,7 @@ func (s *session) background() {
 	}
 	moved := 0
 	for _, c := range s.calls {
-		if c.started && b.Background(c.id) {
+		if c.started && b.Background(c.id, c.name) {
 			moved++
 		}
 	}
@@ -838,20 +1094,74 @@ func (s *session) open(qs *question) {
 	// A question is for the person: the transcript view gives the screen
 	// back, so that it is seen.
 	s.closeView()
+	s.dropHeldKey()
 	now := s.now()
 	qs.opened, qs.guarded = now, true
 	qs.quiet = now.Add(guardShown)
 	if t := s.lastInput.Add(guardPause); t.After(qs.quiet) {
 		qs.quiet = t
 	}
+	if qs.secret {
+		// A key's password is typed at once, often before its question
+		// is drawn: no key typed for it may go to the prompt box, where
+		// Enter would send it to the model. The question takes keys at
+		// once, and what was typed into the box since the question
+		// before it closed (the approval of the command, a moment ago)
+		// is taken out again.
+		qs.guarded = false
+		if !s.closedAt.IsZero() && now.Sub(s.closedAt) < secretGap && s.ed.Text() != s.closedText {
+			s.ed.SetText(s.closedText)
+		}
+	}
+	if qs.form != nil && !qs.escCancels && qs.local == nil && qs.q.Tool == "AskUserQuestion" {
+		qs.idle = s.info.AskTimeout
+	}
+	if cur := s.q; cur != nil && cur != qs && cur.local == nil && !cur.answered {
+		// A menu of the interface's own takes the screen from the
+		// session's question (a picker's second screen, opened just as
+		// the first one closed and put up the question that waited
+		// behind it): the question goes back to the head of the line,
+		// not out of it. It was lost, and its turn waited for ever (the
+		// TUI review of 2026-11-19).
+		s.qwait = append([]*question{cur}, s.qwait...)
+	}
 	s.q = qs
 	s.dirty = true
+}
+
+// questionAway closes the model's questions when they went without a key
+// for their idle time (the askUserQuestionTimeout option): what was picked
+// by then is the answer, with the Choice app.AskedAway, and the model goes
+// on without the person.
+func (s *session) questionAway(q *question) {
+	f, ok := q.ui.(*menu.Form)
+	if !ok {
+		q.idle = 0
+		return
+	}
+	ans, record, _ := q.answer(menu.Result{Done: true, Answers: f.Answers()})
+	ans.Choice = app.AskedAway
+	if err := s.c.Answer(q.q.ID, ans); err != nil {
+		// Answered a moment before from elsewhere.
+		return
+	}
+	words := "no answer in " + span(q.idle) + ": the model goes on without you"
+	for _, line := range strings.Split(record, "\n") {
+		if !strings.HasSuffix(line, "(no answer)") {
+			words += "; picked by then: " + strings.ReplaceAll(record, "\n", "; ")
+			break
+		}
+	}
+	s.record(q, words)
+	q.answered = true
+	s.closeQuestion()
 }
 
 // closeQuestion takes the question off the screen. The prompt box has the
 // keys again, with whatever was in it, unless another question waits.
 func (s *session) closeQuestion() {
 	s.q = nil
+	s.closedText, s.closedAt = s.ed.Text(), s.now()
 	if len(s.qwait) > 0 {
 		next := s.qwait[0]
 		s.qwait = s.qwait[1:]
@@ -866,6 +1176,14 @@ func (s *session) answered(ev *agent.AnswerEvent) {
 	if q := s.q; q != nil && q.q.ID == ev.ID {
 		if !q.answered {
 			words := "answered elsewhere"
+			if ev.Answer.By != "" {
+				words = "answered by " + ev.Answer.By
+			}
+			for _, c := range q.q.Choices {
+				if c.Key == ev.Answer.Choice && ev.Answer.Choice != "" {
+					words += ": " + c.Label
+				}
+			}
 			switch {
 			case ev.Withdrawn && !q.deadline.IsZero() && !s.now().Before(q.deadline):
 				words = "taken back unanswered: nobody answered in time"
@@ -898,13 +1216,29 @@ func (s *session) record(q *question, words string) {
 		lines = []string{""}
 	}
 	s.begin(blkAsk)
-	for i, l := range lines {
-		first := "  "
-		if i == 0 {
-			first = th.Ask.Render(th.AskMark) + " " + title + " "
-		}
-		s.put(wrap(s.m, th.Answer.Render(l), s.cols, first, "  ")...)
+	s.put(answerRows(th, s.m, s.cols, title, lines)...)
+}
+
+// answerRoom is the fewest cells a question's title may leave for its
+// answer beside it in the record.
+const answerRoom = 8
+
+// answerRows are the rows that record a question's answer: "? title" and
+// the answer beside it. Several answers (a form's), or a title that
+// leaves no room beside it, put the title on its own row and each answer
+// under it: beside a title that filled the row, an answer lost its first
+// letters (the TUI review of 2026-11-19: "es: use this folder's
+// settings").
+func answerRows(th *Theme, m text.Metrics, cols int, title string, answers []string) []string {
+	lead := th.Ask.Render(th.AskMark) + " "
+	if len(answers) == 1 && m.VisibleWidth(lead+title+" ")+answerRoom <= cols {
+		return wrap(m, th.Answer.Render(answers[0]), cols, lead+title+" ", "  ")
 	}
+	rows := wrap(m, title, cols, lead, "  ")
+	for _, l := range answers {
+		rows = append(rows, wrap(m, th.Answer.Render(l), cols, "  ", "  ")...)
+	}
+	return rows
 }
 
 // help writes the keys into the scrollback, where they can be read and
@@ -935,6 +1269,7 @@ func (s *session) help() {
 		{"Ctrl+T", "hide or show the task list"},
 		{"Ctrl+G", "edit the prompt in your editor (also Ctrl+X Ctrl+E)"},
 		{"Ctrl+S", "put the prompt aside, and bring it back"},
+		{"Ctrl+V", "paste the picture on the clipboard (or drag a picture's file in)"},
 		{"Ctrl+L", "draw the bottom of the screen again"},
 		{"Ctrl+Z", "suspend gnosh; fg brings it back"},
 		{"/config editorMode=vim", "vim's keys in the box: Esc for NORMAL mode, i to type, v to select"},
@@ -944,15 +1279,29 @@ func (s *session) help() {
 	for _, r := range rows {
 		wide = max(wide, s.m.Width(r[0]))
 	}
+	own := s.ownKeys()
+	for _, r := range own {
+		wide = max(wide, s.m.Width(r[0]))
+	}
 	s.begin(blkText)
 	s.put(th.ToolName.Render("Keys"))
-	for _, r := range rows {
-		key := r[0] + strings.Repeat(" ", wide-s.m.Width(r[0]))
-		rest := strings.Repeat(" ", wide+4)
-		if s.cols < wide+24 {
-			rest = "    "
+	list := func(rows [][2]string) {
+		for _, r := range rows {
+			key := r[0] + strings.Repeat(" ", wide-s.m.Width(r[0]))
+			rest := strings.Repeat(" ", wide+4)
+			if s.cols < wide+24 {
+				rest = "    "
+			}
+			s.put(wrap(s.m, th.Quiet.Render(r[1]), s.cols, "  "+key+"  ", rest)...)
 		}
-		s.put(wrap(s.m, th.Quiet.Render(r[1]), s.cols, "  "+key+"  ", rest)...)
+	}
+	list(rows)
+	if len(own) > 0 {
+		// The person's own keys, as Claude Code's hints follow its
+		// keybindings.json (2.1.329): what each does here, in the words
+		// of the list above.
+		s.put(wrap(s.m, th.ToolName.Render("Yours, from "+showPath(s.cwd, s.home, s.keys.path)), s.cols, "", "  ")...)
+		list(own)
 	}
 	var missing []string
 	if _, ok := s.c.(sheller); !ok {
@@ -972,9 +1321,73 @@ func (s *session) help() {
 	}
 }
 
+// loadThen reads a picker's list away from the loop, so that a long
+// session's file, or a folder of many sessions, does not hold the screen
+// still, and then shows it. What the person types meanwhile is held for
+// the list, as had it come at once: Down and Enter pick in it, Esc closes
+// it. A question or a turn that comes first lets the list go (listCheck),
+// and so does Ctrl+C. again says how to ask for the list again.
+func loadThen[T any](s *session, again string, read func() T, show func(T)) {
+	if s.listing {
+		return
+	}
+	s.listing, s.listAgain = true, again
+	gen := s.listGen
+	s.host.spawn(func() func() {
+		got := read()
+		return func() {
+			if !s.listing || gen != s.listGen {
+				// Let go meanwhile.
+				return
+			}
+			s.listing = false
+			held := s.heldInput
+			s.heldInput = nil
+			show(got)
+			if s.q == nil {
+				// No list came up (there was nothing in it): what was
+				// typed for it is not for the box, where Enter sends.
+				return
+			}
+			list := s.q
+			for _, ev := range held {
+				if s.q != list {
+					// The list was answered, and what that opened (the
+					// rewind's choice of what to put back) was not seen
+					// when the rest was typed: Esc Esc Enter Enter must
+					// not put the files back unseen (the rewind review of
+					// 2026-11-19). The rest is let go.
+					break
+				}
+				s.refeed(ev)
+			}
+		}
+	})
+}
+
+// listCheck lets a list that is being read go when a question or a turn
+// came first: what the person types next is for what is on the screen.
+func (s *session) listCheck() {
+	switch {
+	case !s.listing:
+	case s.q != nil:
+		s.dropList("A question came first: " + s.listAgain + " opens the list again.")
+	case s.busy:
+		s.dropList("A turn began first: " + s.listAgain + " opens the list again.")
+	}
+}
+
+// dropList lets the list that is being read go, with what was typed for
+// it, and says why.
+func (s *session) dropList(why string) {
+	s.listing, s.heldInput = false, nil
+	s.listGen++
+	s.flash(why)
+}
+
 // rewindNote is what the menu says of the files a rewind can and cannot
 // put back.
-const rewindNote = "What shell commands changed is not kept, and stays as it is."
+const rewindNote = "Each goes back as it was before that prompt, and what it holds now is kept first. Files only shell commands or sub-agents changed are not followed."
 
 // rewind opens the list of the person's prompts, the newest first, to
 // take the conversation back to before one of them. It is what Esc Esc
@@ -991,7 +1404,11 @@ func (s *session) rewind() {
 	case s.q != nil:
 		return
 	}
-	points := rw.RewindPoints()
+	loadThen(s, "Esc Esc", rw.RewindPoints, s.rewindMenu)
+}
+
+// rewindMenu opens the list of the person's prompts that rewind read.
+func (s *session) rewindMenu(points []app.RewindPoint) {
 	if len(points) == 0 {
 		s.flash("There is no prompt of yours in this conversation to go back to.")
 		return
@@ -1012,12 +1429,19 @@ func (s *session) rewind() {
 		number := len(points) - res.Index
 		point := points[number-1]
 		// The choices, as Claude Code offers them: the conversation and the
-		// files, the conversation alone, or the files alone; the ones about
-		// files only where Write or Edit changed one since.
-		sure := &question{q: agent.Question{Kind: "rewind", Title: "Go back to before: " + oneLine(point.Text)}}
+		// files, the conversation alone, or the files alone (the ones about
+		// files only where one of the files followed changed since); and a
+		// summary of what followed the prompt, gone back from, or of what
+		// came before it (not for the first prompt).
+		// (A long prompt, pasted, would take the rows the files and the
+		// choices need.)
+		sure := &question{q: agent.Question{Kind: "rewind", Title: "Go back to before: " + fit(s.m, oneLine(point.Text), rewindTitleMost)}}
 		var opts []menu.Option
 		var commands []string
-		body := []string{"Write and Edit changed no file since then. " + rewindNote}
+		body := []string{"No file this session's Write and Edit changed has changed since then: files only shell commands or sub-agents changed are not followed."}
+		if point.FilesWhy != "" {
+			body = []string{"No file can be put back: " + oneLine(point.FilesWhy) + "."}
+		}
 		if n := len(point.Files); n > 0 {
 			shown := point.Files
 			if len(shown) > 5 {
@@ -1025,13 +1449,15 @@ func (s *session) rewind() {
 			}
 			names := make([]string, len(shown))
 			for i, f := range shown {
-				names[i] = filepath.Base(f)
+				// (A name the model gave a file may hold anything: the
+				// menu keeps styles and links.)
+				names[i] = pathShown(f)
 			}
 			more := ""
 			if n > len(shown) {
 				more = fmt.Sprintf(" and %d more", n-len(shown))
 			}
-			body = []string{fmt.Sprintf("Write and Edit changed %s since then: %s%s. %s", count(n, "file", "files"), strings.Join(names, ", "), more, rewindNote)}
+			body = []string{fmt.Sprintf("%s changed since then: %s%s. %s", count(n, "file", "files"), strings.Join(names, ", "), more, rewindNote)}
 			opts = append(opts, menu.Option{Label: "Go back, and put the files back", Description: "the conversation and the files as they were"})
 			commands = append(commands, fmt.Sprintf("/rewind %d all", number))
 		}
@@ -1040,6 +1466,20 @@ func (s *session) rewind() {
 		if len(point.Files) > 0 {
 			opts = append(opts, menu.Option{Label: "Put the files back only", Description: "the conversation stays as it is"})
 			commands = append(commands, fmt.Sprintf("/rewind %d files", number))
+		}
+		if point.InView {
+			// (Of a prompt the model still reads: one a summary or a slide
+			// took out has nothing before or after it to summarize.)
+			// (Each takes, as Claude Code's do, what the summary is to
+			// keep, typed on its row after Tab.)
+			opts = append(opts, menu.Option{Label: "Summarize from here", Description: "go back to before it, keeping a summary of what followed; the files stay",
+				Text: menu.TextOptional, Placeholder: "what the summary is to keep, if anything in particular"})
+			commands = append(commands, fmt.Sprintf("/rewind %d summarize", number))
+			if number > 1 {
+				opts = append(opts, menu.Option{Label: "Summarize up to here", Description: "what came before it becomes a summary; it and what followed stay",
+					Text: menu.TextOptional, Placeholder: "what the summary is to keep, if anything in particular"})
+				commands = append(commands, fmt.Sprintf("/rewind %d summarize-before", number))
+			}
 		}
 		opts = append(opts, menu.Option{Label: "Never mind"})
 		sure.ui = menu.NewSelect(menu.SelectOptions{
@@ -1050,11 +1490,34 @@ func (s *session) rewind() {
 			if res.Cancelled || res.Index < 0 || res.Index >= len(commands) {
 				return
 			}
-			s.run(commands[res.Index])
+			line := commands[res.Index]
+			if guide := strings.Join(strings.Fields(res.Text), " "); guide != "" && strings.Contains(line, " summarize") {
+				line += " " + guide
+			}
+			s.run(line)
 		}
 		s.openLocal(sure)
 	}
 	s.openLocal(pick)
+}
+
+// rewindTitleMost is how many cells of the prompt a rewind's confirmation
+// shows.
+const rewindTitleMost = 100
+
+// pathShown is a path for a menu: on one line, with the marks that turn
+// the order text is drawn in written out, so that a name cannot pass for
+// another.
+func pathShown(p string) string {
+	var b strings.Builder
+	for _, r := range oneLine(p) {
+		if bidiMark(r) {
+			fmt.Fprintf(&b, "\\u%04X", r)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // openLocal puts a menu of the interface's own on the screen. The person
@@ -1084,10 +1547,7 @@ func (s *session) withdrawLast() {
 			// It went out to the model in the meantime.
 			continue
 		}
-		d := editor.Draft{Text: p.Text}
-		if spans, ok := p.Meta[metaPastes].([]editor.Span); ok {
-			d.Pastes = spans
-		}
+		d := editor.Draft{Text: p.Text, Pastes: pastesOf(p.Meta)}
 		s.attach = append(s.attach, p.Attachments...)
 		for j, x := range s.sending {
 			if x.id == queued[i].ID {
@@ -1132,7 +1592,7 @@ func (s *session) sendNow() {
 	b, movable := s.c.(backgrounder)
 	for _, c := range s.calls {
 		switch {
-		case c.started && movable && b.Background(c.id):
+		case c.started && movable && b.Background(c.id, c.name):
 			moved++
 		default:
 			blocked++
@@ -1160,7 +1620,12 @@ func (s *session) resume() {
 	case s.q != nil:
 		return
 	}
-	choices := rs.ResumeChoices()
+	loadThen(s, "/resume", rs.ResumeChoices, s.resumeMenu)
+}
+
+// resumeMenu opens the list of the folder's other sessions that resume
+// read.
+func (s *session) resumeMenu(choices []app.SessionChoice) {
 	if len(choices) == 0 {
 		s.flash("There is no other session in this folder to open.")
 		return

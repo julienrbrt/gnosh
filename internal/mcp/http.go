@@ -31,6 +31,9 @@ type httpTransport struct {
 	url     string
 	headers map[string]string
 	client  *http.Client
+	// auth gives the requests the person's sign-in, when the server's
+	// Authorization header is not configured (auth.go).
+	auth *Authorizer
 	// base ends with the connection: every request is made in it too.
 	base context.Context
 	end  context.CancelFunc
@@ -49,6 +52,9 @@ func StartHTTP(ctx context.Context, name, url string, headers map[string]string,
 	opt = opt.defaults()
 	c := &Client{srv: Server{Name: name}, opt: opt, pending: map[string]chan message{}}
 	t := &httpTransport{c: c, url: url, headers: headers}
+	if opt.Auth != nil && !hasHeader(headers, "Authorization") {
+		t.auth = opt.Auth
+	}
 	t.base, t.end = context.WithCancel(context.Background())
 	t.client = &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		// A redirect elsewhere would take the configured headers, which
@@ -80,6 +86,32 @@ func (t *httpTransport) send(ctx context.Context, m message) error {
 	if err != nil {
 		return err
 	}
+	for renewed := false; ; renewed = true {
+		resp, done, token, err := t.post(ctx, data)
+		if err != nil {
+			return err
+		}
+		if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && !hasHeader(t.headers, "Authorization") {
+			// The server wants a sign-in, or a better one: a refused token
+			// (401) is renewed once, and otherwise the person signs in
+			// (/mcp). A 403 (a scope missing, a firewall) renews and
+			// forgets nothing. With an Authorization header configured, a
+			// refusal is the configured credential's, and a plain failure.
+			www := resp.Header.Get("WWW-Authenticate")
+			resp.Body.Close()
+			done()
+			if resp.StatusCode == http.StatusUnauthorized && !renewed && token != "" && t.auth != nil && t.auth.renew(ctx, token) {
+				continue
+			}
+			return &NeedsAuth{Status: resp.StatusCode, WWWAuthenticate: www}
+		}
+		return t.answered(m, resp, done)
+	}
+}
+
+// post makes one POST of a message: the answer, how to end the request
+// once its answer is read, and the token it carried.
+func (t *httpTransport) post(ctx context.Context, data []byte) (*http.Response, func(), string, error) {
 	// The request ends with ctx, or with the connection.
 	rctx, cancel := context.WithCancel(ctx)
 	unhook := context.AfterFunc(t.base, cancel)
@@ -90,28 +122,42 @@ func (t *httpTransport) send(ctx context.Context, m message) error {
 	req, err := http.NewRequestWithContext(rctx, http.MethodPost, t.url, bytes.NewReader(data))
 	if err != nil {
 		done()
-		return err
+		return nil, nil, "", err
 	}
-	t.header(req)
+	token := t.header(req)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	resp, err := t.client.Do(req)
 	if err != nil {
 		done()
 		if t.base.Err() != nil {
-			return ErrClosed
+			return nil, nil, "", ErrClosed
 		}
-		return fmt.Errorf("%w: %w", ErrUnreachable, err)
+		return nil, nil, "", fmt.Errorf("%w: %w", ErrUnreachable, err)
 	}
+	return resp, done, token, nil
+}
+
+// answered takes the server's answer to the message m. A request's answer
+// comes in it, as JSON or in a stream of events: the client opens no
+// stream of its own where a later one could come. So a request answered
+// with 202, with JSON that holds no answer to it, or with a stream that
+// ends before its answer, fails at once, as a server that could not be
+// reached does: whether the request did anything is not known.
+func (t *httpTransport) answered(m message, resp *http.Response, done func()) error {
 	if id := resp.Header.Get("Mcp-Session-Id"); id != "" && m.Method == "initialize" {
 		t.mu.Lock()
 		t.session = id
 		t.mu.Unlock()
 	}
+	request := m.Method != "" && len(m.ID) > 0
 	switch {
 	case resp.StatusCode == http.StatusAccepted:
 		resp.Body.Close()
 		done()
+		if request {
+			return fmt.Errorf("%w: it took the request (202 Accepted) and sent no answer to it", ErrUnreachable)
+		}
 		return nil
 	case resp.StatusCode == http.StatusNotFound && t.hasSession():
 		resp.Body.Close()
@@ -135,6 +181,11 @@ func (t *httpTransport) send(ctx context.Context, m message) error {
 			defer done()
 			defer resp.Body.Close()
 			t.events(resp.Body)
+			if request {
+				// (A no-op when the answer came: the request no longer
+				// waits.)
+				t.c.fail(m.ID, fmt.Errorf("%w: the stream its answer was to come in ended first", ErrUnreachable))
+			}
 		}()
 		return nil
 	}
@@ -144,14 +195,24 @@ func (t *httpTransport) send(ctx context.Context, m message) error {
 	if err != nil {
 		return fmt.Errorf("mcp: the server's answer could not be read: %w", err)
 	}
-	return t.take(body)
+	answered, err := t.take(body, m.ID)
+	if err == nil && request && !answered {
+		err = fmt.Errorf("%w: its answer held no answer to the request", ErrUnreachable)
+	}
+	return err
 }
 
 // header puts the configured headers, the session id and the protocol
-// version on a request.
-func (t *httpTransport) header(req *http.Request) {
+// version on a request, and the sign-in's token when there is one, which
+// it returns.
+func (t *httpTransport) header(req *http.Request) (token string) {
 	for k, v := range t.headers {
 		req.Header.Set(k, v)
+	}
+	if t.auth != nil {
+		if token = t.auth.token(); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -161,6 +222,7 @@ func (t *httpTransport) header(req *http.Request) {
 	if t.version != "" {
 		req.Header.Set("MCP-Protocol-Version", t.version)
 	}
+	return token
 }
 
 func (t *httpTransport) hasSession() bool {
@@ -169,39 +231,46 @@ func (t *httpTransport) hasSession() bool {
 	return t.session != ""
 }
 
-// take dispatches what a JSON answer holds: one message, or a list.
-func (t *httpTransport) take(body []byte) error {
+// take dispatches what a JSON answer holds: one message, or a list. It
+// reports whether the answer to the request with the id want was among
+// them.
+func (t *httpTransport) take(body []byte, want json.RawMessage) (bool, error) {
 	body = bytes.TrimSpace(body)
 	if len(body) == 0 {
-		return nil
+		return false, nil
 	}
+	var list []message
 	if body[0] == '[' {
-		var list []message
 		if err := json.Unmarshal(body, &list); err != nil {
-			return fmt.Errorf("mcp: the server's answer is not JSON-RPC: %w", err)
+			return false, fmt.Errorf("mcp: the server's answer is not JSON-RPC: %w", err)
 		}
-		for _, m := range list {
-			t.c.dispatch(m)
+	} else {
+		var m message
+		if err := json.Unmarshal(body, &m); err != nil {
+			return false, fmt.Errorf("mcp: the server's answer is not JSON-RPC: %w", err)
 		}
-		return nil
+		list = append(list, m)
 	}
-	var m message
-	if err := json.Unmarshal(body, &m); err != nil {
-		return fmt.Errorf("mcp: the server's answer is not JSON-RPC: %w", err)
+	got := false
+	for _, m := range list {
+		if len(want) > 0 && m.Method == "" && strings.Trim(string(m.ID), `"`) == strings.Trim(string(want), `"`) {
+			got = true
+		}
+		t.c.dispatch(m)
 	}
-	t.c.dispatch(m)
-	return nil
+	return got, nil
 }
 
 // events reads a stream of server-sent events, each event's data a
-// message.
+// message. An event larger than any answer may be ends the stream: what
+// waited on it fails.
 func (t *httpTransport) events(r io.Reader) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64<<10), maxHTTPMessage)
 	var data strings.Builder
 	flush := func() {
 		if data.Len() > 0 {
-			_ = t.take([]byte(data.String()))
+			_, _ = t.take([]byte(data.String()), nil)
 			data.Reset()
 		}
 	}
@@ -211,6 +280,9 @@ func (t *httpTransport) events(r io.Reader) {
 		case line == "":
 			flush()
 		case strings.HasPrefix(line, "data:"):
+			if data.Len()+len(line) > maxHTTPMessage {
+				return
+			}
 			if data.Len() > 0 {
 				data.WriteByte('\n')
 			}

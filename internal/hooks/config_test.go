@@ -42,11 +42,11 @@ func TestParseConfigReadsClaudeCodesBlock(t *testing.T) {
 
 // With no file named, a problem still says where in the block it is.
 func TestParseConfigWithNoSourceNamed(t *testing.T) {
-	cfg, err := ParseConfig(json.RawMessage(`{"Stop": [{"hooks": [{"type": "command", "command": "true"}, {"type": "agent"}]}], "stopp": []}`), "")
+	cfg, err := ParseConfig(json.RawMessage(`{"Stop": [{"hooks": [{"type": "command", "command": "true"}, {"type": "script"}]}], "stopp": []}`), "")
 	if err == nil || len(cfg.Hooks) != 1 || cfg.Hooks[0].Source != "Stop group 1, hook 1" {
 		t.Fatalf("ParseConfig = %+v, %v", cfg.Hooks, err)
 	}
-	contains(t, "the error", err.Error(), `Stop group 1, hook 2: the hook has "type": "agent"`, "\n\"stopp\" is not a hook event")
+	contains(t, "the error", err.Error(), `Stop group 1, hook 2: the hook has "type": "script"`, "\n\"stopp\" is not a hook event")
 }
 
 func TestParseConfigTakesAnAbsentBlock(t *testing.T) {
@@ -66,7 +66,7 @@ func TestParseConfigAcceptsWhatChangesNothing(t *testing.T) {
 	    "type": "command", "command": "true",
 	    "statusMessage": "Checking", "once": true, "shell": "bash",
 	    "async": false, "asyncRewake": false, "onFailure": "continue", "timeout": null
-	  } ] } ],
+	  }, { "type": "command", "command": "true", "onFailure": "block" } ] } ],
 	  "UserPromptSubmit": [ { "matcher": "*", "hooks": [ { "type": "command", "command": "true" } ] } ],
 	  "SubagentStop": [ { "matcher": null, "hooks": [ { "type": "command", "command": "true" } ] } ],
 	  "PostToolUse": [ { "hooks": [] } ]
@@ -75,8 +75,8 @@ func TestParseConfigAcceptsWhatChangesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseConfig: %v", err)
 	}
-	if len(cfg.Hooks) != 3 {
-		t.Errorf("got %d hooks, want 3: %+v", len(cfg.Hooks), cfg.Hooks)
+	if len(cfg.Hooks) != 4 {
+		t.Errorf("got %d hooks, want 4: %+v", len(cfg.Hooks), cfg.Hooks)
 	}
 }
 
@@ -102,8 +102,8 @@ func TestParseConfigRefuses(t *testing.T) {
 		{"an event with underscores", `{"pre_tool_use": []}`, []string{`"pre_tool_use" is not a hook event`, "this one is PreToolUse.", "Notification"}},
 		{"an event in capitals", `{"PRE_TOOL_USE": []}`, []string{`"PRE_TOOL_USE" is not a hook event`, "this one is PreToolUse.", "Notification"}},
 		{"an empty event name", `{"": []}`, []string{"names no event"}},
-		{"a Claude Code event that can block", `{"PostToolBatch": []}`, []string{`"PostToolBatch" is a Claude Code hook event that gnosh does not have`, "would never run", "can block"}},
-		{"a Claude Code event that only watches", `{"FileChanged": []}`, []string{`"FileChanged" is a Claude Code hook event that gnosh does not have`, "would never run"}},
+		{"a Claude Code event that can block", `{"WorktreeCreate": []}`, []string{`"WorktreeCreate" is a Claude Code hook event that gnosh does not have`, "would never run", "can block"}},
+		{"a Claude Code event that only watches", `{"MessageDisplay": []}`, []string{`"MessageDisplay" is a Claude Code hook event that gnosh does not have`, "would never run"}},
 		{"an event written twice", `{"Stop": [], "Stop": []}`, []string{`"Stop" is written twice`, "silently dropped"}},
 
 		{"an event that is not a list", `{"Stop": {"hooks": []}}`, []string{"must be a list of matcher groups", "an object"}},
@@ -128,8 +128,7 @@ func TestParseConfigRefuses(t *testing.T) {
 		{"an mcp_tool hook with neither", hook(`"type": "mcp_tool"`), []string{`the mcp_tool hook names no "server" and no "tool"`}},
 		{"an mcp_tool hook whose input is not an object", hook(`"type": "mcp_tool", "server": "s", "tool": "t", "input": [1]`), []string{`"input" is a JSON object`}},
 		{"a command hook with a server", hook(`"type": "command", "command": "x", "server": "s"`), []string{`"server", which a hook of "type": "command" does not take`}},
-		{"a prompt hook", hook(`"type": "prompt", "prompt": "is it done?"`), []string{`"type": "prompt"`, "command hooks, http hooks and mcp_tool hooks only"}},
-		{"an agent hook", hook(`"type": "agent", "prompt": "is it done?"`), []string{`"type": "agent"`, "command hooks, http hooks and mcp_tool hooks only"}},
+		{"a hook of another type", hook(`"type": "script", "prompt": "is it done?"`), []string{`"type": "script"`, "command hooks, http hooks, mcp_tool hooks, prompt hooks and agent hooks only"}},
 
 		{"an if filter that is not a string", hook(`"type": "command", "command": "true", "if": ["Bash(rm *)"]`), []string{`"if" is one permission rule`, "this one is a list"}},
 		{"an empty if filter", hook(`"type": "command", "command": "true", "if": " "`), []string{`"if" is empty`, `leave "if" out`}},
@@ -138,7 +137,6 @@ func TestParseConfigRefuses(t *testing.T) {
 		{"an argument with a NUL in it", hook(`"type": "command", "command": "check", "args": ["a\u0000b"]`), []string{"an argument of the hook holds a NUL character"}},
 		{"async that is not true or false", hook(`"type": "command", "command": "true", "async": "no"`), []string{`"async": "no"`}},
 		{"another shell", hook(`"type": "command", "command": "true", "shell": "powershell"`), []string{`"shell": "powershell"`, "POSIX shell"}},
-		{"onFailure block", hook(`"type": "command", "command": "true", "onFailure": "block"`), []string{`"onFailure": "block"`, "already blocks", `Remove "onFailure"`}},
 		{"an onFailure gnosh does not know", hook(`"type": "command", "command": "true", "onFailure": "retry"`), []string{`"onFailure": "retry"`, "does not know"}},
 		{"a field gnosh does not know", hook(`"type": "command", "command": "true", "retries": 3`), []string{`"retries"`, "does not know"}},
 		{"a field written twice", hook(`"type": "command", "command": "true", "command": "false"`), []string{`"command" is written twice`}},
@@ -199,7 +197,7 @@ func TestParseConfigReportsEverythingAtOnce(t *testing.T) {
 	  "PreToolUse": [
 	    { "matcher": "Bash", "hooks": [
 	        { "type": "command", "command": "./ok.sh" },
-	        { "type": "prompt", "prompt": "is it safe?" },
+	        { "type": "script", "prompt": "is it safe?" },
 	        { "type": "command", "command": "./filtered.sh", "if": 7, "timeout": -1 } ] } ],
 	  "stop": [ { "hooks": [ { "type": "command", "command": "./tests.sh" } ] } ],
 	  "PermissionRequest": [ { "hooks": [ { "type": "command", "command": "./answer.sh" } ] } ]
@@ -210,7 +208,7 @@ func TestParseConfigReportsEverythingAtOnce(t *testing.T) {
 	}
 	text := err.Error()
 	contains(t, "the error", text,
-		`gnosh.json: PreToolUse group 1, hook 2: the hook has "type": "prompt"`,
+		`gnosh.json: PreToolUse group 1, hook 2: the hook has "type": "script"`,
 		`gnosh.json: PreToolUse group 1, hook 3: "if" is one permission rule`,
 		`gnosh.json: PreToolUse group 1, hook 3: the timeout "-1" cannot be used`,
 		`gnosh.json: "stop" is not a hook event`,
@@ -225,7 +223,7 @@ func TestParseConfigReportsEverythingAtOnce(t *testing.T) {
 	// PermissionRequest hooks.
 	fires := []Event{PreToolUse, Stop}
 	all := problemsText(Check(cfg, Options{Fires: fires}))
-	contains(t, "Check", all, `"type": "prompt"`, `"if" is one permission rule`, `"stop" is not a hook event`, "does not run PermissionRequest hooks yet")
+	contains(t, "Check", all, `"type": "script"`, `"if" is one permission rule`, `"stop" is not a hook event`, "does not run PermissionRequest hooks yet")
 }
 
 func TestNewHook(t *testing.T) {
@@ -252,7 +250,7 @@ func TestNewHookRefuses(t *testing.T) {
 	}{
 		{"an event nobody has", Spec{Event: "Stopp", Command: "true"}, []string{`"Stopp" is not a hook event`}},
 		{"an event with underscores", Spec{Event: "pre_tool_use", Command: "true"}, []string{`"pre_tool_use" is not a hook event`, "PreToolUse"}},
-		{"a Claude Code event gnosh does not have", Spec{Event: "ConfigChange", Command: "true"}, []string{"Claude Code hook event that gnosh does not have", "can block"}},
+		{"a Claude Code event gnosh does not have", Spec{Event: "WorktreeCreate", Command: "true"}, []string{"Claude Code hook event that gnosh does not have", "can block"}},
 		{"no event", Spec{Command: "true"}, []string{"names no event"}},
 		{"no command", Spec{Event: "Stop"}, []string{"no command to run"}},
 		{"a matcher on Stop", Spec{Event: "Stop", Matcher: "Bash", Command: "true"}, []string{"a Stop hook takes no matcher"}},
@@ -340,7 +338,7 @@ func TestCheckRefusesEventsThatAreNotFired(t *testing.T) {
 }
 
 func TestCanBlock(t *testing.T) {
-	blocking := map[Event]bool{PreToolUse: true, UserPromptSubmit: true, UserPromptExpansion: true, Stop: true, SubagentStop: true}
+	blocking := map[Event]bool{PreToolUse: true, UserPromptSubmit: true, UserPromptExpansion: true, Stop: true, SubagentStop: true, PreModelSwitch: true, ConfigChange: true, PostToolBatch: true, Elicitation: true, ElicitationResult: true}
 	for _, e := range Events() {
 		if e.CanBlock() != blocking[e] {
 			t.Errorf("%s.CanBlock() = %v, want %v", e, e.CanBlock(), blocking[e])
@@ -349,8 +347,8 @@ func TestCanBlock(t *testing.T) {
 	if Event("stop").CanBlock() {
 		t.Error(`Event("stop").CanBlock() is true for a name that is not an event`)
 	}
-	if n := len(Events()); n != 19 {
-		t.Errorf("Events() has %d events, want 19", n)
+	if n := len(Events()); n != 25 {
+		t.Errorf("Events() has %d events, want 25", n)
 	}
 }
 
@@ -524,7 +522,7 @@ func TestMergeCarriesProblemsAlong(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bad, err := ParseConfig(json.RawMessage(`{"Stop": [{"hooks": [{"type": "command", "command": "./ok.sh"}, {"type": "prompt", "prompt": "done?"}]}], "PostToolBatch": []}`), "b.json")
+	bad, err := ParseConfig(json.RawMessage(`{"Stop": [{"hooks": [{"type": "command", "command": "./ok.sh"}, {"type": "script", "prompt": "done?"}]}], "WorktreeCreate": []}`), "b.json")
 	if err == nil {
 		t.Fatal("the second block was accepted")
 	}
@@ -536,7 +534,7 @@ func TestMergeCarriesProblemsAlong(t *testing.T) {
 	if len(problems) != 2 {
 		t.Fatalf("got %d problems, want 2:\n%s", len(problems), problemsText(problems))
 	}
-	contains(t, "the problems", problemsText(problems), `b.json: Stop group 1, hook 2: the hook has "type": "prompt"`, `b.json: "PostToolBatch"`)
+	contains(t, "the problems", problemsText(problems), `b.json: Stop group 1, hook 2: the hook has "type": "script"`, `b.json: "WorktreeCreate"`)
 	_, err = NewRunner(all, Options{Fires: Events(), ProjectDir: "/project"})
 	var ce *ConfigError
 	if !errors.As(err, &ce) || len(ce.Problems) != 2 {

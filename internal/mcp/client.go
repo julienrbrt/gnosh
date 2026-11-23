@@ -19,8 +19,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -62,6 +64,33 @@ type Options struct {
 	// OnToolsChanged, when set, is called (in a goroutine of its own) each
 	// time the server says its tool list changed.
 	OnToolsChanged func()
+	// OnChannel, when set, is given each event the server pushes as a
+	// channel, Claude Code's notifications/claude/channel: its content,
+	// and its meta with only the keys that are letters, digits and
+	// underscores, and only string values. It is called in the order the
+	// events come, on the goroutine that reads the server, so it must not
+	// wait long.
+	OnChannel func(content string, meta map[string]string)
+	// OnChannelVerdict, when set, is given each answer to a permission
+	// question the server sends as a channel that relays them, Claude
+	// Code's notifications/claude/channel/permission: the request's id,
+	// five lowercase letters, and "allow" or "deny". Anything else is
+	// dropped, as is a verdict from a server that did not declare
+	// claude/channel/permission. It is called as OnChannel is.
+	OnChannelVerdict func(requestID, behavior string)
+	// Auth, for a server reached at a URL, gives its requests the
+	// person's sign-in to it (auth.go); nil sends none.
+	Auth *Authorizer
+	// OnElicit asks the person what a server asks for in the middle of a
+	// call (elicit.go), and returns their answer; it may wait as long as
+	// they take. With it set the client declares the elicitation
+	// capability; nil declares none, and a server's request is refused.
+	OnElicit func(ctx context.Context, e Elicitation) (ElicitResult, error)
+	// OnHandshake, when set, is told what the server said of itself as
+	// soon as the handshake is done, before any notification of the
+	// server's is taken: what a channel is goes in front of its first
+	// event.
+	OnHandshake func(Info)
 }
 
 // Tool is one tool a server offers.
@@ -104,6 +133,11 @@ type Info struct {
 	// Resources says it offers resources, and Prompts that it offers
 	// prompts (its capabilities name them).
 	Resources, Prompts bool
+	// Channel says it declared itself a channel (the experimental
+	// capability claude/channel): it pushes events into the session.
+	// ChannelPermission says it also takes permission prompts to relay
+	// (claude/channel/permission, declared and not false).
+	Channel, ChannelPermission bool
 }
 
 // Prompt is one prompt a server offers: a message it writes for the user
@@ -178,6 +212,10 @@ type message struct {
 	Params  json.RawMessage `json:"params,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Error   *RPCError       `json:"error,omitempty"`
+
+	// failed is set by the transport, never sent: the answer to the
+	// request will not come, and why (Client.fail).
+	failed error
 }
 
 // Client is the connection to one server.
@@ -194,6 +232,54 @@ type Client struct {
 	err     error // why the connection ended
 	// changed is set when the server says its tool list changed.
 	changed bool
+	// channel says the server declared itself a channel (Info.Channel),
+	// and relay that it takes permission questions too
+	// (Info.ChannelPermission), for the goroutine that reads it.
+	channel, relay atomic.Bool
+	// serving holds the requests of the server's that are being answered,
+	// by their ids: the server may take one back (notifications/cancelled),
+	// and the connection's end takes them all back. (An elicitation waits
+	// for the person.)
+	serving map[string]*served
+	// toolsRunning says OnToolsChanged runs now, and toolsAgain that a
+	// notice came while it ran: it runs once more, however many came.
+	toolsRunning, toolsAgain bool
+}
+
+// maxServing is how many of the server's own requests are answered at
+// once; one more is refused, so that a flood of them (pings) does not
+// grow without end.
+const maxServing = 32
+
+// served is a request of the server's that is being answered.
+type served struct{ cancel context.CancelFunc }
+
+// serve notes that the server's request with the id is being answered,
+// and gives the context its answer is made in, which ends when the server
+// takes the request back or the connection ends; done forgets it. It is
+// called before the next message is read, so that a request taken back
+// at once is found.
+func (c *Client) serve(id json.RawMessage) (ctx context.Context, done func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s, key := &served{cancel: cancel}, idKey(id)
+	c.mu.Lock()
+	if c.closed || c.err != nil {
+		cancel()
+	} else {
+		if c.serving == nil {
+			c.serving = map[string]*served{}
+		}
+		c.serving[key] = s
+	}
+	c.mu.Unlock()
+	return ctx, func() {
+		c.mu.Lock()
+		if c.serving[key] == s {
+			delete(c.serving, key)
+		}
+		c.mu.Unlock()
+		cancel()
+	}
 }
 
 // transport carries messages to a server and brings its own back, which
@@ -249,9 +335,13 @@ func (c *Client) handshake(ctx context.Context) error {
 	opt := c.opt
 	hctx, cancel := context.WithTimeout(ctx, opt.StartTimeout)
 	defer cancel()
+	caps := map[string]any{"roots": map[string]any{"listChanged": false}}
+	if opt.OnElicit != nil {
+		caps["elicitation"] = map[string]any{}
+	}
 	raw, err := c.request(hctx, "initialize", map[string]any{
 		"protocolVersion": ProtocolVersion,
-		"capabilities":    map[string]any{"roots": map[string]any{"listChanged": false}},
+		"capabilities":    caps,
 		"clientInfo":      map[string]any{"name": opt.ClientName, "version": opt.ClientVersion},
 	})
 	if err != nil {
@@ -273,8 +363,19 @@ func (c *Client) handshake(ctx context.Context) error {
 	}
 	_, resources := hello.Capabilities["resources"]
 	_, prompts := hello.Capabilities["prompts"]
+	var experimental map[string]json.RawMessage
+	_ = json.Unmarshal(hello.Capabilities["experimental"], &experimental)
+	_, channel := experimental["claude/channel"]
+	relay := strings.TrimSpace(string(experimental["claude/channel/permission"]))
 	c.info = Info{Name: hello.ServerInfo.Name, Version: hello.ServerInfo.Version, ProtocolVersion: hello.ProtocolVersion, Instructions: hello.Instructions,
-		Resources: resources, Prompts: prompts}
+		Resources: resources, Prompts: prompts, Channel: channel, ChannelPermission: relay != "" && relay != "false" && relay != "null"}
+	// (Read by the goroutine that reads the server: its events are taken
+	// from now on, the handshake done.)
+	if c.opt.OnHandshake != nil {
+		c.opt.OnHandshake(c.info)
+	}
+	c.channel.Store(channel)
+	c.relay.Store(channel && c.info.ChannelPermission)
 	if h, ok := c.t.(*httpTransport); ok {
 		h.setVersion(hello.ProtocolVersion)
 	}
@@ -502,6 +603,9 @@ func (c *Client) request(ctx context.Context, method string, params any) (json.R
 		if !ok {
 			return nil, c.ended()
 		}
+		if m.failed != nil {
+			return nil, m.failed
+		}
 		if m.Error != nil {
 			return nil, m.Error
 		}
@@ -509,6 +613,34 @@ func (c *Client) request(ctx context.Context, method string, params any) (json.R
 	case <-ctx.Done():
 		return nil, giveUp()
 	}
+}
+
+// toolsChanged runs OnToolsChanged for a notice that the server's tools
+// changed: on one goroutine at a time, and once more after it if notices
+// came while it ran, however many. A server that sends a flood of them
+// costs one listing at a time, not a goroutine each.
+func (c *Client) toolsChanged() {
+	c.mu.Lock()
+	if c.toolsRunning {
+		c.toolsAgain = true
+		c.mu.Unlock()
+		return
+	}
+	c.toolsRunning = true
+	c.mu.Unlock()
+	go func() {
+		for {
+			c.opt.OnToolsChanged()
+			c.mu.Lock()
+			if !c.toolsAgain {
+				c.toolsRunning = false
+				c.mu.Unlock()
+				return
+			}
+			c.toolsAgain = false
+			c.mu.Unlock()
+		}
+	}()
 }
 
 // ended is why pending requests can no longer be answered.
@@ -539,19 +671,45 @@ func (c *Client) send(m message) error {
 func (c *Client) dispatch(m message) {
 	switch {
 	case m.Method != "" && len(m.ID) > 0:
-		go c.answer(m)
+		c.mu.Lock()
+		busy := len(c.serving) >= maxServing
+		c.mu.Unlock()
+		if busy {
+			_ = c.send(message{JSONRPC: "2.0", ID: m.ID, Error: &RPCError{Code: -32000, Message: "gnosh is answering too many of the server's requests at once"}})
+			return
+		}
+		ctx, done := c.serve(m.ID)
+		go func() {
+			defer done()
+			c.answer(ctx, m)
+		}()
 	case m.Method != "":
 		c.notified(m)
 	case len(m.ID) > 0:
-		id := strings.Trim(string(m.ID), `"`)
+		// (Handed over under the lock, which lost holds as it closes the
+		// channels: an answer that comes as the connection ends is not
+		// sent on a closed one.)
 		c.mu.Lock()
-		ch := c.pending[id]
-		c.mu.Unlock()
-		if ch != nil {
+		if ch := c.pending[strings.Trim(string(m.ID), `"`)]; ch != nil {
 			select {
 			case ch <- m:
 			default:
 			}
+		}
+		c.mu.Unlock()
+	}
+}
+
+// fail ends the wait of the request with that id, if it still waits, with
+// err: the transport knows its answer will not come (a server at a URL
+// whose answer to it ended without it).
+func (c *Client) fail(id json.RawMessage, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ch := c.pending[strings.Trim(string(id), `"`)]; ch != nil {
+		select {
+		case ch <- message{ID: id, failed: err}:
+		default:
 		}
 	}
 }
@@ -571,10 +729,15 @@ func (c *Client) lost(err error) {
 		close(ch)
 		delete(c.pending, id)
 	}
+	for id, s := range c.serving {
+		s.cancel()
+		delete(c.serving, id)
+	}
 }
 
-// answer answers a request the server made of the client.
-func (c *Client) answer(m message) {
+// answer answers a request the server made of the client, unless the
+// server takes it back (ctx ends) first.
+func (c *Client) answer(ctx context.Context, m message) {
 	reply := message{JSONRPC: "2.0", ID: m.ID}
 	switch m.Method {
 	case "ping":
@@ -585,23 +748,102 @@ func (c *Client) answer(m message) {
 			roots = append(roots, map[string]string{"uri": "file://" + r, "name": r})
 		}
 		reply.Result = mustJSON(map[string]any{"roots": roots})
+	case "elicitation/create":
+		if c.opt.OnElicit == nil {
+			reply.Error = &RPCError{Code: -32601, Message: "gnosh does not answer " + m.Method + " here: nobody is there to ask"}
+			break
+		}
+		reply = c.elicited(ctx, m)
 	default:
 		reply.Error = &RPCError{Code: -32601, Message: "gnosh does not answer " + m.Method}
+	}
+	if ctx.Err() != nil {
+		// Taken back, or the connection ended: nothing is sent.
+		return
 	}
 	_ = c.send(reply)
 }
 
 // notified takes a notification from the server.
 func (c *Client) notified(m message) {
-	if m.Method == "notifications/tools/list_changed" {
+	switch m.Method {
+	case "notifications/cancelled":
+		// The server takes back a request it made: it is answered no more.
+		var p struct {
+			RequestID json.RawMessage `json:"requestId"`
+		}
+		if json.Unmarshal(m.Params, &p) != nil || len(p.RequestID) == 0 {
+			return
+		}
+		c.mu.Lock()
+		s := c.serving[idKey(p.RequestID)]
+		c.mu.Unlock()
+		if s != nil {
+			s.cancel()
+		}
+	case "notifications/tools/list_changed":
 		c.mu.Lock()
 		c.changed = true
 		c.mu.Unlock()
 		if c.opt.OnToolsChanged != nil {
-			go c.opt.OnToolsChanged()
+			c.toolsChanged()
 		}
+	case "notifications/claude/channel":
+		if c.opt.OnChannel == nil || !c.channel.Load() {
+			// (Only a server that declared itself a channel is heard.)
+			return
+		}
+		var p struct {
+			Content string         `json:"content"`
+			Meta    map[string]any `json:"meta"`
+		}
+		if json.Unmarshal(m.Params, &p) != nil {
+			return
+		}
+		meta := map[string]string{}
+		for k, v := range p.Meta {
+			if s, ok := v.(string); ok && metaKey.MatchString(k) {
+				meta[k] = s
+			}
+		}
+		c.opt.OnChannel(p.Content, meta)
+	case "notifications/claude/channel/permission":
+		if c.opt.OnChannelVerdict == nil || !c.relay.Load() {
+			return
+		}
+		var p struct {
+			RequestID string `json:"request_id"`
+			Behavior  string `json:"behavior"`
+		}
+		if json.Unmarshal(m.Params, &p) != nil || !requestID.MatchString(p.RequestID) || (p.Behavior != "allow" && p.Behavior != "deny") {
+			return
+		}
+		c.opt.OnChannelVerdict(p.RequestID, p.Behavior)
 	}
 }
+
+// requestID is what the id of a permission question relayed to a channel
+// is: five lowercase letters, without l (Claude Code's alphabet, which a
+// phone's keyboard cannot mistake for a 1 or an I).
+var requestID = regexp.MustCompile(`^[a-km-z]{5}$`)
+
+// RelayPermission puts a permission question to a server that declared
+// itself a channel that relays them (Info.ChannelPermission), Claude
+// Code's notifications/claude/channel/permission_request: the request's
+// id, the tool's name, what the call does, and its input as display text.
+// The server answers, if it does, with a verdict (Options.OnChannelVerdict).
+func (c *Client) RelayPermission(id, tool, description, preview string) error {
+	if !c.relay.Load() {
+		return errors.New("mcp: the server takes no permission questions")
+	}
+	return c.notify("notifications/claude/channel/permission_request", map[string]string{
+		"request_id": id, "tool_name": tool, "description": description, "input_preview": preview,
+	})
+}
+
+// metaKey is what a key of a channel event's meta may be: letters, digits
+// and underscores, as an attribute of the tag the event is shown in.
+var metaKey = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 func mustJSON(v any) json.RawMessage {
 	if v == nil {

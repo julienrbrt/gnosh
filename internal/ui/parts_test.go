@@ -192,15 +192,16 @@ func TestOnePalette(t *testing.T) {
 		"Markdown's list marks":         th.Markdown.ListMark.Sequence(),
 		"Markdown's links":              th.Markdown.Link.Sequence(),
 		"the wordmark with few colours": th.WordmarkPlain[3].Sequence(),
+		"the working mark's second":     th.Fall.Plain.Fg(th.Fall.Hues[1]).Sequence(),
 	} {
 		if !strings.Contains(seq, "38;2;1;2;3") {
 			t.Errorf("%s is not in the palette's purple: %q", what, seq)
 		}
 	}
 	for what, seq := range map[string]string{
-		"a question's chosen row": th.Menu.Selected.Sequence(),
-		"Markdown's headings":     th.Markdown.Heading.Sequence(),
-		"the spinner's tail":      th.SpinnerStyles[1].Sequence(),
+		"a question's chosen row":  th.Menu.Selected.Sequence(),
+		"Markdown's headings":      th.Markdown.Heading.Sequence(),
+		"the working mark's third": th.Fall.Plain.Fg(th.Fall.Hues[2]).Sequence(),
 	} {
 		if !strings.Contains(seq, "38;2;4;5;6") {
 			t.Errorf("%s is not in the palette's pink: %q", what, seq)
@@ -211,7 +212,7 @@ func TestOnePalette(t *testing.T) {
 		"the box's prompt mark":     th.Editor.PromptStyle.Sequence(),
 		"a question's pointer":      th.Menu.PointerStyle.Sequence(),
 		"the line that says busy":   th.Busy.Sequence(),
-		"the spinner's head":        th.SpinnerStyles[0].Sequence(),
+		"the working mark's first":  th.Fall.Plain.Fg(th.Fall.Hues[0]).Sequence(),
 		"a question's field prompt": th.Menu.Field.PromptStyle.Sequence(),
 	} {
 		if !strings.Contains(seq, "38;2;13;14;15") {

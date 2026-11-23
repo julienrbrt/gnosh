@@ -2,7 +2,8 @@ gnosh mcp add-json
 
   Add a server from its entry, as JSON. The entry is what goes under the
   server's name in "mcpServers", such as {"type": "http", "url":
-  "https://..."}.
+  "https://..."}. With - in its place the entry is read from standard input,
+  so that a key in it stays off the command line.
 
   Not built yet in this build of gnosh: typing it stops with a message that
   says so.

@@ -20,6 +20,9 @@ import (
 var (
 	// ErrClosed means the session has been closed.
 	ErrClosed = errors.New("agent: the session is closed")
+	// ErrYielded means a side request that gives way (SideRequest.Yield)
+	// was stopped because the session's own next request wanted the model.
+	ErrYielded = errors.New("agent: the side request gave way to the session's own")
 	// ErrBlank means a prompt held neither text nor an attachment.
 	ErrBlank = errors.New("agent: the prompt is empty, so nothing was sent")
 	// ErrNobodyToAsk means a question was put in a session nobody attends.
@@ -48,6 +51,10 @@ type Options struct {
 	// Interactive says a person is there to answer questions. Without it
 	// every question is answered with ErrNobodyToAsk at once.
 	Interactive bool
+	// Relay says permission questions go to the front end even so: a run
+	// in the background, whose questions a person answers from the agent
+	// view (app's runasks.go). Other questions still have nobody to ask.
+	Relay bool
 	// StartSource is how the session came to be, for the SessionStart
 	// moment: "startup", "resume", "clear", "fork".
 	StartSource string
@@ -57,6 +64,16 @@ type Options struct {
 	// names a model the person did not choose.
 	Model Model
 	Small *Model
+	// Fallbacks are the models a turn goes on with, in this order, when
+	// Model cannot answer (Claude Code's fallbackModel): its server cannot
+	// be reached or is not ready, says it is too busy, does not have the
+	// model, or keeps failing until the wait for it runs out. The switch
+	// holds for the rest of the turn; the next turn asks Model first
+	// again. One that cannot hold the conversation as it stands, or is on
+	// a model server of one's own that failed in the turn, is passed over;
+	// with none left the turn waits for Model as without them (fallback.go).
+	// Sub-agents are given the same list.
+	Fallbacks []Fallback
 	// System is the system prompt, in parts ordered from the part that
 	// changes least to the part that changes most.
 	System []string
@@ -145,10 +162,17 @@ type Options struct {
 	// results. The loop itself never reads a tool's output as
 	// instructions.
 	CleanResult func(call core.ToolCall, res core.ToolResult) core.ToolResult
+	// Reroute, when not nil, is given every tool call as the model wrote
+	// it (through CleanInput), and says of one that is plainly meant for
+	// another of the session's tools the call to make in its place: Gno
+	// for mem typed into the shell. The gate, the hooks and the tool see
+	// that call, and its result starts with note, in gnosh's marker, which
+	// tells the model what was done and what to call next time.
+	Reroute func(call core.ToolCall) (to core.ToolCall, note string, ok bool)
 	// Outgoing, when not nil, is given every request just before it is
-	// sent, main, summary and side alike. It may change the request, which
-	// is the loop's own copy.
-	Outgoing func(req *core.Request)
+	// sent, main, summary and side alike, with the name of the provider it
+	// goes to. It may change the request, which is the loop's own copy.
+	Outgoing func(provider string, req *core.Request)
 
 	// OnPanic, when not nil, is told when a tool, a port or the loop
 	// itself panicked, with the stack. The loop carries on either way.
@@ -203,49 +227,78 @@ type Agent struct {
 	ready  chan struct{}   // closed when the log has been looked at for the first time
 	wake   chan struct{}   // holds a token when the session's goroutine has something to look at
 
-	modelLock chan struct{} // holds a token while a request to a model is in flight
-	logMu     sync.Mutex    // serialises calls to the Log; let go with unlockLog
-	lateMu    sync.Mutex    // guards late
-	late      []Entry       // notices raised while the Log was busy, stored when it is free
-	store     *sync.Map     // the tools' own state for the session
-	intakeWG  sync.WaitGroup
-	closeOnce sync.Once
-	turnNow   atomic.Value // the running turn's id, a string
-	live      atomic.Value // the model that last sent something, as modelKey names it
+	modelLock  chan struct{} // holds a token while a request to a model is in flight
+	imagesTold sync.Map      // the models the person was told cannot take images
+	yieldMu    sync.Mutex
+	yielders   map[*context.CancelCauseFunc]struct{} // side requests that give way to the session's own
+	logMu      sync.Mutex                            // serialises calls to the Log; let go with unlockLog
+	lateMu     sync.Mutex                            // guards late
+	late       []Entry                               // notices raised while the Log was busy, stored when it is free
+	store      *sync.Map                             // the tools' own state for the session
+	intakeWG   sync.WaitGroup
+	closeOnce  sync.Once
+	turnNow    atomic.Value // the running turn's id, a string
+	live       atomic.Value // the model that last sent something, as modelKey names it
 
-	mu         sync.Mutex
-	closing    bool
-	busy       bool
-	idle       chan struct{} // closed when the session next goes idle
-	intake     []*submission // sent, not yet admitted
-	intaking   bool
-	admitting  *submission
-	admitStop  context.CancelFunc
+	mu        sync.Mutex
+	closing   bool
+	busy      bool
+	idle      chan struct{} // closed when the session next goes idle
+	intake    []*submission // sent, not yet admitted
+	intaking  bool
+	admitting *submission
+	admitStop context.CancelFunc
+	// endStop cancels the moments that run after a turn ended (TurnFailed,
+	// TurnEnded) while they run: Esc and End stop them.
+	endStop    context.CancelFunc
 	queue      []*submission // admitted, waiting for their turn
 	notes      []Note        // told to the model with the next request
 	queueShown bool          // the consumer was last told of a queue that was not empty
-	commands   []*command
-	cur        *operation
-	startRan   bool
-	startAdd   []Part
-	sent       bool // a prompt has gone out in this session, now or before
-	model      Model
-	small      *Model
-	tools      []core.Tool
-	index      map[string]core.Tool
-	specs      []core.ToolSpec
-	system     []string
-	compactAt  int
-	noAuto     bool
-	cwd        string
-	roots      []string
-	tree       *core.WorkTree // its work tree (Options.Tree, SubOptions.Tree), or its parent's
-	loop       loopState
-	questions  map[string]chan Answer
-	state      State
-	running    []RunningCall
+	// queueEmit lets one queue list at a time go from being made to being
+	// sent (emitQueue); it is taken before a.mu, never under it.
+	queueEmit sync.Mutex
+	commands  []*command
+	cur       *operation
+	startRan  bool
+	startAdd  []Part
+	startHalt string // the session's start said stop (Halt): every prompt is refused with it
+	sent      bool   // a prompt has gone out in this session, now or before
+	model     Model
+	small     *Model
+	fell      *Model          // the fallback the turn goes on with, or nil (fallback.go)
+	fellName  string          // its name in Options.Fallbacks
+	fellOut   map[string]bool // the models and fallbacks that failed in this turn
+	tools     []core.Tool
+	index     map[string]core.Tool
+	specs     []core.ToolSpec
+	system    []string
+	compactAt int
+	noAuto    bool
+	cwd       string
+	roots     []string
+	tree      *core.WorkTree // its work tree (Options.Tree, SubOptions.Tree), or its parent's
+	loop      loopState
+	questions map[string]chan Answer
+	// asking is what each open question waits for, in words, and
+	// beforeAsk the state before the first of them was put: with two open
+	// (parallel sub-agents), the first answer put the phase back while the
+	// second still waited (the agent loop review of 2026-11-19).
+	asking    map[string]string
+	beforeAsk State
+	state     State
+	running   []RunningCall
+	// unfinished are the calls of the round under way whose end has not
+	// been told yet: begun, asked about or running. A side question takes
+	// them as still running (side.go): a call is shown before the gate is
+	// asked about it, and only joins running after.
+	unfinished map[string]bool
 	totals     Totals
+	cachePrev  cachePrint // the last main request, for Totals.Cache
 	context    ContextStatus
+	// roomTaken is the room the calls of the round running now have
+	// taken (TakeRoom), and roomRound counts the rounds, so that what is
+	// given back late goes to the round it came from.
+	roomTaken, roomRound int
 
 	// The rest belongs to the session's goroutine alone.
 	settled      bool
@@ -259,9 +312,13 @@ type Agent struct {
 	heldFor      string
 	warnedWindow string
 	summariesOff bool
-	answered     bool
-	answeredFor  string
-	rs           retryState
+	// answeredBy are the models that have answered in this session, so
+	// that one that answered and is restarting is waited for as such,
+	// also after a turn went on with a fallback; rsFor is the model rs is
+	// about.
+	answeredBy map[string]bool
+	rsFor      string
+	rs         retryState
 }
 
 // operation is what the session's goroutine is doing that a stop can
@@ -284,6 +341,10 @@ type submission struct {
 	result    chan TurnResult
 }
 
+// own reports whether gnosh queued the prompt for itself: one stopping a
+// turn drops (dropOwnLocked).
+func (s *submission) own() bool { return s.prompt.Own || s.note }
+
 // resolve says how the prompt ended. Only the first call counts.
 func (s *submission) resolve(r TurnResult) {
 	s.once.Do(func() { s.result <- r })
@@ -293,6 +354,9 @@ func (s *submission) resolve(r TurnResult) {
 type command struct {
 	compact      bool
 	instructions string
+	// part is the part of the conversation a summary is of, or nil for
+	// all of it.
+	part *SummaryPart
 }
 
 type ctxKey struct{}
@@ -357,6 +421,7 @@ func newAgent(opts Options, parent *Agent, sub SubOptions) (*Agent, error) {
 		roots:     slices.Clone(opts.Roots),
 		tree:      opts.Tree,
 		questions: make(map[string]chan Answer),
+		asking:    make(map[string]string),
 		calib:     1,
 	}
 	if a.store == nil {
@@ -409,7 +474,7 @@ func newAgent(opts Options, parent *Agent, sub SubOptions) (*Agent, error) {
 		// a restart of it is ridden out for the sub-agent as for the
 		// parent.
 		if k, _ := parent.live.Load().(string); k != "" && k == modelKey(opts.Model) {
-			a.answered, a.answeredFor = true, k
+			a.answeredBy = map[string]bool{k: true}
 		}
 	} else {
 		a.sink = newSink(opts.SessionID, a.clock, opts.OnEvent, opts.EventBacklog)
@@ -524,10 +589,17 @@ func (a *Agent) Notice(level Level, source, text string) {
 }
 
 func (a *Agent) notice(level Level, source, text string) {
+	a.noticeAs(&NoticeEvent{Level: level, Source: source, Text: text})
+}
+
+// noticeAs is notice, for the event as it is given (a turn's end marks
+// its own: NoticeEvent.TurnEnd).
+func (a *Agent) noticeAs(ev *NoticeEvent) {
+	level, source, text := ev.Level, ev.Source, ev.Text
 	if text == "" {
 		return
 	}
-	a.emit(&NoticeEvent{Level: level, Source: source, Text: text})
+	a.emit(ev)
 	turn, _ := a.turnNow.Load().(string)
 	// The person has been shown the line; what is left is to keep it in
 	// the log. A notice may be raised by code that the log itself is
@@ -694,7 +766,7 @@ func (a *Agent) State() State {
 	s := a.state
 	s.Busy = a.busy
 	s.Running = slices.Clone(a.running)
-	s.Queued = len(a.queue) + len(a.intake)
+	s.Queued = len(a.queue) + len(a.intake) - takenLocked(a.intake)
 	s.Notes = len(a.notes)
 	s.Loop = a.loop.on
 	s.Model = a.model.Info.ID
@@ -708,6 +780,51 @@ func (a *Agent) Context() ContextStatus {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.context
+}
+
+// TakeRoom is for a tool call whose result may fill what is left of the
+// context, as Read's with allow_large: it returns how many tokens, at
+// most most, the call may use of the room left before room has to be
+// made (ContextStatus.Room), less what the other calls of the same round
+// took, since none of their results is counted yet. give hands back,
+// once the call is done, what it did not use. Before the conversation is
+// first counted there is no room.
+func (a *Agent) TakeRoom(most int) (n int, give func(unused int)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n = max(min(a.context.Room()-a.roomTaken, most), 0)
+	a.roomTaken += n
+	round := a.roomRound
+	return n, func(unused int) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.roomRound == round {
+			a.roomTaken -= min(max(unused, 0), n)
+		}
+	}
+}
+
+// newRoomRound starts a round of tool calls for TakeRoom: the room the
+// last count left is whole again, since what the last round's calls took
+// has been counted since.
+func (a *Agent) newRoomRound() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.roomTaken = 0
+	a.roomRound++
+}
+
+// SetCwd moves the session's working directory, as a command's cd does in
+// the model's own calls: for a command the person ran themselves. dir is
+// where the command ended, which the tool that ran it has checked against
+// the session's folders.
+func (a *Agent) SetCwd(dir string) {
+	if dir == "" {
+		return
+	}
+	a.mu.Lock()
+	a.cwd = dir
+	a.mu.Unlock()
 }
 
 // Cwd returns the session's working directory.
@@ -747,7 +864,8 @@ func (a *Agent) SetModel(m Model) error {
 		return err
 	}
 	a.mu.Lock()
-	a.model = m
+	// A model chosen by hand outranks a fallback the turn went on with.
+	a.model, a.fell = m, nil
 	a.mu.Unlock()
 	return nil
 }
@@ -851,8 +969,12 @@ type setup struct {
 func (a *Agent) setup() setup {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	model := a.model
+	if a.fell != nil {
+		model = *a.fell
+	}
 	return setup{
-		model:     a.model,
+		model:     model,
 		small:     a.small,
 		tools:     a.tools,
 		index:     a.index,
@@ -908,7 +1030,7 @@ func (a *Agent) ask(ctx context.Context, q Question, who Meta) (Answer, error) {
 	if a.parent != nil {
 		return a.parent.ask(ctx, q, who)
 	}
-	if !a.opts.Interactive {
+	if !a.opts.Interactive && !(a.opts.Relay && q.Kind == "permission") {
 		return Answer{}, ErrNobodyToAsk
 	}
 	q.ID = a.newID()
@@ -918,10 +1040,14 @@ func (a *Agent) ask(ctx context.Context, q Question, who Meta) (Answer, error) {
 		a.mu.Unlock()
 		return Answer{}, ErrClosed
 	}
+	if len(a.questions) == 0 {
+		a.beforeAsk = a.state
+	}
 	a.questions[q.ID] = ch
-	prev := a.state
+	waiting := "waiting for the person to answer: " + oneLine(firstNonEmpty(q.Title, q.Text, q.Kind))
+	a.asking[q.ID] = waiting
 	a.state.Phase = PhaseQuestion
-	a.state.Waiting = "waiting for the person to answer: " + oneLine(firstNonEmpty(q.Title, q.Text, q.Kind))
+	a.state.Waiting = waiting
 	a.state.Since = a.clock.Now()
 	a.mu.Unlock()
 
@@ -939,8 +1065,16 @@ func (a *Agent) ask(ctx context.Context, q Question, who Meta) (Answer, error) {
 
 	a.mu.Lock()
 	delete(a.questions, q.ID)
+	delete(a.asking, q.ID)
 	if a.state.Phase == PhaseQuestion {
-		a.state.Phase, a.state.Waiting, a.state.Since = prev.Phase, prev.Waiting, a.clock.Now()
+		if len(a.questions) == 0 {
+			a.state.Phase, a.state.Waiting, a.state.Since = a.beforeAsk.Phase, a.beforeAsk.Waiting, a.clock.Now()
+		} else {
+			for _, w := range a.asking {
+				a.state.Waiting = w // one that still waits
+				break
+			}
+		}
 	}
 	a.mu.Unlock()
 	a.emit(&AnswerEvent{Meta: who, ID: q.ID, Answer: ans, Withdrawn: err != nil})
@@ -998,6 +1132,83 @@ func (a *Agent) Tell(n Note) error {
 	}
 	a.notes = append(a.notes, n)
 	return nil
+}
+
+// Record puts a note into the conversation without starting a turn. When
+// no turn runs, it is written to the log at once, between turns: it stands
+// before the prompt that comes next, and is kept if the session ends
+// first. While a turn runs it waits for the turn's next request, as a
+// note told with Tell does. Wake is not read.
+func (a *Agent) Record(n Note) error {
+	if (Prompt{Text: n.Text}).blank() {
+		return ErrBlank
+	}
+	n.Wake = false
+	a.mu.Lock()
+	if a.closing {
+		a.mu.Unlock()
+		return ErrClosed
+	}
+	if a.busy {
+		// The turn's next request takes it; one that makes none leaves it
+		// to be written when the turn ends (leaveBusy), or the session.
+		n.recorded = true
+		a.notes = append(a.notes, n)
+		a.mu.Unlock()
+		return nil
+	}
+	a.mu.Unlock()
+	// (A prompt sent in between may be written first; the note then
+	// waits in the log for that turn's request, which reads it.)
+	if err := a.writeNote(n); err != nil {
+		return a.Tell(n)
+	}
+	return nil
+}
+
+// writeNote writes a note to the log as an entry of its own, between
+// turns, and says so.
+func (a *Agent) writeNote(n Note) error {
+	entry := Entry{Kind: EntryNote, Source: firstNonEmpty(n.Source, "note"), Blocks: []core.Block{core.Text(n.Text)}}
+	if err := a.appendLog(entry); err != nil {
+		return err
+	}
+	a.emit(&NoteEvent{Note: n})
+	if n.Notice != "" {
+		a.notice(LevelInfo, firstNonEmpty(n.Source, "note"), n.Notice)
+	}
+	return nil
+}
+
+// takeRecordedLocked takes out of the notes that wait the ones Record put
+// there while a turn ran. The caller holds a.mu.
+func (a *Agent) takeRecordedLocked() []Note {
+	var keep, took []Note
+	for _, n := range a.notes {
+		if n.recorded {
+			took = append(took, n)
+		} else {
+			keep = append(keep, n)
+		}
+	}
+	if len(took) > 0 {
+		a.notes = keep
+	}
+	return took
+}
+
+// writeRecorded writes the notes Record left while a turn ran that no
+// request took, now that the turn is over; one that cannot be written
+// waits for the next request, as a told one does.
+func (a *Agent) writeRecorded(notes []Note) {
+	for _, n := range notes {
+		if a.writeNote(n) != nil {
+			n.recorded = false
+			a.mu.Lock()
+			a.notes = append(a.notes, n)
+			a.mu.Unlock()
+		}
+	}
 }
 
 // Submit hands a prompt to the session and returns its id at once. The
@@ -1127,15 +1338,39 @@ func (a *Agent) queuedLocked() []QueuedPrompt {
 		out = append(out, QueuedPrompt{ID: s.id, Prompt: s.prompt})
 	}
 	for _, s := range a.intake {
+		if s.taken {
+			continue // taken back while its check runs: not in line
+		}
 		out = append(out, QueuedPrompt{ID: s.id, Prompt: s.prompt, Checking: true})
 	}
 	return out
+}
+
+// takenLocked counts the prompts in intake that were taken back while
+// their check ran, which wait there only for the admitting goroutine to
+// drop them. They were counted and listed as waiting, and a second take
+// handed one back again (the agent loop review of 2026-11-19).
+func takenLocked(intake []*submission) int {
+	n := 0
+	for _, s := range intake {
+		if s.taken {
+			n++
+		}
+	}
+	return n
 }
 
 // emitQueue tells the consumer of events which prompts wait for their
 // turn. A prompt that goes out at once never waits, so an empty list is
 // only told when a list that was not empty was told before.
 func (a *Agent) emitQueue() {
+	// Two lists made one after the other under a.mu could be sent in the
+	// other order, and the older one stayed on the screen: a prompt that
+	// had gone out, or was taken back, shown as waiting (the agent loop
+	// review of 2026-11-19). The sink never blocks, so holding this while
+	// the list is sent holds nobody up for long.
+	a.queueEmit.Lock()
+	defer a.queueEmit.Unlock()
 	a.mu.Lock()
 	q := a.queuedLocked()
 	if len(q) == 0 && !a.queueShown {
@@ -1183,7 +1418,7 @@ func (a *Agent) takeQueued(only string) []Prompt {
 	a.queue = keep
 	keepIn := a.intake[:0:0]
 	for _, s := range a.intake {
-		if s.prompt.Hidden || (only != "" && s.id != only) {
+		if s.taken || s.prompt.Hidden || (only != "" && s.id != only) {
 			keepIn = append(keepIn, s)
 			continue
 		}
@@ -1241,6 +1476,9 @@ func (a *Agent) Interrupt() {
 	}
 	if a.cur != nil {
 		a.cur.cancel()
+	}
+	if a.endStop != nil {
+		a.endStop()
 	}
 	loopOn := a.loop.on
 	turns := a.loop.turns
@@ -1306,6 +1544,9 @@ func (a *Agent) End(reason string) error {
 		if a.admitStop != nil {
 			a.admitStop()
 		}
+		if a.endStop != nil {
+			a.endStop()
+		}
 		a.mu.Unlock()
 		a.kick()
 
@@ -1325,9 +1566,24 @@ func (a *Agent) End(reason string) error {
 		a.mu.Lock()
 		left := append(slices.Clone(a.queue), a.intake...)
 		a.queue, a.intake = nil, nil
+		written := make([]bool, len(left))
+		for i, s := range left {
+			written[i] = s.persisted
+		}
 		had := a.sent
+		recorded := a.takeRecordedLocked()
 		a.mu.Unlock()
-		for _, s := range left {
+		// (What Record kept for a request that never came is in the log.)
+		for _, n := range recorded {
+			_ = a.writeNote(n)
+		}
+		for i, s := range left {
+			if written[i] {
+				// Written down as queued, it is written off too: a session
+				// opened again (one /clear left) returned it a second time
+				// (the agent loop review of 2026-11-19).
+				_ = a.appendLog(Entry{Kind: EntryUnqueued, Prompt: s.id, Text: "the session was closed before it went out"})
+			}
 			a.emit(&PromptReturnedEvent{ID: s.id, Prompt: s.prompt, Why: ReturnClosed, Reason: "the session was closed before this prompt went out"})
 			s.resolve(TurnResult{Prompts: []string{s.id}, Reason: EndWithdrawn, Detail: "the session was closed before the prompt went out"})
 		}

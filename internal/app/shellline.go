@@ -26,15 +26,26 @@ import (
 // The front end is shown it as a tool call. When it has ended, the command
 // and what it printed go to the model as a prompt of gnosh's own, which
 // says whose command it was, and the model answers. One that the person
-// stopped is not answered: it is put in front of the model with their
-// next prompt.
+// stopped is not answered, and with the respondToBashCommands option off
+// none is: it is put in the conversation at once, before their next
+// prompt.
+//
+// The command line is also kept in the session's file as a meta entry
+// (metaShell), for the prompt history: Up and shell mode's Tab offer it
+// again, in this session and the folder's later ones.
 func (l *live) shellLine(command string) error {
 	command = strings.TrimSpace(command)
 	if command == "" {
-		return errors.New("there is no command after the !")
+		return errors.New("nothing follows the ! to run as a command")
 	}
 	if l.shell == nil || l.closing.Load() {
 		return errors.New("the session is closing")
+	}
+	if shelltool.GnokeyPassword(command) {
+		// Caught before anything keeps the line: the session's file, the
+		// history Up brings back, and what the model is sent would each
+		// hold the password.
+		return errors.New("the command gives gnokey a password on its standard input, and what is typed here is kept in the session's file and shown to the model: it was not run, and not kept. Sign in a terminal of your own")
 	}
 	bash := l.shell.PersonsBash()
 	l.shellMu.Lock()
@@ -45,6 +56,11 @@ func (l *live) shellLine(command string) error {
 	ctx, cancel := context.WithCancel(l.ctx)
 	l.shellStop = cancel
 	l.shellMu.Unlock()
+	if l.ts != nil {
+		// (A history that lacks a line is no reason to keep the command
+		// from running.)
+		_, _ = l.ts.Append(transcript.MetaEntry(metaShell, command))
+	}
 
 	input, _ := json.Marshal(map[string]string{"command": command})
 	call := core.ToolCall{ID: newCallID(), Name: shelltool.BashName, Input: input}
@@ -78,6 +94,13 @@ func (l *live) shellLine(command string) error {
 		}
 		res = cleanResult(call, res)
 		stopped := ctx.Err() != nil
+		if res.Cwd != "" && !stopped && l.agent != nil {
+			// Their cd moves the session, as one in the model's own calls
+			// does (the shell tool checked it against the session's
+			// folders), and the result tells the model so.
+			l.agent.SetCwd(res.Cwd)
+			l.cwdMoved(l.ctx, res.Cwd)
+		}
 		ended()
 		l.deliver(&agent.ToolEndEvent{
 			Meta: meta(), CallID: call.ID, Name: call.Name, Input: input,
@@ -88,16 +111,28 @@ func (l *live) shellLine(command string) error {
 		}
 		// Into the conversation. The command's output is data, like a
 		// tool's: it is made harmless on its way in.
-		text := prompt.Wrap("The user ran this shell command themselves, in this session's working directory, and this is what it printed. It was their own command, not a request to run it again: answer what it shows, or go on with what they asked for before.") +
+		// (Not "go on with what they asked for before": on box 1, in a
+		// session with nothing asked before, Qwen went looking for it.)
+		text := prompt.Wrap("The user ran this shell command themselves, in this session's working directory, and this is what it printed. It was their own command, not a request to run it again: answer what it shows, in a few words, and if you were in the middle of something for them, go on with it.") +
 			"\n\n$ " + prompt.Untrusted(command) + "\n" + prompt.Untrusted(core.TextOf(res.Content))
-		if stopped {
-			_ = l.agent.Tell(agent.Note{Source: "shell", Text: text + "\n" + prompt.Wrap("The user stopped it before it finished.")})
-			return
+		// One the model does not answer now is put in the conversation at
+		// once (Record), so that it stands before the person's next
+		// prompt and is kept if the session ends before that.
+		switch {
+		case stopped:
+			_ = l.agent.Record(agent.Note{Source: "shell", Text: text + "\n" + prompt.Wrap("The user stopped it before it finished.")})
+		case !l.respondShell.Load():
+			_ = l.agent.Record(agent.Note{Source: "shell", Text: text})
+		default:
+			_, _ = l.agent.Submit(agent.Prompt{Text: text, Hidden: true, Source: "shell"})
 		}
-		_, _ = l.agent.Submit(agent.Prompt{Text: text, Hidden: true, Source: "shell"})
 	}()
 	return nil
 }
+
+// metaShell is the key of the meta entries that hold the command lines
+// the person ran behind "!", as typed after it.
+const metaShell = "shell"
 
 // runPersonsCommand runs the command and survives a tool that crashes
 // over it.
@@ -119,7 +154,8 @@ const (
 
 // promptHistory is SessionControls.History: the prompts the person sent from
 // this folder, in its most recent sessions and in this one, the oldest
-// first. A prompt that a session's file no longer holds (one that was
+// first, and among them the command lines they ran behind "!", with the
+// "!". A prompt that a session's file no longer holds (one that was
 // erased from it) is not in it.
 func (l *live) promptHistory() []string {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -131,11 +167,20 @@ func (l *live) promptHistory() []string {
 	prompts := func(entries []transcript.Entry) []string {
 		var out []string
 		for i := range entries {
+			if te := &entries[i]; te.Type == transcript.TypeMeta {
+				if te.Key == metaShell && strings.TrimSpace(te.Value) != "" {
+					out = append(out, "!"+te.Value)
+				}
+				continue
+			}
 			for _, e := range decode(&entries[i]) {
 				if e.Kind != agent.EntryPrompt || e.Hidden {
 					continue
 				}
-				if text := strings.TrimSpace(core.TextOf(e.Blocks)); text != "" {
+				// (A blank at the start stays: " !x" and " /x" were sent
+				// as prompts, and must not come back as a shell line or a
+				// command.)
+				if text := strings.TrimRight(core.TextOf(e.Blocks), " \t\r\n"); strings.TrimSpace(text) != "" {
 					out = append(out, text)
 				}
 			}

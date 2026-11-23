@@ -62,7 +62,14 @@ type screen interface {
 
 // config is what a session is made with.
 type config struct {
-	theme    Theme
+	theme Theme
+	// profile is the colours the terminal takes, and light says it said
+	// its background is light: what the theme option picks a theme from.
+	// themed says theme is the interface's own, which the option may
+	// change (a test's given one is kept).
+	profile  text.Profile
+	light    bool
+	themed   bool
 	metrics  text.Metrics
 	now      func() time.Time
 	controls app.Controls
@@ -78,6 +85,13 @@ type config struct {
 	branch func(dir string) string
 	// list lists a directory for file completion.
 	files func(dir string) []fileEntry
+	// project lists the project in a directory for the fuzzy @ search
+	// (mention.go), or is nil for none.
+	project func(dir string, ignored bool) []string
+	// programs lists the programs on the PATH, for shell mode's Tab
+	// (shellcomplete.go), or is nil for none. It is slow, and is run in
+	// the background.
+	programs func() []string
 }
 
 // phase is what the session is doing, as the line above the prompt box
@@ -153,11 +167,22 @@ type reply struct {
 // (or a test) hands it what the session and the terminal report, one
 // thing at a time, and asks it to draw.
 type session struct {
-	th   Theme
-	m    text.Metrics
-	now  func() time.Time
-	c    app.Controls
-	host host
+	th Theme
+	// hookSaid is the reason of the last hook that blocked, when its
+	// record showed it whole: the note that the turn goes on does not say
+	// it again.
+	hookSaid string
+	// pasting says a Ctrl+V is reading the clipboard (picture.go).
+	pasting bool
+	// profile, light and themed are config's, for the theme option
+	// (themecmd.go).
+	profile text.Profile
+	light   bool
+	themed  bool
+	m       text.Metrics
+	now     func() time.Time
+	c       app.Controls
+	host    host
 	// r is what the session draws on: inline, the terminal's scrollback,
 	// panel while the side panel is on, or view's held screen while the
 	// transcript view is open (transcript.go).
@@ -165,6 +190,13 @@ type session struct {
 	inline *term.Renderer
 	panel  *term.Panel
 	view   *transcriptView
+	// agents is the agent view while it is open over the session, and
+	// leftAt when ← was pressed in the empty box (agentsover.go).
+	// agentsHintUntil is when the status line stops saying "← for
+	// agents", a few seconds after the session began.
+	agents          *agentsOverlay
+	leftAt          time.Time
+	agentsHintUntil time.Time
 	// changed are the files the session's calls changed, the newest
 	// first, for the panel.
 	changed []changedFile
@@ -179,6 +211,19 @@ type session struct {
 	cwd, home  string
 	branchOf   func(string) string
 	listDir    func(string) []fileEntry
+	// programs lists the PATH's programs, and progNames is the list as
+	// last made, at progAt, or being made again when progLoading
+	// (shellcomplete.go).
+	programs    func() []string
+	progNames   []string
+	progAt      time.Time
+	progLoading bool
+	// listProject and index are the fuzzy @ search's lister and what it
+	// last listed (mention.go); suggest is what the person's own @ search
+	// command answered (filesuggest.go).
+	listProject func(dir string, ignored bool) []string
+	index       fileIndex
+	suggest     suggested
 
 	// pending are the lines that wait to be committed at the next frame,
 	// last is the kind of block the last of them ends, and dirty says
@@ -214,16 +259,37 @@ type session struct {
 	// stopArmed is when Ctrl+X Ctrl+K was pressed once, waiting for the
 	// second press that stops the background sub-agents.
 	stopArmed time.Time
+	// listing says a picker's list is being read (loadThen): heldInput is
+	// what the person typed meanwhile, for the list; listAgain says how to
+	// ask for it again; listGen counts the lists let go before they came.
+	listing   bool
+	heldInput []term.Event
+	listAgain string
+	listGen   int
+	// refeed is input, set when the session is made: a list that came
+	// takes in what was held for it by it (a call to input from there
+	// would tie the slash commands' table to itself).
+	refeed func(term.Event)
 
 	// q is the question on the screen and qwait the ones behind it.
 	q     *question
 	qwait []*question
+	// closedText is what the prompt box held when the last question
+	// closed, and closedAt when: what is typed between an answer and a
+	// masked question that follows it is taken out of the box again
+	// (secretGap).
+	closedText string
+	closedAt   time.Time
 
 	// busy says the session has work in hand: from its BusyEvent to its
 	// IdleEvent. ph is what it is doing and since when.
 	busy  bool
 	ph    phase
 	since time.Time
+	// fall is what falls through the words of the line that says what
+	// the session is doing, as it stood when the line was last drawn
+	// (fall.go).
+	fall fall
 	// heard is when the session last reported anything.
 	heard time.Time
 	// stopping says the person stopped the turn and its end has not
@@ -256,15 +322,23 @@ type session struct {
 	loop  bool
 
 	// cmdq are slash commands that wait for the turn to end, cmdRun the
-	// one that is running, and cmdStop what stops it.
-	cmdq    []string
-	cmdRun  string
-	cmdStop context.CancelFunc
+	// one that is running, and cmdStop what stops it. cmdShown says the
+	// running one was shown as typed when it started.
+	cmdq     []string
+	cmdRun   string
+	cmdStop  context.CancelFunc
+	cmdShown bool
 
 	// What the status line says.
 	info app.SessionInfo
 	// recapped is the id of the session whose recap was shown (recap.go).
 	recapped string
+	// suggestion is the person's likely next prompt, shown in the empty
+	// box until they type (promptSuggestionEnabled).
+	suggestion string
+	// failHint is what to try next after a turn failed, shown in the empty
+	// box until the person sends something (failHintFor).
+	failHint string
 	// color is the colour of the prompt mark the session asked for
 	// (/color), "" for the theme's own.
 	color  string
@@ -273,6 +347,10 @@ type session struct {
 	branch string
 	facts  map[string]string
 	detail bool
+	// focus is focus view (focus.go): each run of tool calls is written
+	// as one line, fold, when something else is written.
+	focus bool
+	fold  fold
 	// vimSaid is the mode of the box's vim keys the session was last told
 	// (reportVim).
 	vimSaid string
@@ -313,14 +391,16 @@ type session struct {
 // newSession makes a session. Nothing is drawn until start.
 func newSession(cfg config) *session {
 	s := &session{
-		th: cfg.theme, m: cfg.metrics, now: cfg.now, c: cfg.controls, r: cfg.renderer, inline: cfg.renderer, host: cfg.host,
+		th: cfg.theme, profile: cfg.profile, light: cfg.light, themed: cfg.themed,
+		m: cfg.metrics, now: cfg.now, c: cfg.controls, r: cfg.renderer, inline: cfg.renderer, host: cfg.host,
 		cols: max(cfg.cols, 1), rows: max(cfg.rows, 1), termCols: max(cfg.cols, 1), home: cfg.home,
-		branchOf: cfg.branch, listDir: cfg.files, selectKey: cfg.selectKey,
+		branchOf: cfg.branch, listDir: cfg.files, listProject: cfg.project, programs: cfg.programs, selectKey: cfg.selectKey,
 		facts: map[string]string{},
 	}
 	if s.now == nil {
 		s.now = time.Now
 	}
+	s.refeed = s.input
 	s.ed = editor.New(editor.Options{
 		Theme:    s.th.Editor,
 		Complete: s.complete,
@@ -335,12 +415,17 @@ func newSession(cfg config) *session {
 
 // start writes the header and takes in what the session is.
 func (s *session) start() {
+	s.agentsHintUntil = s.now().Add(agentsHintFor)
 	s.refresh()
 	s.tasks = s.c.Tasks()
 	s.readDeliverables()
 	s.header()
 	// (What in the keybindings file cannot be used is said at once.)
 	s.keysNow()
+	// (The project is listed for the fuzzy @ search while nothing waits,
+	// and the PATH's programs for shell mode's Tab.)
+	s.indexed()
+	s.programNames()
 	s.recap()
 	if h, ok := s.c.(historian); ok {
 		var drafts []editor.Draft
@@ -401,16 +486,45 @@ func (s *session) header() {
 		where += th.Quiet.Render(" (" + s.branch + ")")
 	}
 	s.put(wrap(s.m, where, s.cols, "", "  ")...)
-	s.put(wrap(s.m, th.Quiet.Render("? shows the keys"+th.Sep+"/help lists the commands"+th.Sep+"Esc stops a turn"), s.cols, "", "")...)
+	welcome := "? shows the keys" + th.Sep + "/help lists the commands"
+	if k := s.keyHint("chat:cancel", "Esc"); k != "" {
+		welcome += th.Sep + k + " stops a turn"
+	}
+	s.put(wrap(s.m, th.Quiet.Render(welcome), s.cols, "", "")...)
+	s.put(wrap(s.m, th.credits(), s.cols, "", "")...)
 }
 
-// begin starts a block of the given kind in the scrollback. No blank line
-// stands between blocks: each begins with a mark of its own, and the
-// screen is for what was said and done. (Jae, 14 November 2026: "remove
-// the newline after prompt and before done etc, in general don't print
-// empty lines".) The empty lines of the model's own answer, between its
-// paragraphs, are the answer's and stay.
+// The addresses the header's last line names. gnosh's licence asks an
+// interface built on gnosh to show "built on gnosh" with a link to
+// gnoshURL, and the GnoVM's licence, gno.land's, asks an interface that
+// includes the GnoVM to show "built on gno.land" with a link to gnoURL
+// (LICENSE.md and internal/gnovm/LICENSE.md, the Additional Terms).
+const (
+	gnoshURL = "https://gnosh.ai"
+	gnoURL   = "https://gno.land"
+)
+
+// credits is the header's last line: gnosh's address, the credit the
+// GnoVM's licence asks for, and the command that shows the legal notices
+// (DECISIONS item 139).
+func (th *Theme) credits() string {
+	return th.Profile.Hyperlink(gnoshURL, gnoshURL) + th.Quiet.Render(th.Sep+"built on gno.land (") +
+		th.Profile.Hyperlink(gnoURL, gnoURL) + th.Quiet.Render(")"+th.Sep+"/license")
+}
+
+// begin starts a block of the given kind in the scrollback: a blank line
+// goes first where the block before it should stand apart. (Jae, 19
+// November 2026: "put the blank lines back into gnosh...", after his 14
+// November "in general don't print empty lines".)
 func (s *session) begin(kind blockKind) {
+	if !s.fold.empty() {
+		// (Focus view: the run of calls before this block is one line.)
+		s.writeFold()
+	}
+	packed := kind == s.last && (kind == blkNotice || kind == blkToolLine || kind == blkAsk)
+	if s.last != blkNone && !packed {
+		s.pending = append(s.pending, "")
+	}
 	s.last = kind
 }
 
@@ -497,19 +611,23 @@ func (s *session) leave(code int, why string) {
 	s.done, s.code, s.why = true, code, why
 }
 
+// liveCommitter is a screen that commits lines and replaces the live
+// region in one write (term.Renderer, term.Panel).
+type liveCommitter interface {
+	CommitLive(commit, lines []string, cursorRow, cursorCol int) error
+}
+
 // frame writes what is waiting: first the lines to commit, for good, and
 // then the live region as it stands now. It is the only place the session
 // writes to the terminal.
 func (s *session) frame() {
-	if len(s.pending) > 0 {
-		if s.onCommit != nil {
-			s.onCommit(s.pending)
+	if s.agents != nil || s.view != nil {
+		s.commitPending()
+		if s.agents != nil {
+			s.agentsFrame()
+		} else {
+			s.viewFrame()
 		}
-		s.keep(s.r.Commit(s.pending...))
-		s.pending = s.pending[:0]
-	}
-	if s.view != nil {
-		s.viewFrame()
 		s.dirty = false
 		return
 	}
@@ -517,11 +635,40 @@ func (s *session) frame() {
 		s.keep(s.panel.SetPanel(s.panelLines(s.panel.TextWidth())))
 	}
 	lines, row, col := s.compose()
+	// What moves from the live region to the scrollback goes in the same
+	// write as the region without it: committed first and drawn again
+	// below, it would stand on the screen twice for a moment, and at the
+	// bottom of the screen push the box up off the last row.
+	if lc, both := s.r.(liveCommitter); both && len(s.pending) > 0 {
+		if s.onCommit != nil {
+			s.onCommit(s.pending)
+		}
+		if s.onLive != nil {
+			s.onLive(lines, row, col)
+		}
+		s.keep(lc.CommitLive(s.pending, lines, row, col))
+		s.pending = s.pending[:0]
+		s.dirty = false
+		return
+	}
+	s.commitPending()
 	if s.onLive != nil {
 		s.onLive(lines, row, col)
 	}
 	s.keep(s.r.SetLive(lines, row, col))
 	s.dirty = false
+}
+
+// commitPending commits the lines that wait, by themselves.
+func (s *session) commitPending() {
+	if len(s.pending) == 0 {
+		return
+	}
+	if s.onCommit != nil {
+		s.onCommit(s.pending)
+	}
+	s.keep(s.r.Commit(s.pending...))
+	s.pending = s.pending[:0]
 }
 
 // keep remembers the first error a write to the terminal gave. A terminal
@@ -541,6 +688,18 @@ func (s *session) resize(cols, rows int) {
 		return
 	}
 	s.termCols, s.rows = cols, rows
+	if r, ok := s.c.(resizeTeller); ok {
+		r.Resized()
+	}
+	if o := s.agents; o != nil {
+		// The agent view is laid out again for the new size, as the
+		// transcript view is.
+		s.keep(o.scr.p.Resize(cols, rows))
+		o.scr.drawn = nil
+		s.relayout(cols)
+		s.dirty = true
+		return
+	}
 	if s.view != nil {
 		// The view is laid out again for the new size; what the session
 		// says meanwhile is laid out for the scrollback's.
@@ -594,6 +753,9 @@ func (s *session) tick() {
 		s.q.guarded = false
 		s.dirty = true
 	}
+	if q := s.q; q != nil && q.idle > 0 && !q.answered && now.Sub(q.idleSince(s.lastInput)) >= q.idle {
+		s.questionAway(q)
+	}
 	if s.hint != "" && !now.Before(s.hintUntil) {
 		s.hint = ""
 		s.dirty = true
@@ -601,6 +763,15 @@ func (s *session) tick() {
 	if s.busy || s.cmdRun != "" || s.q != nil || s.ed.Hint() != editor.HintNone {
 		// Something on the screen counts seconds.
 		s.dirty = true
+	}
+	if s.agents != nil {
+		// The agent view counts seconds, and looks at the runs again.
+		s.agents.v.tick()
+		s.dirty = true
+	}
+	if !s.agentsHintUntil.IsZero() && !now.Before(s.agentsHintUntil) {
+		s.agentsHintUntil = time.Time{}
+		s.dirty = s.dirty || s.agentsOffered()
 	}
 	if s.busy && now.Sub(s.heard) > 3*time.Second {
 		// Nothing may look busy with nothing in flight. The session
@@ -640,9 +811,16 @@ func (s *session) wake() time.Time {
 	if s.busy || s.cmdRun != "" || s.q != nil || s.ed.Hint() != editor.HintNone {
 		soon(now.Add(time.Second).Truncate(time.Second))
 	}
-	if (s.busy || s.cmdRun != "") && s.q == nil && len(s.th.Spinner) > 0 && s.th.SpinEvery > 0 {
-		// The spinner takes its next step.
-		soon(now.Add(s.th.SpinEvery))
+	if s.agents != nil {
+		soon(now.Add(agentsLook))
+	}
+	if !s.agentsHintUntil.IsZero() && s.agentsOffered() {
+		soon(s.agentsHintUntil)
+	}
+	if (s.busy || s.cmdRun != "") && s.q == nil && s.th.Fall.moves() {
+		// The fall goes on through the working line: the deeper the
+		// thought, the sooner the next step.
+		soon(now.Add(s.th.Fall.every(s.fall.depth)))
 	}
 	if s.info.NotifyHooks || s.host.desktop(s.info.NotifChannel, "") {
 		if q := s.q; q != nil && !q.notified {
@@ -689,6 +867,30 @@ func (s *session) notify(now time.Time) {
 		s.idleTold = true
 		tell("idle_prompt", "gnosh", "gnosh has finished and waits for your next prompt")
 	}
+}
+
+// pushAway is how long with no key pressed the person counts as away
+// from the terminal, for a notification the model sends.
+const pushAway = 30 * time.Second
+
+// push sends a notification the model asked for (PushNotification) when
+// the person seems to be away: a desktop note by their channel, and their
+// Notification hooks, of the type push_notification. It says what it did.
+func (s *session) push(msg string) string {
+	if !s.lastInput.IsZero() && s.now().Sub(s.lastInput) < pushAway {
+		return "not sent: the user is at the terminal (a key pressed in the last half minute) and reads what you write"
+	}
+	hooks, desk := s.info.NotifyHooks, s.host.desktop(s.info.NotifChannel, "")
+	if !hooks && !desk {
+		return "not sent: no way to notify reaches the user here (their preferredNotifChannel, or a Notification hook, would)"
+	}
+	if hooks {
+		s.c.Notify("push_notification", "gnosh", msg)
+	}
+	if desk {
+		s.host.desktop(s.info.NotifChannel, msg)
+	}
+	return "sent"
 }
 
 // idleWaits reports whether the hooks are still to be told that the

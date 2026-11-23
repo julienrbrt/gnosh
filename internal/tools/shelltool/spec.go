@@ -55,6 +55,19 @@ How long it may run:
 	}
 	fmt.Fprintf(&b, "\n- Do not keep a process alive by ending the command with &. It stays tied to this call's output and is reported as left running; %s is the way.", argBackground)
 
+	if sb := o.Sandbox; sb != nil {
+		if sb.Writes == "" {
+			fmt.Fprintf(&b, "\n\nIn the sandbox:\n- Commands on this machine run in a sandbox: they read and write files as usual, and %s.", sb.network())
+		} else {
+			fmt.Fprintf(&b, "\n\nIn the sandbox:\n- Commands on this machine run in a sandbox: they write only in %s, %s, and read everything else as usual.", sb.Writes, sb.network())
+		}
+		if sb.Unsandboxed {
+			fmt.Fprintf(&b, "\n- A command that failed because of the sandbox (\"Read-only file system\" or \"Operation not permitted\" on a write elsewhere, a name that does not resolve, a connection that cannot be made) may be run again outside it with %s set to true; that call is judged as any command is, the person asked unless a rule or the mode lets it run. Do not set it for a command that has not failed that way.", argNoSandbox)
+		} else {
+			b.WriteString("\n- The sandbox cannot be left in this session: when a command must write elsewhere or reach the network, tell the person what and why.")
+		}
+	}
+
 	// What is said of other machines is the same whether or not any is
 	// declared, so that the tools a model is sent are the same bytes in
 	// every session. Which machines there are goes with the first prompt.
@@ -67,16 +80,20 @@ On another machine:
 - With machines declared, never type ssh or scp in a command: it is refused.`, argHost, argBackground)
 
 	timeout := fmt.Sprintf("How long the command may run, in milliseconds. Default %d, at most %d.", o.DefaultTimeout.Milliseconds(), o.MaxTimeout.Milliseconds())
+	params := []param{
+		{argCommand, "string", "The command to run, exactly as you would type it at a shell prompt."},
+		{argDescription, "string", "What the command does, in a few plain words, for the person watching."},
+		{argTimeout, "number", timeout},
+		{argBackground, "boolean", "Set to true to start the command in the background and return at once."},
+		{argHost, "string", "The name of a declared machine to run the command on. Leave it out to run on this machine."},
+	}
+	if o.Sandbox != nil && o.Sandbox.Unsandboxed {
+		params = append(params, param{argNoSandbox, "boolean", "Set to true to run the command outside the sandbox, after it failed because of the sandbox. The call is then judged as any command is."})
+	}
 	return core.ToolSpec{
 		Name:        BashName,
 		Description: b.String(),
-		InputSchema: schema([]string{argCommand},
-			param{argCommand, "string", "The command to run, exactly as you would type it at a shell prompt."},
-			param{argDescription, "string", "What the command does, in a few plain words, for the person watching."},
-			param{argTimeout, "number", timeout},
-			param{argBackground, "boolean", "Set to true to start the command in the background and return at once."},
-			param{argHost, "string", "The name of a declared machine to run the command on. Leave it out to run on this machine."},
-		),
+		InputSchema: schema([]string{argCommand}, params...),
 	}
 }
 

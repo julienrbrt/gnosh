@@ -50,6 +50,10 @@ type Task struct {
 	// Monitor says the command is a Monitor's: what it prints is passed on
 	// as it comes.
 	Monitor bool
+	// Owner is the sub-agent that started the command, by its session id
+	// (core.ToolEnv.SessionID of a sub-agent's call), or "" when the
+	// session's own model did.
+	Owner string
 }
 
 // Ended is the news that a background command has ended, as Options.OnEnd
@@ -80,6 +84,7 @@ func (j *job) task(now time.Time) Task {
 		Duration:    now.Sub(j.started),
 		Running:     true,
 		Monitor:     j.mon != nil,
+		Owner:       j.owner,
 	}
 	if e := j.ending(); e != nil {
 		t.Running = false
@@ -134,6 +139,8 @@ func (j *job) how(e *ending) string {
 		switch groups, _ := describeGroups(e.left); {
 		case e.swept:
 			text += "; it left a process running, which was stopped"
+		case closed(j.pumped) && j.letGo.Load():
+			text += "; the process it left running let go of its output since, and runs on: it will be stopped when the session ends"
 		case closed(j.pumped):
 			text += "; the process it left running has ended since"
 		case groups != "":

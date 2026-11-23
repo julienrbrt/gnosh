@@ -25,8 +25,11 @@ const (
 //     each other, the second's thinking is set off by a blank line.
 //   - A block that never closes is thinking to the end of the stream.
 //   - Text with no block at its start passes through exactly as it came.
-//     A lone </think> is left alone too, because by the time it shows up
-//     the text before it has been handed on.
+//     A </think> before the answer's first word closes a block the server's
+//     chat template opened (Qwen with a picture in the prompt and thinking
+//     off writes one), and is dropped with the white space after it. One
+//     later is left alone, because by the time it shows up the text before
+//     it has been handed on.
 type thinkSplitter struct {
 	state   int
 	hold    string // fed but not handed on yet
@@ -79,7 +82,12 @@ func (t *thinkSplitter) run(emit func(thinking bool, s string), final bool) {
 				t.gap = t.thought
 				continue
 			}
-			if !final && strings.HasPrefix(thinkOpen, rest) {
+			if strings.HasPrefix(rest, thinkClose) {
+				t.hold = rest[len(thinkClose):]
+				t.after = true
+				continue
+			}
+			if !final && (strings.HasPrefix(thinkOpen, rest) || strings.HasPrefix(thinkClose, rest)) {
 				return // This may be the first half of a tag.
 			}
 			text := t.hold

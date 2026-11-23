@@ -1,0 +1,20 @@
+gnosh stop
+
+  Stop a session that runs in the background. The session is a run that gnosh
+  --bg, /background or /fork started, named by its ID or the start of one
+  (gnosh agents lists them). It is stopped as Esc stops a turn, and given a
+  minute to end in good order before it is made to; what it did so far is
+  kept: gnosh -r opens it.
+  Also typed: gnosh kill.
+
+  Not built yet in this build of gnosh: typing it stops with a message that
+  says so.
+
+Usage
+  gnosh stop [flags] <session>
+
+Flags
+  --cwd <dir>
+      Work in this folder instead of the current one.
+  -h, --help
+      Show help: gnosh's, or after a command's name that command's.

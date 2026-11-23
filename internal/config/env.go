@@ -29,12 +29,29 @@ type Limits struct {
 	// MaxOutputTokens is CLAUDE_CODE_MAX_OUTPUT_TOKENS: how long one reply
 	// may run. Not set means no limit is sent.
 	MaxOutputTokens Value[int]
+	// MaxThinkingTokens is MAX_THINKING_TOKENS: the most tokens a model
+	// may think before a reply, over each model's own thinkingBudget; 0
+	// turns thinking off. Not set means each model's own.
+	MaxThinkingTokens Value[int]
 	// FileReadMaxTokens is CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS: the
 	// most one read returns. Default: 25,000.
 	FileReadMaxTokens Value[int]
 	// GlobTimeout is CLAUDE_CODE_GLOB_TIMEOUT_SECONDS: how long a file
 	// search may run. Not set means the search tool's own limit.
 	GlobTimeout Value[time.Duration]
+	// WebFetchCacheTTL is CLAUDE_CODE_WEBFETCH_CACHE_TTL_MS: how long a
+	// fetched page is kept for another call. Default: 15 minutes, which 0
+	// keeps too, as in Claude Code (its reference: "0, a decimal, or any
+	// other spelling keeps the default").
+	WebFetchCacheTTL Value[time.Duration]
+	// WebFetchDeadline is CLAUDE_CODE_WEBFETCH_DEADLINE_MS: how long a page
+	// may take to download, its redirects with it; 0 is no limit. Default:
+	// 5 minutes.
+	WebFetchDeadline Value[time.Duration]
+	// GlobNoIgnore is CLAUDE_CODE_GLOB_NO_IGNORE: true lists, in a Glob,
+	// the files .gitignore leaves out, as Claude Code's Glob does by
+	// default. Not set, or false, leaves them out, as gnosh's Glob does.
+	GlobNoIgnore Value[bool]
 	// AutoCompactPct is CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: a percentage of
 	// the auto-compact window, which can make the backstop run earlier and
 	// never later. Not set means none.
@@ -60,8 +77,12 @@ var limitVars = []struct{ name, what, from string }{
 	{"BASH_MAX_TIMEOUT_MS", "the most a command's own timeout may ask for", fromClaudeCode},
 	{"BASH_MAX_OUTPUT_LENGTH", "characters of a command's output the model reads", fromClaudeCode},
 	{"CLAUDE_CODE_MAX_OUTPUT_TOKENS", "how long one reply may run", fromClaudeCode},
+	{"MAX_THINKING_TOKENS", "tokens a model may think before a reply; 0 turns thinking off", fromClaudeCode},
 	{"CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", "the most one read returns", fromClaudeCode},
 	{"CLAUDE_CODE_GLOB_TIMEOUT_SECONDS", "seconds a file search may run", fromClaudeCode},
+	{"CLAUDE_CODE_WEBFETCH_CACHE_TTL_MS", "milliseconds a fetched page is kept for another call", fromClaudeCode},
+	{"CLAUDE_CODE_WEBFETCH_DEADLINE_MS", "milliseconds a page may take to download; 0 is no limit", fromClaudeCode},
+	{"CLAUDE_CODE_GLOB_NO_IGNORE", "true lists in a Glob the files .gitignore leaves out, as Claude Code's Glob does by default", fromClaudeCode},
 	{"CLAUDE_CODE_AUTO_COMPACT_WINDOW", "tokens of context before room is made; outranks the autoCompactWindow option", fromClaudeCode},
 	{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "a percentage of that window; earlier only", fromClaudeCode},
 	{"CLAUDE_CODE_SAFE_MODE", "the same as --safe-mode", fromClaudeCode},
@@ -131,6 +152,8 @@ func (ld *loader) limits() Limits {
 		BashMaxTimeout:     Value[time.Duration]{V: 10 * time.Minute},
 		BashMaxOutput:      Value[int]{V: 30000},
 		FileReadMaxTokens:  Value[int]{V: 25000},
+		WebFetchCacheTTL:   Value[time.Duration]{V: 15 * time.Minute},
+		WebFetchDeadline:   Value[time.Duration]{V: 5 * time.Minute},
 		MCPTimeout:         Value[time.Duration]{V: 30 * time.Second},
 		MCPMaxOutputTokens: Value[int]{V: 25000},
 	}
@@ -169,11 +192,30 @@ func (ld *loader) limits() Limits {
 	if n, o, ok := ld.whole("CLAUDE_CODE_MAX_OUTPUT_TOKENS", 1); ok {
 		l.MaxOutputTokens.put(n, o)
 	}
+	if n, o, ok := ld.whole("MAX_THINKING_TOKENS", 0); ok {
+		l.MaxThinkingTokens.put(n, o)
+	}
 	if n, o, ok := ld.whole("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", 1); ok {
 		l.FileReadMaxTokens.put(n, o)
 	}
 	if n, o, ok := ld.whole("CLAUDE_CODE_GLOB_TIMEOUT_SECONDS", 1); ok {
 		l.GlobTimeout.put(time.Duration(n)*time.Second, o)
+	}
+	if n, o, ok := ld.whole("CLAUDE_CODE_WEBFETCH_CACHE_TTL_MS", 1); ok {
+		l.WebFetchCacheTTL.put(ms(n), o)
+	}
+	if n, o, ok := ld.whole("CLAUDE_CODE_WEBFETCH_DEADLINE_MS", 0); ok {
+		l.WebFetchDeadline.put(ms(n), o)
+	}
+	if text, o, ok := ld.limitVar("CLAUDE_CODE_GLOB_NO_IGNORE"); ok {
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "1", "true", "yes", "on":
+			l.GlobNoIgnore.put(true, o)
+		case "0", "false", "no", "off":
+			l.GlobNoIgnore.put(false, o)
+		default:
+			ld.bad(o, "CLAUDE_CODE_GLOB_NO_IGNORE", "holds %s, which is neither true nor false, so it was not used.", show(text))
+		}
 	}
 	if n, o, ok := ld.whole("CLAUDE_CODE_AUTO_COMPACT_WINDOW", 1); ok {
 		if n < 100000 || n > 1000000 {

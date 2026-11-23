@@ -90,6 +90,7 @@ func (l *live) slashAddDir(ctx context.Context, c *SlashContext) error {
 		return err
 	}
 	l.roots = append(slices.Clone(l.roots), dir)
+	l.addedDirs = append(l.addedDirs, dir)
 	l.agent.SetRoots(l.roots)
 	l.flog.logf("permission", "a working directory was added for the rest of the session: %s", dir)
 	// The model is told with the next request, so that it knows it may work
@@ -97,8 +98,16 @@ func (l *live) slashAddDir(ctx context.Context, c *SlashContext) error {
 	_ = l.agent.Tell(agent.Note{Source: "add-dir",
 		Text: prompt.Wrap(fmt.Sprintf("The user added %s as a working directory for the rest of this session: its files may be read and changed as the project's are, under the same permission mode and rules.", dir))})
 	c.Say("%s is a working directory for the rest of this session: its files are read and changed as the project's are, under the same mode and rules. --add-dir adds one for a whole session.", dir)
+	if note := untrustedRootNote(dir); note != "" && l.st.trusted && !l.rootTrusted(dir) {
+		c.Say("%s", note)
+	}
 	l.directoryAdded(ctx, dir)
 	return nil
+}
+
+// endedWords says how a sub-agent's last run ended, for /tasks.
+var endedWords = map[string]string{
+	"completed": "done", "partial": "ended part way", "failed": "failed", "halted": "ended for good", "stopped": "stopped",
 }
 
 // slashTasks is /tasks (also /bashes): the commands that run, or ran, in
@@ -108,20 +117,56 @@ func (l *live) slashTasks(ctx context.Context, c *SlashContext) error {
 	args := strings.Fields(c.Args)
 	switch {
 	case len(args) == 2 && args[0] == "stop":
+		if found, wake := l.unschedule(args[1]); found {
+			if wake {
+				l.endSelfLoop("its next run was cancelled")
+				c.Say("The self-paced /loop's next run, %s, is cancelled, and the loop is over.", args[1])
+				return nil
+			}
+			c.Say("The scheduled prompt %s is cancelled.", args[1])
+			return nil
+		}
 		if b := l.findBackgroundAgent(args[1]); b != nil {
 			l.stopBackgroundAgent(b)
 			c.Say("The background sub-agent %s is stopped: %s", b.id, oneLine(b.desc, 100))
 			return nil
 		}
-		if l.shell == nil {
-			return fmt.Errorf("%s is not one of this session's background tasks; /tasks lists them", oneLine(args[1], 40))
+		if l.shell != nil {
+			if t, err := l.shell.Stop(ctx, args[1]); err == nil {
+				c.Say("%s is stopped: %s", t.ID, oneLine(t.Command, 100))
+				return nil
+			}
 		}
-		t, err := l.shell.Stop(ctx, args[1])
-		if err != nil {
-			return fmt.Errorf("%s is not one of this session's background tasks; /tasks lists them", oneLine(args[1], 40))
+		// A session in the background, this folder's or another's, as
+		// gnosh stop stops one. The wait for it to end goes on beside the
+		// session.
+		if dir := l.crashDir(); dir != "" {
+			id, log, err := findRun([]string{dir}, args[1])
+			if err != nil && strings.HasPrefix(err.Error(), "no session ") {
+				id, log, err = findRun(l.store.ProjectDirs(), args[1])
+			}
+			if err != nil && !strings.HasPrefix(err.Error(), "no session ") {
+				return err
+			}
+			if err == nil {
+				proc, said, err := askStop(id, log)
+				if err != nil {
+					return err
+				}
+				if proc == nil {
+					c.Say("%s", strings.ToUpper(said[:1])+said[1:])
+					return nil
+				}
+				c.Say("The session %s was asked to stop; it ends what it was doing first (up to %s).", RunShort(id), roundTime(stopWait))
+				l.background(func(ctx context.Context) {
+					if said, err := awaitStop(ctx, l.p.now, id, log, proc); err == nil {
+						l.notice(agent.LevelInfo, "tasks", strings.ToUpper(said[:1])+said[1:])
+					}
+				})
+				return nil
+			}
 		}
-		c.Say("%s is stopped: %s", t.ID, oneLine(t.Command, 100))
-		return nil
+		return fmt.Errorf("%s is not one of this session's background tasks, or a session in the background; /tasks lists them, and gnosh agents those of every folder", oneLine(args[1], 40))
 	case len(args) > 0:
 		return errors.New("/tasks takes nothing after it, or stop and the id of a background task")
 	}
@@ -131,8 +176,65 @@ func (l *live) slashTasks(ctx context.Context, c *SlashContext) error {
 			c.Say("     its session file: %s", b.output)
 		}
 	}
+	// The sub-agents of this session that have ended, as Claude Code's
+	// "Earlier in this session": the model can give one more to do.
+	if earlier := l.earlierAgents(ctx); len(earlier) > 0 {
+		c.Say("Earlier in this session:")
+		var more []string
+		for _, a := range earlier {
+			c.Say("%s  sub-agent (%s), %s: %s", a.id, a.kind, firstOf(endedWords[a.ended], "ended"), oneLine(firstOf(a.task, "(no task in its file)"), 100))
+			if a.more {
+				more = append(more, a.id)
+			}
+		}
+		if len(more) > 0 {
+			c.Say("     The model can give %s more to do (SendMessage to its id): ask it to.", strings.Join(more, ", "))
+		}
+	}
+	// The prompts the session has scheduled (CronCreate, /loop) and the
+	// goal it works towards, as Claude Code 2.1.329's /tasks has them.
+	scheduled := l.scheduled()
+	now := l.p.now()
+	for _, t := range scheduled {
+		if t.wake {
+			c.Say("%s  the self-paced /loop's next run, at %s: %s", t.id, whenText(t.next, now), oneLine(t.prompt, 100))
+			continue
+		}
+		how := "recurring"
+		if !t.recurring {
+			how = "once"
+		}
+		who := "a scheduled prompt"
+		if t.loop {
+			who = "/loop's prompt"
+		}
+		c.Say("%s  %s, %q %s, next run %s: %s", t.id, who, t.sched, how, whenText(t.next, now), oneLine(t.prompt, 100))
+	}
+	if goal := l.statusFacts()["goal"]; goal != "" {
+		c.Say("goal  %s (/goal clear ends it)", oneLine(goal, 100))
+	}
+	// The runs /background and /fork started from this folder, from any
+	// session: they outlive the session that started them.
+	for _, r := range l.backgroundRuns() {
+		state := runState(r) + ", started " + roundTime(l.p.now().Sub(r.started)) + " ago"
+		if r.running {
+			state = "running for " + roundTime(l.p.now().Sub(r.started))
+		}
+		c.Say("%s  a session in the background, %s: %s", RunShort(r.session), state, oneLine(firstOf(r.name, r.prompt, "(its prompt is not in its log)"), 100))
+		if r.running {
+			c.Say("     what it prints: %s; /tasks stop %s stops it; gnosh -r %s opens it once it is done", l.tilde(r.log), RunShort(r.session), r.session)
+		} else {
+			if e := runEnding(r); e != "" {
+				c.Say("     %s", e)
+			}
+			if r.last != "" {
+				c.Say("     it ended with: %s", oneLine(r.last, 120))
+			}
+			c.Say("     gnosh -r %s opens it; all it printed is in %s", r.session, l.tilde(r.log))
+		}
+	}
 	if l.shell == nil {
-		if len(agents) == 0 {
+		if len(agents) == 0 && len(scheduled) == 0 {
 			c.Say("This session runs no commands, so none runs in the background.")
 		} else {
 			c.Say("/tasks stop <id> stops one.")
@@ -141,7 +243,7 @@ func (l *live) slashTasks(ctx context.Context, c *SlashContext) error {
 	}
 	tasks := l.shell.Tasks()
 	if len(tasks) == 0 {
-		if len(agents) == 0 {
+		if len(agents) == 0 && len(scheduled) == 0 {
 			c.Say("No command has run in the background in this session. Ctrl+B moves one that is running into the background.")
 		} else {
 			c.Say("/tasks stop <id> stops one.")
@@ -163,9 +265,9 @@ func (l *live) slashTasks(ctx context.Context, c *SlashContext) error {
 			state = "a Monitor's, " + state
 		}
 		c.Say("%s  %s: %s", t.ID, state, oneLine(t.Command, 100))
-		c.Say("     its output: %s (%s)", t.OutputFile, byteCount(t.OutputBytes))
+		c.Say("     its output: %s (%s)", t.OutputFile, ByteCount(t.OutputBytes))
 	}
-	if running > 0 || len(agents) > 0 {
+	if running > 0 || len(agents) > 0 || len(scheduled) > 0 {
 		c.Say("/tasks stop <id> stops one.")
 	}
 	return nil
@@ -183,6 +285,9 @@ func (l *live) slashCost(ctx context.Context, c *SlashContext) error {
 	c.Say("This session: %s to its model, %s of waiting on it.", requests(u.Requests), roundTime(u.APITime))
 	c.Say("  read     %s tokens (%s fresh, %s from the cache)", tokenCount(m.PromptTokens()), tokenCount(m.InputTokens+m.CacheWriteTokens), tokenCount(m.CacheReadTokens))
 	c.Say("  written  %s tokens", tokenCount(m.OutputTokens))
+	if line := cacheLine(u); line != "" {
+		c.Say("  cache    %s", line)
+	}
 	if len(u.ByModel) > 0 {
 		c.Say("Every request made for it, by model (summaries, side jobs and sub-agents included):")
 		ids := make([]string, 0, len(u.ByModel))
@@ -202,6 +307,28 @@ func (l *live) slashCost(ctx context.Context, c *SlashContext) error {
 		c.Say("The context now holds about %s of %s tokens (%d%%).", tokenCount(cs.Used), tokenCount(cs.Window), cs.Used*100/cs.Window)
 	}
 	return nil
+}
+
+// cacheLine says how the model server's prompt cache served the main
+// requests (Claude Code's "Prompt cache (main)" line of /usage), or ""
+// when the server never said: the share of what was read that came from
+// it, the requests that read again what the request before had sent the
+// same way, and those that began anew.
+func cacheLine(u agent.Totals) string {
+	c := u.Cache
+	all := u.Main.PromptTokens()
+	if !c.Observed || all == 0 {
+		return ""
+	}
+	line := fmt.Sprintf("%d%% of what was read came from the model server's cache", u.Main.CacheReadTokens*100/all)
+	if c.Misses > 0 {
+		line += fmt.Sprintf("; %s read again about %s tokens it could have kept from the request before, the last at %s (another request took the cache's place, the server started again, or the model's template wrote earlier turns anew)",
+			requests(c.Misses), tokenCount(c.MissTokens), c.LastMiss.Local().Format("15:04"))
+	}
+	if c.Rebuilds > 0 {
+		line += fmt.Sprintf("; %s began anew after the conversation's start changed (a summary, a slide, mem putting a frame away, a rewind)", requests(c.Rebuilds))
+	}
+	return line
 }
 
 // requests counts requests in words: "1 request", "3 requests".
@@ -245,6 +372,11 @@ func (l *live) slashAgents(ctx context.Context, c *SlashContext) error {
 			about = "(no description)"
 		}
 		c.Say("  %s (%s): %s", d.Name, where, about)
+		if d.Scope != "built-in" {
+			// What the picker shows of it, on a line: its tools, its model
+			// and the rest of what its file sets.
+			c.Say("    %s", visible(oneLine(strings.Join(agentDetails(d), " · "), 600)))
+		}
 	}
 	c.Say("A new kind is a Markdown file in %s, or in .gnosh/agents/ in a trusted project; ask the model to write one.", filepath.Join(l.cfg.Paths.ConfigDir, "agents"))
 	return nil
@@ -257,7 +389,7 @@ func (l *live) slashMemory(ctx context.Context, c *SlashContext) error {
 	var files []string
 	if l.instr != nil {
 		for _, f := range l.instr.Files() {
-			line := fmt.Sprintf("  %s (%s, %s)", f.Path, strings.ToLower(string(f.Scope)), byteCount(f.Size))
+			line := fmt.Sprintf("  %s (%s, %s)", f.Path, strings.ToLower(string(f.Scope)), ByteCount(f.Size))
 			if f.Late {
 				line += ", read when a file under it was touched"
 			}
@@ -276,12 +408,12 @@ func (l *live) slashMemory(ctx context.Context, c *SlashContext) error {
 		c.Say("Yours, for every project: %s", l.cfg.Context.Global[0].V)
 	}
 	c.Say("The project's, shared with whoever works on it: %s (/init has the model write it)", filepath.Join(l.cfg.Paths.ProjectRoot, "GNOSH.md"))
-	c.Say("They are read as a session starts, and a change shows in the next one. What the model keeps for itself between sessions is mem: /mem shows it.")
+	c.Say("They are read as a session starts, and read again after a summary (/compact) when one has changed. What the model keeps for itself between sessions is mem: /mem shows it.")
 	return nil
 }
 
-// byteCount writes a size in bytes for a person.
-func byteCount(n int64) string {
+// ByteCount writes a size in bytes for a person.
+func ByteCount(n int64) string {
 	switch {
 	case n < 1024:
 		return fmt.Sprintf("%d bytes", n)
@@ -352,6 +484,7 @@ func (l *live) slashCopy(ctx context.Context, c *SlashContext) error {
 // own tool where the person's terminal is on this machine, and otherwise
 // through the terminal (OSC 52); and says which, of what (which).
 func (l *live) toClipboard(ctx context.Context, c *SlashContext, which, text string) {
+	text = clipboard.Plain(text)
 	size := countWords(utf8.RuneCountInString(text), "character", "characters")
 	failed := ""
 	if tool := clipboard.Tool(runtime.GOOS, l.p.getenv, l.p.lookPath); tool != nil {
@@ -373,8 +506,11 @@ const exportClipboard = "--clipboard"
 // slashExport is /export [file | --clipboard]: the conversation as plain
 // text, in a file, or on the clipboard. A relative name is the working
 // directory's, a name with no extension gets .txt, and with no name it is
-// <date>-<session's name>.txt there. A file that is there already is
-// never written over.
+// <date>-<session's name>.txt there, or in the folder named. A file that
+// is there already is never written over. The file is the person's alone,
+// as the session's own file is, and holds no control character but tabs
+// and line breaks: what commands printed is in it (the hosts review of
+// 2026-11-19: it was readable by all, and cat replayed escape sequences).
 func (l *live) slashExport(ctx context.Context, c *SlashContext) error {
 	name := strings.TrimSpace(c.Args)
 	if name == exportClipboard {
@@ -382,21 +518,28 @@ func (l *live) slashExport(ctx context.Context, c *SlashContext) error {
 		l.toClipboard(ctx, c, "The conversation", exportText(l.ts.Entries()))
 		return nil
 	}
+	title, _ := l.title()
+	byDefault := l.p.now().Format("2006-01-02") + "-" + fileSlug(firstOf(title, "session")) + ".txt"
 	if name == "" {
-		title, _ := l.title()
-		name = l.p.now().Format("2006-01-02") + "-" + fileSlug(firstOf(title, "session")) + ".txt"
+		name = byDefault
 	}
 	switch {
+	case name == "~":
+		name = l.cfg.Paths.Home
 	case strings.HasPrefix(name, "~/"):
 		name = filepath.Join(l.cfg.Paths.Home, name[2:])
 	case !filepath.IsAbs(name):
 		name = filepath.Join(l.cwd(), name)
 	}
+	if info, err := os.Stat(name); err == nil && info.IsDir() {
+		// (/export ~/Desktop wrote ~/Desktop.txt.)
+		name = filepath.Join(name, byDefault)
+	}
 	if filepath.Ext(name) == "" {
 		name += ".txt"
 	}
-	text := exportText(l.ts.Entries())
-	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	text := clipboard.Plain(exportText(l.ts.Entries()))
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	switch {
 	case errors.Is(err, os.ErrExist):
 		return fmt.Errorf("%s is there already, and /export writes over nothing; give it another name", name)
@@ -503,7 +646,11 @@ func exportText(entries []transcript.Entry) string {
 				}
 			}
 		case transcript.TypeSummary:
-			put("", "", "(The conversation up to here was summarized for the model.)")
+			if e.Covers != "" {
+				put("", "", "(The conversation before an earlier prompt was summarized for the model; what followed that prompt stays.)")
+			} else {
+				put("", "", "(The conversation up to here was summarized for the model.)")
+			}
 		}
 	}
 	return b.String()

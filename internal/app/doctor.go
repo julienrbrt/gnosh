@@ -18,6 +18,7 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/cli"
 	"github.com/gnosh-ai/gnosh/internal/config"
 	"github.com/gnosh-ai/gnosh/internal/llm"
+	"github.com/gnosh-ai/gnosh/internal/sandbox"
 	"github.com/gnosh-ai/gnosh/internal/tools/shelltool"
 )
 
@@ -44,6 +45,14 @@ func (p *program) doctor(ctx context.Context, cfg *config.Config, problems []con
 			_, err := os.Stat(path)
 			return err == nil
 		},
+		Sandbox: func() (bool, string, string, string) {
+			setup, userns := sandbox.Setup{}, false
+			if cfg != nil {
+				setup, userns = sandboxSetup(cfg.Sandbox), cfg.Sandbox.Loose("allowNestedUserNamespaces")
+			}
+			st := sandbox.CheckWith(setup)
+			return st.OK, st.Why, st.Tool, st.Notes(userns)
+		},
 	}
 	if tryHosts && cfg != nil && len(cfg.Hosts) > 0 {
 		// The same shell tool a session has, so that a host is tried
@@ -51,6 +60,7 @@ func (p *program) doctor(ctx context.Context, cfg *config.Config, problems []con
 		shell := shelltool.New(shelltool.Options{
 			Environ: func() []string { return slices.Clone(p.o.Environ) },
 			Env:     cfg.CommandEnv(),
+			Scrub:   p.scrubbing(),
 			Now:     p.now,
 			Hosts:   shellHosts(cfg),
 			Local:   p.whoAndWhere(),

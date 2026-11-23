@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -66,8 +67,12 @@ func (l *live) slashConfig(ctx context.Context, c *SlashContext) error {
 				return err
 			}
 		} else if r, ok := findRow(rows, key); !ok {
-			_, err := config.ParseOption(key, "")
-			return err
+			if _, was := saved[key]; !was {
+				_, err := config.ParseOption(key, "")
+				return err
+			}
+			// An option another version of gnosh saved, which this one
+			// does not know: taken off.
 		} else if r.List {
 			return fmt.Errorf("%s holds a list, and a list is set in gnosh.json", key)
 		}
@@ -83,7 +88,11 @@ func (l *live) slashConfig(ctx context.Context, c *SlashContext) error {
 		return fmt.Errorf("nothing was saved: %w", err)
 	}
 	for _, ch := range changes {
-		r, _ := findRow(rows, ch.key)
+		r, known := findRow(rows, ch.key)
+		if !known {
+			c.Say("%s, an option this gnosh does not know, is no longer kept.", ch.key)
+			continue
+		}
 		if ch.raw != nil && r.Origin.Layer <= config.LayerState && l.applyOption(ch.key, ch.raw) {
 			c.Say("%s is %s from now on, in this session and later ones, in every project whose own files do not set it.", ch.key, jsonText(ch.raw))
 			continue
@@ -93,11 +102,9 @@ func (l *live) slashConfig(ctx context.Context, c *SlashContext) error {
 			continue
 		}
 		if ch.raw == nil {
+			l.forgetLive(ch.key)
 			c.Say("%s is no longer set with /config: when gnosh next starts the config files decide (in this session it is %s, from %s).", ch.key, r.Text, l.originText(r))
 			continue
-		}
-		if ch.raw == nil {
-			l.forgetLive(ch.key)
 		}
 		c.Say("%s is %s when gnosh next starts, in every project whose own files do not set it.", ch.key, jsonText(ch.raw))
 		if r.Origin.Layer > config.LayerState {
@@ -131,7 +138,7 @@ func (l *live) slashAutocompact(ctx context.Context, c *SlashContext) error {
 
 // liveOptions are the options a running session can change: /config puts
 // them in force at once.
-var liveOptions = map[string]bool{"autoCompactEnabled": true, "autoCompactWindow": true, "debug": true, "verbose": true, "editorMode": true, "outputStyle": true, "preferredNotifChannel": true}
+var liveOptions = map[string]bool{"autoCompactEnabled": true, "autoCompactWindow": true, "debug": true, "verbose": true, "editorMode": true, "outputStyle": true, "preferredNotifChannel": true, "promptSuggestionEnabled": true, "respondToBashCommands": true, "askUserQuestionTimeout": true, "theme": true, "viewMode": true, "showTurnDuration": true, "respectGitignore": true}
 
 // applyOption puts what /config set in force in the running session, for
 // an option that can be (liveOptions), and reports whether it was.
@@ -145,6 +152,12 @@ func (l *live) applyOption(key string, raw json.RawMessage) bool {
 		if json.Unmarshal(raw, &name) != nil || l.setStyle(name) != nil {
 			return false
 		}
+	case "askUserQuestionTimeout":
+		var v string
+		if json.Unmarshal(raw, &v) != nil {
+			return false
+		}
+		l.askIdle.Store(int64(askIdleOf(v)))
 	case "preferredNotifChannel":
 		var channel string
 		if json.Unmarshal(raw, &channel) != nil {
@@ -153,9 +166,22 @@ func (l *live) applyOption(key string, raw json.RawMessage) bool {
 		l.notifMu.Lock()
 		l.notif = channel
 		l.notifMu.Unlock()
-	case "editorMode":
-		// (The interface's to put in force, as verbose is: the box is
-		// its own.)
+	case "editorMode", "theme", "viewMode":
+		// (The interface's to put in force, as verbose is: the box, its
+		// colours and how it shows the conversation are its own.)
+	case "showTurnDuration", "respectGitignore":
+		// (The interface reads it from the session's info, which
+		// liveBool gives as /config set it.)
+	case "promptSuggestionEnabled", "respondToBashCommands":
+		var on bool
+		if json.Unmarshal(raw, &on) != nil {
+			return false
+		}
+		if key == "respondToBashCommands" {
+			l.respondShell.Store(on)
+		} else {
+			l.suggestOn.Store(on)
+		}
 	case "autoCompactEnabled", "debug", "verbose":
 		var on bool
 		if json.Unmarshal(raw, &on) != nil {
@@ -219,9 +245,20 @@ func (l *live) optionRows() []config.OptionValue {
 func jsonText(raw json.RawMessage) string {
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
-		return s
+		return shownValue(s)
 	}
 	return string(raw)
+}
+
+// shownValue is a value as /config shows it: an address that carries a
+// user name, a password or a query string without them, as the listing
+// shows it; /config key=value said it back whole (the settings-commands
+// review of 2026-11-20).
+func shownValue(s string) string {
+	if u, err := url.Parse(s); err == nil && u.Scheme != "" && u.Host != "" && (u.User != nil || u.RawQuery != "") {
+		return config.DisplayURL(s)
+	}
+	return s
 }
 
 // listOptions says every option's value in this session and what set it.
@@ -274,7 +311,7 @@ func pendingNote(r config.OptionValue, saved map[string]json.RawMessage) string 
 	shown := buf.String()
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
-		shown = s
+		shown = shownValue(s)
 	}
 	if r.Origin.Layer > config.LayerState {
 		return "(set with /config to " + shown + "; what sets it here outranks that)"
@@ -297,7 +334,11 @@ func (l *live) originText(r config.OptionValue) string {
 
 // tilde writes a path under the home directory with ~ in its place.
 func (l *live) tilde(path string) string {
-	home := l.cfg.Paths.Home
+	return homeTilde(l.cfg.Paths.Home, path)
+}
+
+// homeTilde writes path with ~ for the home folder home.
+func homeTilde(home, path string) string {
 	if home != "" && home != "/" && (path == home || strings.HasPrefix(path, home+"/")) {
 		return "~" + path[len(home):]
 	}
@@ -349,4 +390,106 @@ func configArgs(s string) ([]string, error) {
 		out = append(out, b.String())
 	}
 	return out, nil
+}
+
+// slashTheme is /theme: the theme option, which /config sets as well. With
+// a name it is /config theme=<name>; with none it says which is in force.
+// (The full interface opens a picker for it instead.)
+// slashFocus is /focus: focus view, in which each run of tool calls is
+// folded into one line that sums it up. /focus on sets the viewMode option
+// to focus, kept for every project, and /focus off takes that setting away
+// again, so that the verbose option decides as before; a bare /focus turns
+// it over (the interface sends it as one of the two, by what it shows).
+func (l *live) slashFocus(ctx context.Context, c *SlashContext) error {
+	var mode string
+	switch arg := strings.ToLower(strings.TrimSpace(c.Args)); arg {
+	case "on":
+		mode = "focus"
+	case "off":
+		mode = l.viewModeOff()
+	case "":
+		mode = l.viewModeOff()
+		if l.viewModeNow() != "focus" {
+			mode = "focus"
+		}
+	default:
+		return fmt.Errorf("/focus takes on or off, or nothing to turn focus view over; %q is neither", c.Args)
+	}
+	set := *c
+	set.Args = "viewMode=" + mode
+	return l.slashConfig(ctx, &set)
+}
+
+// viewModeNow is the viewMode option in force: what /config set in this
+// session, else what the configuration gives.
+func (l *live) viewModeNow() string {
+	l.configMu.Lock()
+	raw, ok := l.configNow["viewMode"]
+	l.configMu.Unlock()
+	var mode string
+	if ok && json.Unmarshal(raw, &mode) == nil && mode != "" {
+		return mode
+	}
+	return firstOf(l.cfg.Options.ViewMode.V, "default")
+}
+
+// viewModeOff is what /focus off sets the viewMode option to: nothing,
+// so that the verbose option decides again, unless one of the person's
+// config files sets focus, which a /config setting must then outweigh:
+// the view verbose gives. (Whether /focus on ran earlier in the session
+// does not matter: it made /focus off take the setting away, and the
+// file's focus came back the next session: the settings-commands review
+// of 2026-11-20.)
+func (l *live) viewModeOff() string {
+	o := l.cfg.Options.ViewMode
+	if !o.Set || o.Origin.Layer == config.LayerState || o.V != "focus" {
+		return ""
+	}
+	if l.cfg.Options.Verbose.V {
+		return "verbose"
+	}
+	return "default"
+}
+
+// liveBool is a boolean option as the session has it now: as /config set
+// it since the session started, or else as it started.
+func (l *live) liveBool(key string, start bool) bool {
+	l.configMu.Lock()
+	raw, ok := l.configNow[key]
+	l.configMu.Unlock()
+	var on bool
+	if ok && string(raw) != "null" && json.Unmarshal(raw, &on) == nil {
+		return on
+	}
+	return start
+}
+
+// viewModeSet is the viewMode option for the interface: "" when nothing
+// set it, so that the verbose option decides.
+func (l *live) viewModeSet() string {
+	if !l.cfg.Options.ViewMode.Set {
+		return ""
+	}
+	return l.cfg.Options.ViewMode.V
+}
+
+func (l *live) slashTheme(ctx context.Context, c *SlashContext) error {
+	name := strings.ToLower(strings.TrimSpace(c.Args))
+	if name == "" {
+		// As it is now: what /theme set in this session, else what the
+		// session started with (the start value was said after a change).
+		now := firstOf(l.cfg.Options.Theme.V, "auto")
+		l.configMu.Lock()
+		raw, ok := l.configNow["theme"]
+		l.configMu.Unlock()
+		var set string
+		if ok && json.Unmarshal(raw, &set) == nil && set != "" {
+			now = set
+		}
+		c.Say("The theme is %s: auto (for the background the terminal says it has), dark, light, or ansi (the terminal's own sixteen colours). /theme <name> sets it.", now)
+		return nil
+	}
+	set := *c
+	set.Args = "theme=" + name
+	return l.slashConfig(ctx, &set)
 }

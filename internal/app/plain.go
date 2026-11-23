@@ -12,12 +12,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gnosh-ai/gnosh/internal/agent"
 	"github.com/gnosh-ai/gnosh/internal/cli"
 	"github.com/gnosh-ai/gnosh/internal/core"
 	"github.com/gnosh-ai/gnosh/internal/diff"
+	"github.com/gnosh-ai/gnosh/internal/hooks"
 	"github.com/gnosh-ai/gnosh/internal/term"
 	"github.com/gnosh-ai/gnosh/internal/text"
 	"github.com/gnosh-ai/gnosh/internal/tools/shelltool"
@@ -45,15 +48,27 @@ import (
 // It stands in until the full interface is attached in its place
 // (Options.Interactive), through the same Frontend interface.
 type plain struct {
-	p   *program
-	inv cli.Invocation
-	out io.Writer
+	// hookSaid is the reason of the last hook that blocked, when its
+	// record said it whole: the note that the turn goes on does not say it
+	// again.
+	hookSaid string
+	p        *program
+	inv      cli.Invocation
+	out      io.Writer
 	// in hands out the lines a person types, or is nil when nobody can
 	// type. piped is standard input when it is not a terminal, and term
 	// the terminal that was opened to type at in its place.
-	in    *lineReader
-	piped io.Reader
-	term  io.Closer
+	in *lineReader
+	// askedAt is when the question that waits was put, and answerWait how
+	// long after it a line is still taken for one typed before it was
+	// read (answerAfter).
+	askedAt    time.Time
+	answerWait time.Duration
+	// heldSignal is a signal that came while a command ran, other than
+	// Ctrl+C, which the loop acts on once the command has stopped.
+	heldSignal os.Signal
+	piped      io.Reader
+	term       io.Closer
 	// inputFd is the terminal the lines are typed at, as a file
 	// descriptor, or -1 when it is not known to be one. restoreEcho, when
 	// not nil, puts back the showing of what is typed, which is off while
@@ -78,7 +93,10 @@ type plain struct {
 	// the model's questions when that is what it holds: they are asked
 	// one after another.
 	question *agent.Question
-	form     *plainForm
+	// behind are the questions behind the one being answered, the
+	// oldest first.
+	behind []agent.Question
+	form   *plainForm
 	// nobody says no more lines will come: questions are answered no.
 	nobody bool
 	// waiting ticks while a request is out and nothing has come back.
@@ -90,6 +108,9 @@ type plain struct {
 	ask  *time.Timer
 
 	wake chan struct{}
+	// restarting says a tool moved the session (RestartEvent): the loop
+	// closes it, and gnosh starts again where it moved.
+	restarting atomic.Bool
 }
 
 // lineReader hands out the lines of a stream, one at a time, to whoever
@@ -97,7 +118,13 @@ type plain struct {
 type lineReader struct {
 	once  sync.Once
 	r     io.Reader
-	lines chan string
+	lines chan typedLine
+}
+
+// typedLine is a line of input and when it was read.
+type typedLine struct {
+	text string
+	at   time.Time
 }
 
 // start begins reading, the first time a line is wanted.
@@ -109,7 +136,7 @@ func (lr *lineReader) start() {
 			for {
 				s, err := br.ReadString('\n')
 				if s != "" {
-					lr.lines <- strings.TrimRight(s, "\r\n")
+					lr.lines <- typedLine{strings.TrimRight(s, "\r\n"), time.Now()}
 				}
 				if err != nil {
 					return
@@ -134,21 +161,43 @@ func newPlain(p *program, inv cli.Invocation) *plain {
 	switch {
 	case p.o.StdinIsTerminal:
 		typed = p.o.Stdin
-		f.in = &lineReader{r: p.o.Stdin, lines: make(chan string)}
+		f.in = &lineReader{r: p.o.Stdin, lines: make(chan typedLine)}
 	default:
 		f.piped = p.o.Stdin
 		if p.o.OpenTerminal != nil {
 			if term, err := p.o.OpenTerminal(); err == nil {
 				typed = term
 				f.term = term
-				f.in = &lineReader{r: term, lines: make(chan string)}
+				f.in = &lineReader{r: term, lines: make(chan typedLine)}
 			}
 		}
 	}
 	if file, ok := typed.(interface{ Fd() uintptr }); ok {
 		f.inputFd = int(file.Fd())
 	}
+	f.answerWait = answerWait
+	if p.o.AnswerWait != nil {
+		f.answerWait = *p.o.AnswerWait
+	}
 	return f
+}
+
+// answerWait is how long after a question is put a line is still taken
+// for one typed before the question could be read, and not as its answer:
+// the full interface waits as long before a key answers.
+const answerWait = 400 * time.Millisecond
+
+// answerAfter reports whether a line can be the answer to the question
+// that waits, by when it was read: a line typed before the question came,
+// or as it came, was taken as its answer, so that a "2" typed for the
+// model's own list picked "Yes, and don't ask again" (the cd review of
+// 2026-11-19). It says so when it cannot. The caller holds f.mu.
+func (f *plain) answerAfter(l typedLine) bool {
+	if l.at.IsZero() || !l.at.Before(f.askedAt.Add(f.answerWait)) {
+		return true
+	}
+	f.say("%s", "That line was typed before the question could be read, so it is not taken as the answer: answer it now.")
+	return false
 }
 
 // secretKind is the kind of a question whose answer is a secret: a
@@ -198,25 +247,35 @@ const (
 // control characters other than the line break and the tab are written as
 // visible escapes, so that nothing printed can act as a control sequence.
 func visible(s string) string {
-	clean := true
-	for i := 0; i < len(s); i++ {
-		if c := s[i]; (c < 0x20 && c != '\n' && c != '\t') || c == 0x7f {
-			clean = false
-			break
-		}
+	bad := func(r rune) bool {
+		return (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f || r >= 0x80 && r <= 0x9f || turnsText(r)
 	}
-	if clean {
+	// (A byte that is no UTF-8 is written as U+FFFD: alone, 0x9b is the
+	// 8-bit CSI to a terminal that is not set for UTF-8. The cd review of
+	// 2026-11-19.)
+	if utf8.ValidString(s) && !strings.ContainsFunc(s, bad) {
 		return s
 	}
 	var b strings.Builder
 	for _, r := range s {
-		if (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f {
+		switch {
+		case turnsText(r):
+			// (A mark that turns the order text is drawn in.)
+			fmt.Fprintf(&b, `\u%04x`, r)
+		case bad(r):
+			// (The C1 controls, from U+0080, some terminals read as the
+			// escape sequences they stand for.)
 			fmt.Fprintf(&b, `\x%02x`, r)
-			continue
+		default:
+			b.WriteRune(r)
 		}
-		b.WriteRune(r)
 	}
 	return b.String()
+}
+
+// turnsText reports whether r changes the order text is drawn in.
+func turnsText(r rune) bool {
+	return r >= 0x202a && r <= 0x202e || r >= 0x2066 && r <= 0x2069 || r == 0x200e || r == 0x200f || r == 0x061c
 }
 
 // fresh ends whatever was being written as it arrived, so that the next
@@ -285,12 +344,13 @@ func (f *plain) AskBefore(q agent.Question) (agent.Answer, error) {
 		return agent.Answer{}, errors.New("nobody can be asked: there is no terminal to type an answer at")
 	}
 	f.mu.Lock()
+	f.askedAt = time.Now()
 	f.printQuestion(q)
 	f.mu.Unlock()
 	f.in.start()
 	signals := f.p.o.Signals
 	for {
-		var line string
+		var line typedLine
 		select {
 		case l, ok := <-f.in.lines:
 			if !ok {
@@ -301,7 +361,11 @@ func (f *plain) AskBefore(q agent.Question) (agent.Answer, error) {
 			return agent.Answer{}, errors.New("stopped before the question was answered")
 		}
 		f.mu.Lock()
-		ans, good := f.parseAnswer(q, line)
+		if !f.answerAfter(line) {
+			f.mu.Unlock()
+			continue
+		}
+		ans, good := f.parseAnswer(q, line.text)
 		if !good {
 			f.say("%s", f.answerHint(q))
 		}
@@ -388,9 +452,14 @@ func (f *plain) printFormQuestion() {
 			}
 		}
 	}
-	if q.MultiSelect {
+	switch {
+	case len(q.Options) == 0:
+		fmt.Fprintln(f.out, "Type your answer and Enter, or Enter alone to leave it empty.")
+	case q.NoOther:
+		fmt.Fprintln(f.out, "Type a number and Enter.")
+	case q.MultiSelect:
 		fmt.Fprintln(f.out, "Type the numbers of all that apply, with commas between them, and Enter. Or answer in your own words.")
-	} else {
+	default:
 		fmt.Fprintln(f.out, "Type a number and Enter. Or answer in your own words.")
 	}
 }
@@ -399,6 +468,9 @@ func (f *plain) printFormQuestion() {
 // did not answer it.
 func (pf *plainForm) hint() string {
 	q := pf.form.Questions[pf.at]
+	if q.NoOther {
+		return fmt.Sprintf("That is not an answer. Type one number from 1 to %d.", len(q.Options))
+	}
 	if q.MultiSelect {
 		return fmt.Sprintf("That is not an answer. Type numbers from 1 to %d with commas between them, or your own words. (For an answer of your own that is only a number, put a word before it.)", len(q.Options))
 	}
@@ -409,6 +481,10 @@ func (pf *plainForm) hint() string {
 // the line was an answer, and more that another question waits after it.
 // With the last answer it returns the answer to the whole form.
 func (pf *plainForm) take(line string) (ans agent.Answer, more, good bool) {
+	if pf.form.EscCancels && strings.TrimSpace(line) == "/cancel" {
+		// A server's form, cancelled: the server is told so.
+		return agent.Answer{Choice: "cancel"}, false, true
+	}
 	q := pf.form.Questions[pf.at]
 	said, ok := formAnswer(q, line)
 	if !ok {
@@ -428,6 +504,11 @@ func (pf *plainForm) take(line string) (ans agent.Answer, more, good bool) {
 // several), which stands for its label, or the person's own words.
 func formAnswer(q FormQuestion, line string) (string, bool) {
 	line = strings.TrimSpace(line)
+	if len(q.Options) == 0 {
+		// A question answered by typing (a server's field): the line as
+		// it is, a number too; an empty one leaves it unanswered.
+		return line, true
+	}
 	if line == "" {
 		return "", false
 	}
@@ -436,6 +517,15 @@ func formAnswer(q FormQuestion, line string) (string, bool) {
 	seen := map[int]bool{}
 	for _, word := range fields {
 		n, err := strconv.Atoi(strings.TrimRight(word, "."))
+		if err != nil && q.NoOther {
+			// Words, where only the options will do: an option's label.
+			for _, o := range q.Options {
+				if strings.EqualFold(strings.TrimSpace(o.Label), line) {
+					return o.Label, true
+				}
+			}
+			return "", false
+		}
 		if err != nil {
 			// Words: the line is the person's own answer, as typed.
 			return line, true
@@ -536,7 +626,7 @@ func (f *plain) Run(ctx context.Context, c Controls) int {
 		}
 		first = joinPrompt(piped, first)
 	}
-	var lines <-chan string
+	var lines <-chan typedLine
 	ending := false
 	if f.in != nil {
 		f.in.start()
@@ -567,6 +657,10 @@ func (f *plain) Run(ctx context.Context, c Controls) int {
 		}
 	}()
 	for {
+		if f.restarting.Load() {
+			c.Quit("other")
+			return f.leave(c, cli.ExitOK)
+		}
 		if ending && !c.State().Busy {
 			// Everything that was under way has ended, and nobody can
 			// type more.
@@ -580,6 +674,15 @@ func (f *plain) Run(ctx context.Context, c Controls) int {
 				recheck = time.NewTicker(250 * time.Millisecond)
 			}
 			again = recheck.C
+		}
+		f.mu.Lock()
+		held := f.heldSignal
+		f.heldSignal = nil
+		f.mu.Unlock()
+		if held != nil {
+			c.Interrupt()
+			c.Quit("other")
+			return f.leave(c, signalExit(held))
 		}
 		f.prompt()
 		select {
@@ -627,6 +730,48 @@ func (f *plain) Run(ctx context.Context, c Controls) int {
 	}
 }
 
+// put puts a question to the person: the one being answered from now on.
+// The caller holds f.mu.
+func (f *plain) put(q agent.Question) {
+	f.question, f.askedAt = &q, time.Now()
+	if form, ok := q.Data.(QuestionForm); ok && q.Kind == questionKind && len(form.Questions) > 0 {
+		f.form = &plainForm{form: form, answers: map[string]string{}}
+		f.fresh()
+		fmt.Fprintln(f.out)
+		head := q.Title
+		if form.Lead != "" {
+			head = form.Lead
+		}
+		fmt.Fprintln(f.out, "? "+visible(head))
+		if form.EscCancels {
+			fmt.Fprintln(f.out, "(/cancel answers that you will not say.)")
+		}
+		f.printFormQuestion()
+	} else {
+		f.printQuestion(q)
+	}
+	f.poke()
+	if f.ask != nil {
+		f.ask.Stop()
+		f.ask = nil
+	}
+	if c := f.c; c != nil && c.Info().NotifyHooks {
+		title := q.Title
+		f.ask = time.AfterFunc(askNotifyAfter, func() { c.Notify("permission_prompt", title, "gnosh is waiting for an answer: "+title) })
+	}
+}
+
+// next puts the question that waited longest, if one does. The caller
+// holds f.mu.
+func (f *plain) next() {
+	if len(f.behind) == 0 {
+		return
+	}
+	q := f.behind[0]
+	f.behind = f.behind[1:]
+	f.put(q)
+}
+
 // setNobody notes that no more lines will come, and answers the question
 // that waits, if one does: a question nobody can answer must not hold the
 // session for ever.
@@ -634,26 +779,30 @@ func (f *plain) setNobody(c Controls) {
 	f.mu.Lock()
 	f.nobody = true
 	q := f.question
-	f.question = nil
+	behind := f.behind
+	f.question, f.behind = nil, nil
 	f.mu.Unlock()
 	if q != nil {
 		f.refuse(c, *q)
 	}
+	for _, w := range behind {
+		f.refuse(c, w)
+	}
 }
 
-// refuse answers a question that nobody can answer.
+// refuse answers a question that nobody can answer: no, where no is a
+// choice, with the reason. A question with no such choice is left
+// unanswered: the reason as its answer's text was taken for what was
+// typed, and gnokey was handed it as the key's password (the cd review of
+// 2026-11-19). The model's own questions are left unanswered too, which
+// the tool that put them says in its own words.
 func (f *plain) refuse(c Controls, q agent.Question) {
 	const why = "nobody is at the keyboard to answer (the input has ended), so this was not approved"
-	ans := agent.Answer{Text: why}
+	ans := agent.Answer{}
 	for _, ch := range q.Choices {
-		if ch.Key == "no" {
-			ans.Choice = "no"
+		if ch.Key == "no" && q.Kind != questionKind {
+			ans = agent.Answer{Choice: "no", Text: why}
 		}
-	}
-	if q.Kind == questionKind {
-		// The model's own questions: they are left unanswered, which the
-		// tool that put them says in its own words.
-		ans = agent.Answer{}
 	}
 	_ = c.Answer(q.ID, ans)
 }
@@ -696,12 +845,17 @@ func (f *plain) interrupted() {
 
 // line acts on one line of input, and reports whether the person asked
 // to leave.
-func (f *plain) line(ctx context.Context, c Controls, line string) (quit bool) {
+func (f *plain) line(ctx context.Context, c Controls, typed typedLine) (quit bool) {
+	line := typed.text
 	f.mu.Lock()
 	q := f.question
 	f.mu.Unlock()
 	if q != nil {
 		f.mu.Lock()
+		if !f.answerAfter(typed) {
+			f.mu.Unlock()
+			return false
+		}
 		var ans agent.Answer
 		var good bool
 		if f.form != nil {
@@ -724,11 +878,24 @@ func (f *plain) line(ctx context.Context, c Controls, line string) (quit bool) {
 			return false
 		}
 		f.question = nil
+		if f.ask != nil {
+			f.ask.Stop()
+			f.ask = nil
+		}
 		f.showTyping()
 		f.mu.Unlock()
 		if err := c.Answer(q.ID, ans); err != nil {
 			f.note("That question is no longer waiting for an answer.")
 		}
+		f.mu.Lock()
+		if f.question == nil {
+			f.next()
+		}
+		f.mu.Unlock()
+		return false
+	}
+	line, ok := f.cleanLine(line)
+	if !ok {
 		return false
 	}
 	text := strings.TrimSpace(line)
@@ -749,7 +916,7 @@ func (f *plain) line(ctx context.Context, c Controls, line string) (quit bool) {
 		return false
 	}
 	if strings.HasPrefix(text, "/") {
-		res, err := c.Command(ctx, text)
+		res, err := f.command(ctx, c, text)
 		if res.Handled || err != nil {
 			if res.Copy != "" {
 				fmt.Fprint(f.out, term.ClipboardWrite(res.Copy))
@@ -769,6 +936,104 @@ func (f *plain) line(ctx context.Context, c Controls, line string) (quit bool) {
 	}
 	f.submit(c, line)
 	return false
+}
+
+// command runs a typed /command. A command may put a question while it
+// runs (a PreModelSwitch hook's "ask" does), so while the session's
+// question waits the lines typed are read here, and the first answers it.
+// Lines are read only then: a question put before a session exists
+// (AskBefore: which model, after /clear) reads its own, and the rest wait
+// for the command to be done.
+//
+// Ctrl+C stops the command, as Esc does in the full interface: it was not
+// looked at until the command was done, and two pressed meanwhile then
+// quit the session (the cd review of 2026-11-19). Another signal stops
+// it too, and is handled once it has.
+func (f *plain) command(ctx context.Context, c Controls, text string) (CommandResult, error) {
+	type result struct {
+		res CommandResult
+		err error
+	}
+	cmdCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan result, 1)
+	go func() {
+		res, err := c.Command(cmdCtx, text)
+		done <- result{res, err}
+	}()
+	signals := c.Signals()
+	for {
+		f.mu.Lock()
+		asked, nobody := f.question != nil, f.nobody
+		f.mu.Unlock()
+		var lines <-chan typedLine
+		if asked && f.in != nil && !nobody {
+			lines = f.in.lines
+		}
+		select {
+		case r := <-done:
+			return r.res, r.err
+		case <-f.wake:
+			// (A question was put or taken back: look again.)
+		case sig := <-signals:
+			signals = nil
+			cancel()
+			// (And what the command set going: a summary it waits for.)
+			c.Interrupt()
+			f.note("Stopping /%s.", strings.Fields(strings.TrimPrefix(text, "/") + " ")[0])
+			if sig != os.Interrupt {
+				// (Handled by the loop once the command has stopped.)
+				f.mu.Lock()
+				f.heldSignal = sig
+				f.mu.Unlock()
+			}
+		case line, ok := <-lines:
+			if !ok {
+				// The input ended: the question that waits is answered
+				// no, and the loop finds the end again afterwards.
+				f.setNobody(c)
+				continue
+			}
+			f.typed()
+			f.line(ctx, c, line)
+		}
+	}
+}
+
+// cleanLine takes the characters a terminal draws as nothing out of a
+// line typed to be sent, as the full interface does on Enter
+// (ui/invisible.go), and says so. It returns false, with nothing to send,
+// when what was taken out could hide text or change its order, or when
+// what is left begins as a command or a shell line and what was typed did
+// not: there is no box here to put the line back in, so what is left is
+// shown, to be typed again if it is meant.
+func (f *plain) cleanLine(line string) (string, bool) {
+	clean, found := text.CleanInvisible(line)
+	if found.Removed == 0 {
+		return line, true
+	}
+	what := countWords(found.Removed, "invisible character", "invisible characters")
+	// (Trimmed as line() trims a line before it looks for a ! or a /.)
+	typed := strings.TrimSpace(line)
+	lead := strings.TrimSpace(clean)
+	switch {
+	case strings.TrimSpace(clean) == "":
+		f.note("The line held only invisible characters, so nothing was sent.")
+		return "", false
+	case found.Hiding:
+		f.note("Took out %s that could hide text or reorder it; nothing was sent. What is left: %s", what, visible(clean))
+		return "", false
+	case strings.HasPrefix(typed, "!"):
+		// What is taken out of a command changes what it does, so it is
+		// never run before it is read.
+		f.note("Took out %s from the shell line, which changes what it runs, so it was not run: %s", what, visible(clean))
+		return "", false
+	case (strings.HasPrefix(lead, "/") || strings.HasPrefix(lead, "!")) && !strings.HasPrefix(typed, "/"):
+		f.note("Took out %s, and what is left reads as a command, so it was not run: %s", what, visible(clean))
+		return "", false
+	}
+	f.note("Took out %s before sending the line.", what)
+	return clean, true
 }
 
 // submit sends a prompt.
@@ -973,6 +1238,10 @@ func (f *plain) Event(ev any) {
 		f.fresh()
 	case *agent.RetryEvent:
 		f.stopWaiting()
+		if ev.FellBack != "" {
+			f.say("%s", visible(ev.Message))
+			break
+		}
 		f.say("waiting: %s", visible(ev.Message))
 	case *agent.PromptEvent:
 		// One of gnosh's own prompts says why a turn started in a notice
@@ -1001,6 +1270,9 @@ func (f *plain) Event(ev any) {
 			f.say("%s%s", markTool, visible(toolLine(ev.Name, ev.Input)))
 		}
 		f.say("%s%s", markResult, visible(resultLine(ev.Result, ev.Denied, ev.Interrupted)))
+		for _, n := range ev.Result.Notes {
+			f.say("  %s", visible(n))
+		}
 		if !ev.Denied && !ev.Result.IsError {
 			if _, isCommand := metaInt(ev.Result.Meta, "exitCode"); isCommand {
 				// The line a command's result begins with, which says
@@ -1020,34 +1292,39 @@ func (f *plain) Event(ev any) {
 			}
 			return
 		}
-		f.question = &q
-		if form, ok := q.Data.(QuestionForm); ok && q.Kind == questionKind && len(form.Questions) > 0 {
-			f.form = &plainForm{form: form, answers: map[string]string{}}
-			f.fresh()
-			fmt.Fprintln(f.out)
-			fmt.Fprintln(f.out, "? "+visible(q.Title))
-			f.printFormQuestion()
-		} else {
-			f.printQuestion(q)
+		if f.question != nil {
+			// One question at a time: this one waits, and is put once the
+			// one being answered is done. Put in its place, it would take
+			// the answer typed for that one (a background sub-agent's
+			// question over the session's own), and leave that one
+			// waiting for good.
+			f.behind = append(f.behind, q)
+			f.say("(Another question waits behind this one: %s)", visible(q.Title))
+			return
 		}
-		f.poke()
-		if c := f.c; c != nil && c.Info().NotifyHooks {
-			title := q.Title
-			f.ask = time.AfterFunc(askNotifyAfter, func() { c.Notify("permission_prompt", title, "gnosh is waiting for an answer: "+title) })
-		}
+		f.put(q)
 	case *agent.AnswerEvent:
+		f.behind = slices.DeleteFunc(f.behind, func(w agent.Question) bool { return w.ID == ev.ID })
 		if f.question != nil && f.question.ID == ev.ID {
 			f.question, f.form = nil, nil
 		}
 		f.showTyping()
-		if ev.Withdrawn {
+		switch {
+		case ev.Withdrawn:
 			f.say("(The question was taken back: the turn was stopped.)")
+		case ev.Answer.By != "":
+			f.say("(%s answered the question: %s.)", visible(ev.Answer.By), visible(ev.Answer.Choice))
 		}
-		if f.ask != nil {
+		if f.ask != nil && f.question == nil {
+			// (The reminder was the answered question's. One put since
+			// has its own.)
 			f.ask.Stop()
 			f.ask = nil
 		}
 		f.poke()
+		if f.question == nil {
+			f.next()
+		}
 	case *agent.NoticeEvent:
 		lead := "note: "
 		switch ev.Level {
@@ -1072,9 +1349,12 @@ func (f *plain) Event(ev any) {
 		case ev.Action == agent.Halt:
 		case ev.Checkpoint:
 			f.say("The turn goes on: %s objects, %d times in a row now, so the model is asked whether there is a real reason to stop: %s", ev.Name, ev.Streak, visible(oneLine(ev.Objection, 300)))
+		case f.hookSaid != "" && strings.Join(strings.Fields(ev.Objection), " ") == f.hookSaid:
+			f.say("The turn goes on: %s objects, as the hook above says.", ev.Name)
 		default:
 			f.say("The turn goes on: %s objects: %s", ev.Name, visible(oneLine(ev.Objection, 300)))
 		}
+		f.hookSaid = ""
 	case *agent.LoopEvent:
 		switch {
 		case ev.On:
@@ -1084,19 +1364,40 @@ func (f *plain) Event(ev any) {
 		}
 	case *agent.SummaryEvent:
 		switch {
+		case ev.Phase == "start" && ev.Part == "before":
+			f.say("Summarizing the conversation before your prompt; what followed it stays. This can take minutes on a local model; Ctrl+C stops it.")
+		case ev.Phase == "start" && ev.Part == "after":
+			f.say("Summarizing what followed your prompt, to go back to before it. This can take minutes on a local model; Ctrl+C stops it.")
 		case ev.Phase == "start":
 			f.say("Summarizing the conversation to make room (%s). This can take minutes on a local model; Ctrl+C stops it.", ev.Trigger)
 		case ev.Err != nil:
 			f.say("No summary was made: %v", ev.Err)
+		case ev.Part == "after":
+			// (The rewind that follows says what became of it.)
+		case ev.Part == "before":
+			f.say("The conversation before your prompt was summarized: about %s tokens before, about %s after.", tokenCount(ev.PreTokens), tokenCount(ev.PostTokens))
 		default:
 			f.say("The conversation was summarized: about %s tokens before, about %s after.", tokenCount(ev.PreTokens), tokenCount(ev.PostTokens))
 		}
 	case *HookEvent:
 		for _, r := range ev.Records {
-			f.say("%s%s", markHook, visible(r.String()))
+			line := r.String()
+			if reason := strings.Join(strings.Fields(r.Reason), " "); r.Result == hooks.ResultBlocked && reason != "" && strings.HasSuffix(line, reason) {
+				f.hookSaid = reason
+			}
+			f.say("%s%s", markHook, visible(line))
 		}
 	case *TasksEvent:
 		f.printTasks(ev.Tasks)
+	case *PushEvent:
+		ev.Reply <- "not sent: the plain interface sends no notifications"
+	case *RestartEvent:
+		f.say("%s", visible(ev.Why))
+		f.restarting.Store(true)
+		select {
+		case f.wake <- struct{}{}:
+		default:
+		}
 	case *agent.TurnEndEvent:
 		f.stopWaiting()
 		how := "done"
@@ -1107,8 +1408,11 @@ func (f *plain) Event(ev any) {
 			how = "failed"
 		case agent.EndHalted:
 			how = "ended"
+			if ev.Result.Planned {
+				how = "done" // (a tool ended the turn as it meant to)
+			}
 			if d := strings.TrimSpace(ev.Result.Detail); d != "" {
-				how = "ended (" + visible(oneLine(d, 160)) + ")"
+				how += " (" + visible(oneLine(d, 160)) + ")"
 			}
 		case agent.EndModelStopped:
 			how = "the model chose to stop"

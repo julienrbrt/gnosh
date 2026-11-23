@@ -42,7 +42,8 @@ func TestASharedProbeSeesTheLock(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "a.lock")
 	release := mustTry(t, path)
-	if !probe(t, path) || !probe(t, path) {
+	first, second := probe(t, path), probe(t, path)
+	if !first || !second {
 		t.Fatal("a shared probe did not see the lock, or took it from its holder")
 	}
 	mustBeHeld(t, path)

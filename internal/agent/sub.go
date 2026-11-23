@@ -95,6 +95,9 @@ func (a *Agent) Spawn(sub SubOptions) (*Agent, error) {
 	if opts.Moments.AfterTool == nil {
 		opts.Moments.AfterTool = a.opts.Moments.AfterTool
 	}
+	if opts.Moments.AfterRound == nil {
+		opts.Moments.AfterRound = a.opts.Moments.AfterRound
+	}
 	opts.Drivers = sub.Drivers
 	opts.OnEvent = nil
 	opts.Store = sub.Store

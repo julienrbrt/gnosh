@@ -107,6 +107,11 @@ func TestCompileErrors(t *testing.T) {
 		`{"$ref": "#/$defs/missing"}`:            "leads nowhere",
 		`{"minLength": -1}`:                      "a whole number",
 		`{"anyOf": []}`:                          "a list of schemas",
+		// Keywords that would hold an answer to more than is checked.
+		`{"if": {"required": ["a"]}, "then": {"required": ["b"]}}`:            "a keyword gnosh does not check",
+		`{"properties": {"l": {"contains": {"const": 1}, "minContains": 2}}}`: "a keyword gnosh does not check",
+		`{"dependentRequired": {"a": ["b"]}}`:                                 "a keyword gnosh does not check",
+		`{"type": "object", "unevaluatedProperties": false}`:                  "a keyword gnosh does not check",
 	} {
 		if _, err := Compile(text); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Compile(%s) = %v, want an error with %q", text, err, want)

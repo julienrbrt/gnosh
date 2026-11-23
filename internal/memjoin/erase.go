@@ -337,7 +337,7 @@ func (sc *scrubber) edit(en *transcript.Entry) bool {
 // text another.
 const (
 	saidEntry transcript.EntryType = "notice"
-	loopKey                        = "loop"
+	loopKey   string               = "loop"
 )
 
 // said takes what was erased out of a line gnosh said for itself about

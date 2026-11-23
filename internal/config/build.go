@@ -29,6 +29,8 @@ type builder struct {
 	// before the state file's were put on top, to fall back on when the
 	// state file's choice turns out to be stale.
 	largeBefore, smallBefore Value[ModelRef]
+	// fallback is "fallbackModel" or --fallback-model.
+	fallback Value[[]ModelRef]
 
 	hosts    []Host
 	hooks    []Hook
@@ -37,6 +39,19 @@ type builder struct {
 	agent Value[string]
 	// statusLine is the status line command; a later file wins.
 	statusLine Value[StatusLine]
+	// fileSuggestion is the @ file suggestion command; a later file wins.
+	fileSuggestion Value[FileSuggestion]
+	// lsp are the language servers by name; a later file's entry of a name
+	// takes the place of a weaker file's.
+	lsp map[string]LSPServer
+	// attribution is what commits and pull requests are signed with; a
+	// later file wins.
+	attribution Value[Attribution]
+	// hookURLs and hookEnvVars are allowedHttpHookUrls and
+	// httpHookAllowedEnvVars, every file's merged.
+	hookURLs, hookEnvVars allowList
+	// sandbox is the sandbox settings (sandbox.go).
+	sandbox sandboxBuild
 
 	layers []*RuleLayer
 	mode   Value[string]
@@ -45,7 +60,11 @@ type builder struct {
 	modeFromUser   bool
 	bypassDisabled Value[bool]
 	denyInstead    Value[bool]
-	dirs           []ListItem
+	blockReads     Value[bool]
+	blockWrites    Value[bool]
+	// dirNamed are the places that named each additional directory.
+	dirNamed map[string][]Origin
+	dirs     []ListItem
 
 	env           map[string]EnvVar
 	skillOver     map[string]Value[string] // the person's own files
@@ -214,6 +233,12 @@ func (b *builder) addModel(ref ModelRef, ch modelChange, o Origin) {
 	if ch.maxOutput != nil {
 		m.MaxOutputTokens.put(*ch.maxOutput, ch.maxAt)
 	}
+	if ch.noBudget {
+		m.ThinkingBudget = Value[int]{}
+	}
+	if ch.budget != nil {
+		m.ThinkingBudget.put(*ch.budget, ch.budgetAt)
+	}
 	if ch.noLevels {
 		m.ThinkingLevels = Value[[]string]{}
 	}
@@ -317,6 +342,16 @@ func (b *builder) addRule(which string, r Rule, scope, file, dir string) {
 	}
 }
 
+// addDir adds an additional directory, and keeps every place that named
+// it (ProjectDirs tells the project's apart from the person's by them).
+func (b *builder) addDir(dir string, o Origin) {
+	addItem(&b.dirs, dir, o)
+	if b.dirNamed == nil {
+		b.dirNamed = map[string][]Origin{}
+	}
+	b.dirNamed[dir] = append(b.dirNamed[dir], o)
+}
+
 // setEnv sets a variable of the env block. A later file wins.
 func (b *builder) setEnv(v EnvVar) {
 	if have, ok := b.env[v.Name]; ok && v.Origin.Layer < have.Origin.Layer {
@@ -386,6 +421,10 @@ func (b *builder) sweep(keep func(kind string) bool, projectFiles []string) (rem
 				note("thinkingLevels of model " + m.Ref())
 				m.ThinkingLevels = Value[[]string]{}
 			}
+			if m.ThinkingBudget.Set && from(m.ThinkingBudget.Origin) {
+				note("thinkingBudget of model " + m.Ref())
+				m.ThinkingBudget = Value[int]{}
+			}
 		}
 		for _, slot := range []struct {
 			name string
@@ -428,6 +467,10 @@ func (b *builder) sweep(keep func(kind string) bool, projectFiles []string) (rem
 		note("disableAllHooks")
 		b.hooksOff = Value[bool]{}
 	}
+	if !ok(KindFileSuggest) && b.fileSuggestion.Set && from(b.fileSuggestion.Origin) {
+		note("fileSuggestion")
+		b.fileSuggestion = Value[FileSuggestion]{}
+	}
 	if !ok(KindStatusLine) && b.statusLine.Set && from(b.statusLine.Origin) {
 		note("statusLine")
 		b.statusLine = Value[StatusLine]{}
@@ -454,18 +497,40 @@ func (b *builder) sweep(keep func(kind string) bool, projectFiles []string) (rem
 			note("defaultMode")
 			b.mode = Value[string]{}
 		}
-		if b.bypassDisabled.Set && from(b.bypassDisabled.Origin) {
-			note("disableBypassPermissionsMode")
-			b.bypassDisabled = Value[bool]{}
-		}
 		if b.denyInstead.Set && from(b.denyInstead.Origin) {
 			note("denyInsteadOfPrompting")
 			b.denyInstead = Value[bool]{}
 		}
 	}
+	if !ok(KindRestriction) && b.bypassDisabled.Set && from(b.bypassDisabled.Origin) {
+		note("disableBypassPermissionsMode")
+		b.bypassDisabled = Value[bool]{}
+	}
+	if !ok(KindRestriction) && b.blockReads.Set && from(b.blockReads.Origin) {
+		note("blockReadsOutsideWorkingDirectories")
+		b.blockReads = Value[bool]{}
+	}
+	if !ok(KindRestriction) && b.blockWrites.Set && from(b.blockWrites.Origin) {
+		note("blockWritesOutsideWorkingDirectories")
+		b.blockWrites = Value[bool]{}
+	}
+	b.sandbox.sweep(ok, from, note)
+	if !ok(KindHookOff) {
+		if b.hookURLs.drop(from) {
+			note("allowedHttpHookUrls")
+		}
+		if b.hookEnvVars.drop(from) {
+			note("httpHookAllowedEnvVars")
+		}
+	}
 	if !ok(KindAddDir) {
 		b.dirs = slices.DeleteFunc(b.dirs, func(d ListItem) bool {
-			if from(d.Origin) {
+			// (Kept when the person named it too.)
+			theirs := from(d.Origin)
+			for _, o := range b.dirNamed[d.V] {
+				theirs = theirs && from(o)
+			}
+			if theirs {
 				note("additional directory")
 				return true
 			}

@@ -17,6 +17,7 @@ const (
 	idNoPersist = "--no-session-persistence"
 	idYolo      = "--yolo"
 	idMode      = "--permission-mode"
+	idBack      = "--bg"
 )
 
 // The headings flags are listed under in help, in the order they appear.
@@ -107,12 +108,15 @@ func Default() *Table {
 		help:       "Continue the most recent session of this project. (-c used to take the working folder, which is --cwd now. So a single word right after -c is refused: write -C before a one-word prompt.)",
 		refuseNext: wordAfterC})
 	resume := t.add(&flag{names: "-r --resume", kind: kindOptional, arg: "session", group: groupConversation, pri: 0,
-		help: "Resume a session by its ID or its name, or from a transcript file given as an absolute path ending in .jsonl. With nothing after it, show the sessions to pick from; in print mode a session must be named. The argument after -r is always taken as the session, never as the prompt.",
+		help: "Resume a session by its ID or its name, or by words in its name or first prompt when one session alone has them, or from a transcript file given as an absolute path ending in .jsonl. With nothing after it, show the sessions to pick from; in print mode a session must be named. The argument after -r is always taken as the session, never as the prompt.",
 		set:  func(i *Invocation, v flagValue) { i.Resume = v.text }})
 	sessionID := t.add(&flag{names: "--session-id", kind: kindText, arg: "uuid", group: groupConversation, pri: 0,
 		help:  "Give the new conversation this ID, which must be a UUID. It is for a new conversation only: not with -c, -r or --fork-session.",
 		check: isUUID,
 		set:   func(i *Invocation, v flagValue) { i.SessionID = v.text }})
+	back := t.add(&flag{names: "--bg --background", group: groupConversation, pri: 1,
+		help: "Start the session in the background and return at once: it works on the prompt as a run of its own, as /background has a session go on, and gnosh says its ID and how to follow it (gnosh agents, gnosh logs, gnosh stop, gnosh -r). A call that needs a yes waits for one in gnosh agents, listed there under Needs input. With -c, or -r and a session's ID or name, it goes on with that session instead of a new one. Not with -p, --fork-session or --no-session-persistence.",
+		set:  func(i *Invocation, _ flagValue) { i.Background = true }})
 	fork := t.add(&flag{names: "--fork-session", group: groupConversation, pri: 1,
 		help: "With -c or -r: go on in a copy of the session and leave the original as it was.",
 		set:  func(i *Invocation, _ flagValue) { i.ForkSession = true }})
@@ -126,6 +130,9 @@ func Default() *Table {
 	effort := t.add(&flag{names: "--reasoning-effort --effort", kind: kindText, arg: "level", group: groupModel, pri: 1,
 		help: "How hard the model thinks in this run. The levels depend on the model.",
 		set:  func(i *Invocation, v flagValue) { i.Effort = v.text }})
+	fallback := t.add(&flag{names: "--fallback-model", kind: kindText, arg: "models", group: groupModel, pri: 1,
+		help: "Models to go on with, tried in order, when the model cannot answer (its server is down, not ready or too busy): up to three, separated by commas. The switch holds for the rest of the turn; the next one asks the model first again.",
+		set:  func(i *Invocation, v flagValue) { i.FallbackModel = v.text }})
 
 	yolo := t.add(&flag{names: "-y --yolo --dangerously-skip-permissions", group: groupPermissions, pri: 0,
 		help: "Skip every permission question; the same as --permission-mode bypassPermissions. A print run refuses whatever would have asked, unless it is given this, a permission mode or allow rules."})
@@ -197,6 +204,12 @@ func Default() *Table {
 	mcpConfig := t.add(&flag{names: "--mcp-config", kind: kindList, list: listPaths, arg: "files-or-json...", group: groupSettings, pri: 1,
 		help: "MCP servers for this run, as files or the JSON itself, each in the shape of .mcp.json. A run waits for them before its turn.",
 		set:  func(i *Invocation, v flagValue) { i.MCPConfigs = append(i.MCPConfigs, v.items...) }})
+	channels := t.add(&flag{names: "--channels", kind: kindList, list: listPaths, arg: "servers...", group: groupSettings, pri: 1,
+		help: "MCP servers whose events come into this session as they happen, each as server:<name>: a stdio server of your MCP configuration that declares itself a channel, as Claude Code's do (a CI webhook, a chat bridge). The model sees each event and may answer through the server's own tools.",
+		set:  func(i *Invocation, v flagValue) { i.Channels = append(i.Channels, v.items...) }})
+	devChannels := t.add(&flag{names: "--dangerously-load-development-channels", kind: kindList, list: listPaths, arg: "servers...", group: groupSettings, pri: 1,
+		help: "The same as --channels, which gnosh keeps no list of approved channels for: Claude Code's spelling for a channel of one's own.",
+		set:  func(i *Invocation, v flagValue) { i.Channels = append(i.Channels, v.items...) }})
 	strictMCP := t.add(&flag{names: "--strict-mcp-config", group: groupSettings, pri: 1,
 		help: "Use only the MCP servers --mcp-config gives.",
 		set:  func(i *Invocation, _ flagValue) { i.StrictMCPConfig = true }})
@@ -257,6 +270,9 @@ func Default() *Table {
 	partial := t.add(&flag{names: "--include-partial-messages", group: groupPrint, pri: 1, printOnly: true,
 		help: "With --output-format stream-json: also write the replies as they arrive, as the Messages API's streaming events (stream_event lines).",
 		set:  func(i *Invocation, _ flagValue) { i.IncludePartialMessages = true }})
+	hookEvents := t.add(&flag{names: "--include-hook-events", group: groupPrint, pri: 1, printOnly: true,
+		help: "With --output-format stream-json: also write each hook's start and end (system lines hook_started and hook_response); the SessionStart hooks' are written without it.",
+		set:  func(i *Invocation, _ flagValue) { i.IncludeHookEvents = true }})
 	noPersist := t.add(&flag{names: "--no-session-persistence", group: groupPrint, pri: 1, printOnly: true,
 		help: "Keep nothing of the run: its session is not saved, and cannot be resumed.",
 		set:  func(i *Invocation, _ flagValue) { i.NoSessionPersistence = true }})
@@ -267,12 +283,12 @@ func Default() *Table {
 		help: "Print which build of gnosh this is: when it was built, and from which commit. (With -p, -v means --verbose.)"})
 
 	sessionFlags := []*flag{
-		cont, resume, sessionID, fork, name,
-		model, effort,
+		cont, resume, sessionID, fork, name, back,
+		model, effort, fallback,
 		yolo, mode, allowSkip, allowed, disallowed, tools, addDir, trustFolder,
 		system, systemFile, appendSystem, appendSystemFile, agents, asAgent,
-		cwd, worktree, settings, settingSrc, mcpConfig, strictMCP, safeMode, bare, noSlash, debug, debugFile, verbose,
-		printMode, output, input, goal, maxTurns, smallModel, partial, replay, schema, prompts, noPersist,
+		cwd, worktree, settings, settingSrc, mcpConfig, strictMCP, channels, devChannels, safeMode, bare, noSlash, debug, debugFile, verbose,
+		printMode, output, input, goal, maxTurns, smallModel, partial, hookEvents, replay, schema, prompts, noPersist,
 		help, version,
 	}
 
@@ -292,6 +308,15 @@ func Default() *Table {
 	sessionJSON := t.add(&flag{names: "--json", id: "session --json", pri: 1,
 		help: "Print JSON instead of text.",
 		set:  func(i *Invocation, _ flagValue) { i.JSON = true }})
+	promptForce := t.add(&flag{names: "--force", id: "prompt export --force", pri: 1,
+		help: "Write over a file of that name that is there already.",
+		set:  func(i *Invocation, _ flagValue) { i.Force = true }})
+	agentsJSON := t.add(&flag{names: "--json", id: "agents --json", pri: 1,
+		help: "Print JSON instead of text: the working sessions, and with --all the others too.",
+		set:  func(i *Invocation, _ flagValue) { i.JSON = true }})
+	agentsAll := t.add(&flag{names: "--all", id: "agents --all", pri: 1,
+		help: "Also list every session that is done, not only those of the last week.",
+		set:  func(i *Invocation, _ flagValue) { i.All = true }})
 	logsFollow := t.add(&flag{names: "-f --follow", id: "logs --follow", pri: 1,
 		help: "Keep printing as the log grows.",
 		set:  func(i *Invocation, _ flagValue) { i.Follow = true }})
@@ -302,6 +327,9 @@ func Default() *Table {
 		choices: []choice{{name: "local"}, {name: "user"}, {name: "project"}},
 		help:    "Where the server is kept: local (this project, for you alone: the default for add), user (every project of yours) or project (the project's .mcp.json, which goes with it).",
 		set:     func(i *Invocation, v flagValue) { i.MCPScope = v.text }})
+	mcpNoBrowser := t.add(&flag{names: "--no-browser", id: "mcp --no-browser", pri: 1,
+		help: "Open no browser: only say the address to sign in at.",
+		set:  func(i *Invocation, _ flagValue) { i.NoBrowser = true }})
 	mcpTransport := t.add(&flag{names: "-t --transport", id: "mcp --transport", kind: kindText, arg: "transport", pri: 1,
 		choices: []choice{{name: "stdio"}, {name: "http"},
 			{name: "sse", refuse: "the sse transport is not one gnosh speaks: a server reached at a URL is spoken to over http (Streamable HTTP), which servers that once spoke SSE speak now too"}},
@@ -379,9 +407,42 @@ func Default() *Table {
 		summary: "Serve the project's machines, mem and frames view to another harness, without a model.",
 		about:   "Requests come as JSON lines on standard input and replies go as JSON lines to standard output; spec/gnosh/bridge.md gives the protocol. It ends when standard input ends."})
 
-	t.command(root, &command{name: "logs", cmd: CmdLogs, pri: 1,
+	prm := t.command(root, &command{name: "prompt", needSub: true, pri: 1,
+		argsUsage: "<command>", flags: []*flag{help},
+		summary: "Read gnosh's own words to the model, and make any of them yours.",
+		about:   "These start no model. A file of yours in the folder gnosh prompt path names stands in for gnosh's text of its name in every session from then on. What fills the model's window, each tool's share with it, is /context all (in a session, or gnosh -p '/context all')."})
+	t.command(prm, &command{name: "show", cmd: CmdPromptShow, pri: 1, maxArgs: 1, argsUsage: "[name]",
+		flags:   []*flag{help},
+		summary: "List gnosh's texts to the model, or print one as it is sent.",
+		about:   "The list says where each text goes and how large it is, and which are yours. With a name, the text in force is printed, and what it is, when it is sent and where it came from are said on standard error, so that the text alone can be kept in a file."})
+	t.command(prm, &command{name: "path", cmd: CmdPromptPath, pri: 1,
+		flags:   []*flag{help},
+		summary: "Print the folder your own texts go in."})
+	t.command(prm, &command{name: "export", cmd: CmdPromptExport, pri: 1, maxArgs: -1, argsUsage: "[name...]",
+		flags:   []*flag{promptForce, help},
+		summary: "Write gnosh's own texts into the folder yours go in, to edit them.",
+		about:   "With no name, every text. A file that is there is kept unless --force is given. An exported text changes nothing until its words are changed: its first line marks it as gnosh's own, and is never sent."})
+
+	t.command(root, &command{name: "agents", cmd: CmdAgents, pri: 1,
+		flags:   []*flag{agentsJSON, agentsAll, cwd, yolo, mode, model, effort, help},
+		finish:  func(inv *Invocation, p *parsed, _ Env) *Error { return finishYolo(inv, p) },
+		summary: "The sessions that run in the background, and those that ran: a view of them on a terminal.",
+		about:   "The sessions gnosh --bg, /background and /fork started, from every folder (with --cwd, from that folder and the folders in it): the working ones first, then those done in the last week. On a terminal it is a view to work in, as Claude Code's agent view: Space peeks at a run, Enter watches a working one or opens one that is over, Ctrl+X stops one, a prompt typed at the bottom starts one, and ? lists the keys; -y, --permission-mode, --model and --effort go to the runs it starts. Elsewhere, and with --json, it prints the list, each run named by the start of its ID, which gnosh logs, gnosh stop and gnosh -r take."})
+
+	t.command(root, &command{name: "logs", cmd: CmdLogs, pri: 1, maxArgs: 1, argsUsage: "[session]",
 		flags:   []*flag{logsFollow, logsTail, cwd, help},
-		summary: "Print the end of the project's log, or follow it."})
+		summary: "Print the end of the project's log, or follow it.",
+		about:   "With a session's ID (or the start of one), what that session printed as a run in the background (gnosh --bg, /background, /fork; gnosh agents lists them); --follow follows it until the run is done."})
+
+	t.command(root, &command{name: "attach", cmd: CmdAttach, pri: 1, minArgs: 1, maxArgs: 1, argsUsage: "<session>",
+		flags:   []*flag{cwd, help},
+		summary: "Open the agent view on a session that runs in the background.",
+		about:   "As Claude Code's claude attach: the session is a run that gnosh --bg, /background or /fork started, named by its ID, the start of one, or its name (gnosh agents lists them). A working run is watched as it goes, one that waits on a question shows the question, and one that is over opens as gnosh -r opens it. It needs a terminal; elsewhere gnosh logs -f follows a run."})
+
+	t.command(root, &command{name: "stop", aliases: []string{"kill"}, cmd: CmdStop, pri: 1, minArgs: 1, maxArgs: 1, argsUsage: "<session>",
+		flags:   []*flag{cwd, help},
+		summary: "Stop a session that runs in the background.",
+		about:   "The session is a run that gnosh --bg, /background or /fork started, named by its ID or the start of one (gnosh agents lists them). It is stopped as Esc stops a turn, and given a minute to end in good order before it is made to; what it did so far is kept: gnosh -r opens it."})
 
 	t.command(root, &command{name: "dirs", cmd: CmdDirs, pri: 1,
 		flags:   []*flag{cwd, help},
@@ -407,11 +468,11 @@ func Default() *Table {
 		flags:   []*flag{mcpScope, mcpTransport, mcpEnv, mcpHeader, cwd, help},
 		summary: "Add a server.",
 		about:   "A server gnosh starts is its command and arguments; one at a URL is -t http and the URL. Put -- before the command when it has flags of its own."})
-	t.command(mcp, &command{name: "add-json", cmd: CmdMCPAddJSON, pri: 1, minArgs: 2, maxArgs: 2,
+	t.command(mcp, &command{name: "add-json", cmd: CmdMCPAddJSON, pri: 1, minArgs: 2, maxArgs: 2, dashIsStdin: true,
 		argsUsage: "<name> <json>",
 		flags:     []*flag{mcpScope, cwd, help},
 		summary:   "Add a server from its entry, as JSON.",
-		about:     `The entry is what goes under the server's name in "mcpServers", such as {"type": "http", "url": "https://..."}.`})
+		about:     `The entry is what goes under the server's name in "mcpServers", such as {"type": "http", "url": "https://..."}. With - in its place the entry is read from standard input, so that a key in it stays off the command line.`})
 	t.command(mcp, &command{name: "get", cmd: CmdMCPGet, pri: 1, minArgs: 1, maxArgs: 1, argsUsage: "<name>",
 		flags:   []*flag{cwd, help},
 		summary: "Show one server, and whether it connects.",
@@ -424,6 +485,15 @@ func Default() *Table {
 		flags:   []*flag{mcpScope, cwd, help},
 		summary: "Remove a server.",
 		about:   "When the name is kept in more than one place, -s says which."})
+	t.command(mcp, &command{name: "login", cmd: CmdMCPLogin, pri: 1, minArgs: 1, maxArgs: 1, argsUsage: "<name>",
+		flags:   []*flag{mcpNoBrowser, cwd, help},
+		summary: "Sign in to a server at a URL that wants it.",
+		about: "gnosh says the address to sign in at, and opens a browser there when it runs at a desktop (not over ssh, and never with --no-browser). " +
+			"When the browser cannot come back to this machine, paste the address it tried to open, and Enter. The sign-in is kept for every session."})
+	t.command(mcp, &command{name: "logout", cmd: CmdMCPLogout, pri: 1, minArgs: 1, maxArgs: 1, argsUsage: "<name>",
+		flags:   []*flag{cwd, help},
+		summary: "Forget the sign-in to a server at a URL.",
+		about:   "The authorization server is not told: the token it gave may still work until it runs out."})
 
 	t.command(root, &command{name: "help", cmd: CmdHelp, pri: 0, maxArgs: -1, argsUsage: "[command]",
 		flags: []*flag{help}, finish: finishHelp, afterAnything: true,

@@ -8,6 +8,7 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/agent"
 	"github.com/gnosh-ai/gnosh/internal/app/agentdef"
 	"github.com/gnosh-ai/gnosh/internal/app/skill"
+	"github.com/gnosh-ai/gnosh/internal/core"
 	"github.com/gnosh-ai/gnosh/internal/hooks"
 	"github.com/gnosh-ai/gnosh/internal/prompt"
 )
@@ -57,15 +58,21 @@ func (l *live) skillsToPreload(def agentdef.Def) ([]skill.Skill, string) {
 // preloadParts are the parts a session of the kind starts with, one for
 // each skill it preloads: the skill's text with no arguments and its
 // !`command` lines run, under a line of gnosh's that says whose it is.
-func (l *live) preloadParts(def agentdef.Def, sessionID string) ([]agent.Part, error) {
+// env is the agent's that starts with them: its commands are judged as
+// that agent's calls are, and run where it works.
+func (l *live) preloadParts(def agentdef.Def, env *core.ToolEnv) ([]agent.Part, error) {
 	skills, why := l.skillsToPreload(def)
 	if why != "" {
 		return nil, fmt.Errorf("%s", why)
 	}
 	var parts []agent.Part
 	for _, sk := range skills {
-		vars := skill.Vars{SessionID: sessionID, SkillDir: sk.Dir, ProjectDir: l.cfg.Paths.ProjectRoot, Effort: def.Effort}
-		text, err := l.injectCommands(sk, sk.Render("", vars))
+		vars := skill.Vars{SessionID: env.SessionID, SkillDir: sk.Dir, ProjectDir: l.cfg.Paths.ProjectRoot, Effort: def.Effort}
+		pieces, err := sk.Parts("", vars)
+		text := ""
+		if err == nil {
+			text, err = l.injectCommands(env, pieces)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("the skill %s, which the kind %q preloads, could not be made ready: %w", sk.Name, def.Name, err)
 		}
@@ -88,7 +95,7 @@ func (l *live) agentPreloaded() ([]agent.Part, error) {
 	if pre != nil {
 		return pre, nil
 	}
-	pre, err := l.preloadParts(*l.asAgent, l.ts.ID())
+	pre, err := l.preloadParts(*l.asAgent, l.env())
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +120,12 @@ func (l *live) agentHooks(def agentdef.Def, id string) (func(), error) {
 	where := firstOf(def.Source, "gnosh's own definition")
 	cfg, err := hooks.ParseConfig(def.Hooks, where+" (hooks)")
 	if err == nil {
+		// "once" is a skill's: in an agent's definition it is not read,
+		// as in Claude Code, so that the agent's guard is not gone after
+		// its first run.
+		for i := range cfg.Hooks {
+			cfg.Hooks[i].Once = false
+		}
 		if id == "" {
 			return none, l.hookErr(def, l.hooks.r.Add(cfg))
 		}

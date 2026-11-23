@@ -8,3 +8,8 @@ package shelltool
 func sessionProcs(sid int) ([]procInfo, error) {
 	return nil, errNoProcList
 }
+
+// procEnvHas cannot read another process's environment on this system.
+func procEnvHas(pid int, entry string) (bool, error) {
+	return false, errNoEnviron
+}

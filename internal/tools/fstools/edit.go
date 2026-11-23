@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -35,7 +36,7 @@ old_string must be in the file character for character: same indentation, same s
 
 old_string must pick out one place. If it is found more than once the call is refused: add surrounding lines until it is unique, or set replace_all to change every occurrence.
 
-The lines being changed must have been shown to this session by %[1]s, and the file must not have changed on disk since; otherwise the call is refused and says what to read. The file keeps its line endings (a line break in old_string matches LF and CRLF alike), its byte order mark and its permissions. When old_string is not found, the error says where the closest text is and how it differs.
+The lines being changed must have been shown to this session by %[1]s; otherwise the call is refused and says what to read. A file read whole that has changed on disk since may still be edited where old_string is found exactly once in it as it is now: the result then says the rest holds changes not yet seen. The file keeps its line endings (a line break in old_string matches LF and CRLF alike), its byte order mark and its permissions. When old_string is not found, the error says where the closest text is and how it differs.
 
 To make a new file or replace a whole one, use %[2]s.`,
 		o.ReadName, o.WriteName)
@@ -186,6 +187,12 @@ func (t *editTool) plan(call core.ToolCall, env *core.ToolEnv) (*change, *failur
 	if f := o.writable(o.EditName, &loc); f != nil {
 		return c, f
 	}
+	if strings.EqualFold(filepath.Ext(loc.abs), ".ipynb") {
+		// Read shows a notebook's cells, not its JSON, and a cell's text
+		// put into the JSON as it is breaks the file (the review of the
+		// day's code, 2026-11-20).
+		return c, failf("%s is a Jupyter notebook. Nothing was changed. Change its cells with %s.", loc.abs, o.NotebookEditName)
+	}
 	rec, known := sessionOf(env).record(loc.real)
 	if !known {
 		return c, failf("This session has not read %s. Nothing was changed. Read it with %s first, then edit.", loc.abs, o.ReadName)
@@ -201,7 +208,16 @@ func (t *editTool) plan(call core.ToolCall, env *core.ToolEnv) (*change, *failur
 		return c, failf("%s is %s, more than the %s that %s takes on. Nothing was changed. Use a shell command to change it.", loc.abs, byteSize(info.Size()), byteSize(o.EditMaxBytes), o.EditName)
 	}
 	c.old = info
-	if !rec.unchanged(info, content) {
+	// A file changed on disk since the session read it may still be
+	// edited where old_string matches it as it is now, once, as Claude
+	// Code lets it (its tools reference, "Edit tool behavior"): the edit
+	// touches that place alone and keeps the other changes, and the reply
+	// says they are there. Any other case is told to read it again.
+	c.stale = !rec.unchanged(info, content)
+	if c.stale && !rec.all {
+		// Of a file read only in part, the edit could land in lines never
+		// shown, which the same edit of the unchanged file is refused for
+		// (the review of the day's code, 2026-11-20).
 		return c, staleFailure(o, &loc)
 	}
 	if looksBinary(content) {
@@ -224,6 +240,9 @@ func (t *editTool) plan(call core.ToolCall, env *core.ToolEnv) (*change, *failur
 
 	starts := findAll(view.text, oldLF)
 	if len(starts) == 0 {
+		if c.stale {
+			return c, staleFailure(o, &loc)
+		}
 		return c, missingText(o, &loc, view.text, oldLF, len(view.cr) > 0)
 	}
 
@@ -241,13 +260,28 @@ func (t *editTool) plan(call core.ToolCall, env *core.ToolEnv) (*change, *failur
 		at = s
 		c.edits = append(c.edits, lineEdit{first: line, last: line + spanLines, delta: delta})
 	}
+	if len(starts) > 1 && c.stale {
+		// (Of a changed file only one place, plainly picked out: every
+		// place, with replace_all, may lie in lines never shown.)
+		return c, staleFailure(o, &loc)
+	}
 	if len(starts) > 1 && !all {
 		return c, failf("old_string is found %d times in %s (at %s). Nothing was changed. Add more of the surrounding text to old_string so that it picks out one place, or set replace_all to true to change every one.",
 			len(starts), loc.abs, editLines(c.edits, false))
 	}
+	if len(starts) == 1 && !all && strings.Contains(view.text[starts[0]+1:], oldLF) {
+		// It is found once more where it overlaps the first place ("aba"
+		// in "ababa"), which findAll steps over: that is two places too,
+		// and the edit would have gone to the first unasked (the
+		// Edit/Write review of 2026-11-19).
+		return c, failf("old_string is found more than once in %s, at places that overlap (from %s on). Nothing was changed. Add more of the surrounding text to old_string so that it picks out one place.",
+			loc.abs, editLines(c.edits, false))
+	}
 	var unseen []lineEdit
 	for _, e := range c.edits {
-		if !rec.sees(span{e.first, e.last}) {
+		// (Of a changed file the lines seen are where they were: the
+		// match on the file as it is now is what counts.)
+		if !c.stale && !rec.sees(span{e.first, e.last}) {
 			unseen = append(unseen, e)
 		}
 	}
@@ -306,6 +340,7 @@ func (t *editTool) Describe(call core.ToolCall, env *core.ToolEnv) (core.Action,
 	if f != nil {
 		return core.Action{Kind: core.ActionEdit, Paths: c.loc.paths(), Summary: c.summary}, f
 	}
+	t.sys.judge(call.ID, c.loc.real)
 	return c.action(), nil
 }
 
@@ -332,6 +367,9 @@ func (t *editTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEn
 	if c.loc.real != where.real {
 		return refused(failf("%s leads somewhere else than it did a moment ago (%s, not %s). Nothing was changed. Run the call again if that is what you mean.", c.loc.abs, c.loc.real, where.real))
 	}
+	if was, moved := t.sys.judgedElsewhere(call.ID, c.loc.real); moved {
+		return refused(failf("%s leads somewhere else than when the call was looked at (%s, not %s): a link or a folder on the way changed in between. Nothing was changed. Run the call again if that is what you mean.", c.loc.abs, c.loc.real, was))
+	}
 	if err := ctx.Err(); err != nil {
 		return core.ToolResult{}, fmt.Errorf("%s of %s stopped before anything was changed: %w", o.EditName, c.loc.abs, context.Cause(ctx))
 	}
@@ -346,22 +384,37 @@ func (t *editTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEn
 	// The session has seen what it had seen before, moved to where those
 	// lines now are, and it has seen the text it put in.
 	lines := lineCount(strings.TrimPrefix(c.after, utf8BOM))
-	seen := []span(nil)
-	if !c.rec.all {
+	seen, all := []span(nil), c.rec.all
+	switch {
+	case c.stale:
+		// Of a file that had changed, only the text the edit put in is
+		// known: the rest is to be read again before an edit there.
+		all = false
+		for i, e := range c.edits {
+			seen = addSpan(seen, span{c.lines[i], max(c.lines[i], c.lines[i]+(e.last-e.first)+e.delta)})
+		}
+	case !c.rec.all:
 		seen = shiftSpans(c.rec.seen, c.edits)
 	}
-	sessionOf(env).wrote(c.loc.real, info, sha256.Sum256([]byte(c.after)), c.rec.all, seen, lines)
+	sessionOf(env).wrote(c.loc.real, info, sha256.Sum256([]byte(c.after)), all, seen, lines)
 
 	var text strings.Builder
 	fmt.Fprintf(&text, "Edited %s%s: %s, at %s", c.loc.abs, c.loc.viaLink(), countOf(c.count, "replacement", "replacements"), newLines(c.lines))
-	if inPlace {
-		text.WriteString(". The file was overwritten where it is, because its directory did not allow replacing it in one step")
+	if inPlace != "" {
+		text.WriteString(". The file was overwritten where it is, because " + inPlace)
+	} else if n := otherNames(c.old); n > 0 {
+		// Replaced by a new file, its other names keep the old content:
+		// said, as nothing else would (the Edit/Write review of 2026-11-19).
+		text.WriteString(fmt.Sprintf(". It had %s by hard links, which still hold the old content", countOf(n, "other name", "other names")))
 	}
 	if snippet := t.snippet(c); snippet != "" {
 		text.WriteString(". ")
 		text.WriteString(snippet)
 	} else {
 		text.WriteString(".")
+	}
+	if c.stale {
+		text.WriteString(" " + c.loc.abs + " had changed on disk since this session last read it: the edit went where old_string matches it as it is now, and the rest of the file holds changes this session has not seen. Read it again before an edit that depends on what is around it.")
 	}
 	res := core.TextResult(text.String())
 	res.Display = c.display()
@@ -374,7 +427,7 @@ func (t *editTool) Run(ctx context.Context, call core.ToolCall, env *core.ToolEn
 	if c.loc.real != c.loc.abs {
 		res.Meta["realPath"] = c.loc.real
 	}
-	if inPlace {
+	if inPlace != "" {
 		res.Meta["inPlace"] = true
 	}
 	return res, nil

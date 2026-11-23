@@ -5,9 +5,12 @@ import (
 	"maps"
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/gnosh-ai/gnosh/internal/envscrub"
 )
 
 // The time limits of a model request when nothing sets them (LM-1, LM-2,
@@ -74,7 +77,7 @@ func (ld *loader) finish() *Config {
 			continue
 		}
 		flags.add(op{kind: KindAddDir, text: "additional directory " + dir, origin: o, feature: FeaturePermissions, what: "an additional directory",
-			apply: func(b *builder) { addItem(&b.dirs, dir, o) }})
+			apply: func(b *builder) { b.addDir(dir, o) }})
 	}
 	for _, o := range flags.ops {
 		b.run(o)
@@ -93,6 +96,7 @@ func (ld *loader) finish() *Config {
 		cfg.Models = append(cfg.Models, *m)
 	}
 	cfg.Large, cfg.Small = b.large, b.small
+	cfg.Fallback = b.fallback
 	cfg.Options = b.opts
 	cfg.Hosts = b.hosts
 	ld.probs.list = append(ld.probs.list, checkHosts(cfg.Hosts)...)
@@ -108,6 +112,11 @@ func (ld *loader) finish() *Config {
 	default:
 		cfg.Hooks = b.hooks
 	}
+	cfg.HTTPHookURLs, cfg.HTTPHookEnvVars = b.hookURLs.list(), b.hookEnvVars.list()
+	cfg.Sandbox = b.sandbox.finish()
+	if envscrub.On([]string{envscrub.Var + "=" + ld.env[envscrub.Var]}) {
+		cfg.Sandbox.scrub(runtime.GOOS)
+	}
 	if b.statusLine.Set {
 		switch {
 		case cfg.Switches.SafeMode.V:
@@ -117,6 +126,21 @@ func (ld *loader) finish() *Config {
 		default:
 			sl := b.statusLine.V
 			cfg.StatusLine = &sl
+		}
+	}
+	cfg.Attribution = b.attribution.V
+	if !cfg.Switches.SafeMode.V {
+		cfg.LSPServers = ld.lspServerList()
+	}
+	if b.fileSuggestion.Set {
+		switch {
+		case cfg.Switches.SafeMode.V:
+			cfg.FileSuggestionOff = "safe mode"
+		case b.hooksOff.V:
+			cfg.FileSuggestionOff = "disableAllHooks in " + b.hooksOff.Origin.String()
+		default:
+			fs := b.fileSuggestion.V
+			cfg.FileSuggestion = &fs
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(b.env)) {
@@ -138,14 +162,16 @@ func (ld *loader) finish() *Config {
 		Off:            cfg.Switches.SafeMode.V,
 		ProjectNames:   slices.Clone(contextNames),
 		LocalNames:     slices.Clone(contextLocalNames),
+		DotDirs:        []string{".gnosh", ".claude"},
 		Cwd:            in.Cwd,
 		ProjectRoot:    in.ProjectRoot,
 		Extra:          b.opts.ProjectInstructionFiles,
+		Exclude:        b.opts.ClaudeMdExcludes,
 		ImportDepth:    contextImportDepth,
 		MaxFileBytes:   contextMaxFileBytes,
 		NestedMaxChars: contextNestedMaxChars,
 	}
-	cfg.Context.Global = []ListItem{{V: filepath.Join(ld.paths.ConfigDir, "GNOSH.md")}, {V: ld.agentsFile}}
+	cfg.Context.Global = []ListItem{{V: filepath.Join(ld.paths.ConfigDir, "GNOSH.md")}, {V: filepath.Join(ld.paths.ConfigDir, "rules")}, {V: ld.agentsFile}}
 	cfg.Context.Global = append(cfg.Context.Global, b.opts.UserInstructionFiles...)
 
 	cfg.BadEnv = ld.badEnv
@@ -304,6 +330,42 @@ func (ld *loader) models() {
 			sl.Thinking.V = "on"
 		}
 	}
+	ld.fallbacks()
+}
+
+// fallbacks settles "fallbackModel", which --fallback-model outranks, and
+// checks that each model it names is on a provider that is configured.
+func (ld *loader) fallbacks() {
+	in, b := ld.in, ld.b
+	if text := strings.TrimSpace(in.Flags.FallbackModel); text != "" {
+		o := flagOrigin("--fallback-model")
+		var refs []ModelRef
+		ok := true
+		for name := range strings.SplitSeq(text, ",") {
+			ref, good := ld.modelFlag("--fallback-model", name)
+			ok = ok && good
+			if good && !slices.Contains(refs, ref) {
+				refs = append(refs, ref)
+			}
+		}
+		if len(refs) > MaxFallbacks {
+			ld.probs.at(Error, o, "--fallback-model names %d models, and a turn falls back to %d at most. Keep the ones to try first.", len(refs), MaxFallbacks)
+			ok = false
+		}
+		if ok {
+			b.fallback.put(refs, o)
+		}
+	}
+	for _, ref := range b.fallback.V {
+		p := b.provider(ref.Provider)
+		switch {
+		case ref.Provider == "":
+		case p == nil:
+			ld.probs.at(Error, b.fallback.Origin, "the fallback model %s is on a provider that is not configured. The providers are: %s.%s", ref, b.providerIDs(), ld.heldNote())
+		case p.ListModels.Set && !p.ListModels.V && b.model(ref) == nil:
+			ld.probs.at(Error, b.fallback.Origin, "the fallback model %s is not one provider %s lists, and that provider is set not to ask its server (\"listModels\": false). Register the model under \"models\", as %q: {}, or name another.", ref, ref.Provider, ref.String())
+		}
+	}
 }
 
 // providers completes each provider: its addresses and their time limits,
@@ -320,7 +382,7 @@ func (ld *loader) providers(limits Limits) {
 		for i := range p.Endpoints {
 			e := &p.Endpoints[i]
 			e.URL = apiRoot(e.Given, t)
-			e.Display = displayURL(e.URL)
+			e.Display = DisplayURL(e.URL)
 			if u, err := url.Parse(e.URL); err == nil {
 				e.Local = IsLocal(u.Hostname())
 			}
@@ -393,7 +455,21 @@ func (ld *loader) timeouts(local bool, limits Limits) Timeouts {
 // permissions settles the starting mode and gathers the rules.
 func (ld *loader) permissions() Permissions {
 	in, b := ld.in, ld.b
-	perm := Permissions{Dirs: b.dirs, BypassDisabled: b.bypassDisabled, DenyInsteadOfPrompting: b.denyInstead}
+	perm := Permissions{Dirs: b.dirs, BypassDisabled: b.bypassDisabled, DenyInsteadOfPrompting: b.denyInstead,
+		BlockReads: b.blockReads, BlockWrites: b.blockWrites}
+	for _, d := range b.dirs {
+		// The project's only when no file or flag of the person's named it
+		// too: --add-dir and the person's own files are read after the
+		// project's gnosh.json, which named it first (the blocks review of
+		// 2026-11-20).
+		mine := false
+		for _, o := range b.dirNamed[d.V] {
+			mine = mine || o.File == "" || !slices.Contains(ld.projectFiles, o.File)
+		}
+		if !mine {
+			perm.ProjectDirs = append(perm.ProjectDirs, d.V)
+		}
+	}
 	for _, l := range b.layers {
 		if len(l.Allow)+len(l.Ask)+len(l.Deny) > 0 {
 			perm.Layers = append(perm.Layers, *l)
@@ -526,6 +602,19 @@ func (p Permissions) Rules(which string) []Rule {
 		}
 	}
 	return out
+}
+
+// EnvEntry returns what the env block of the settings files gives a
+// variable, with the file it came from, and whether it gives one: Claude
+// Code sets its own process's environment from that block, so its
+// variables may come from there as well as from the shell.
+func (c *Config) EnvEntry(name string) (EnvVar, bool) {
+	for _, v := range c.Env {
+		if v.Name == name {
+			return v, true
+		}
+	}
+	return EnvVar{}, false
 }
 
 // CommandEnv returns the env block in the form a command's environment is

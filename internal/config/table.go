@@ -86,15 +86,23 @@ var topKeys = []keyDef{
 	{"models", "", "what gnosh should know about a model, under \"<provider>/<model id>\"", fromPlain},
 	{"model", "", "the session's model: \"<provider>/<model id>\", or an object that also says how it is asked", fromClaudeCode + ": the settings key"},
 	{"smallModel", "", "the model for the short side jobs (titles, summaries, checks); the session's model does them when none is named", fromPlain + ", after \"model\""},
+	{"fallbackModel", "", "the models a turn goes on with when the session's model cannot answer: \"<provider>/<model id>\", or a list of up to three, tried in order", fromClaudeCode + ": the settings key"},
 	{"hosts", FeatureHosts, "other machines the model may run commands on, each under a name", fromPlain},
 	{"options", "", "gnosh's own switches and limits", fromPlain},
 	{"permissions", FeaturePermissions, "allow, ask and deny rules, the starting mode, more directories", fromClaudeCode + ": the settings key"},
 	{"hooks", FeatureHooks, "hooks, in Claude Code's shape", fromClaudeCode + ": the settings key"},
 	{"env", FeatureEnv, "variables for the commands and hooks gnosh starts", fromClaudeCode + ": the settings key"},
 	{"disableAllHooks", "", "switch every hook off", fromClaudeCode + ": the settings key"},
+	{"allowedHttpHookUrls", FeatureHooks, "the URL patterns an http hook may post to (* is any run of characters); every file's list is merged, and an empty one lets none", fromClaudeCode + ": the settings key"},
+	{"httpHookAllowedEnvVars", FeatureHooks, "the variables an http hook's headers may take, beside the hook's own allowedEnvVars; every file's list is merged", fromClaudeCode + ": the settings key"},
 	{"agent", "", "the kind of agent the session runs as: its prompt, its tools and its model", fromClaudeCode + ": the settings key"},
 	{"statusLine", "", "a command whose output is the status line under the prompt", fromClaudeCode + ": the settings key"},
+	{"fileSuggestion", "", "a command that offers the paths an @ mention completes to, in place of gnosh's own search", fromClaudeCode + ": the settings key"},
+	{"attribution", "", "the lines the model ends its commits' messages and its pull requests' descriptions with: {\"commit\": ..., \"pr\": ...}; none by default", fromClaudeCode + ": the settings key"},
+	{"includeCoAuthoredBy", "", "Claude Code's older word for leaving its attribution out: taken, and changes nothing, as gnosh adds none of its own", fromClaudeCode + ": the settings key"},
 	{"skillOverrides", "", "how far each skill is seen, by its name: on, name-only, user-invocable-only or off", fromClaudeCode + ": the settings key"},
+	{"sandbox", "", "run the shell's commands in the operating system's sandbox (bubblewrap, Seatbelt): {\"enabled\": true, \"autoAllowBashIfSandboxed\": true, \"excludedCommands\": [...], \"filesystem\": {\"allowWrite\": [...], \"denyRead\": [...]}}", fromClaudeCode + ": the settings key"},
+	{"lspServers", "", "language servers, each under a name, with the files they are for: diagnostics after edits, and the LSP tool", fromClaudeCode + ": a plugin's .lsp.json and manifest key"},
 	{"$schema", "", "accepted and not read", fromClaudeCode + ": the settings key"},
 }
 
@@ -116,6 +124,7 @@ var modelFields = []keyDef{
 	{"contextWindow", "", "the model's window, in tokens", fromAPIs + ": the context window"},
 	{"maxOutputTokens", "", "the reply limit sent with a request", fromAPIs + ": the max output tokens, and Claude Code's CLAUDE_CODE_MAX_OUTPUT_TOKENS"},
 	{"thinkingLevels", "", "the model's thinking levels, the least thinking first; an empty list says it has no switch", fromPlain},
+	{"thinkingBudget", "", "the most tokens the model may think before a reply, 0 for no cap; 4096 for a llama.cpp server's model when not given", fromClaudeCode + ": its MAX_THINKING_TOKENS, for one model"},
 }
 
 // slotFields is every field of "model" and "smallModel" written as an
@@ -142,32 +151,28 @@ var permissionKeys = []keyDef{
 	{"disableBypassPermissionsMode", FeaturePermissions, "\"disable\" forbids skipping permissions", fromClaudeCode},
 	{"disableAutoMode", "", "\"disable\"; gnosh has no auto mode, so it changes nothing", fromClaudeCode},
 	{"denyInsteadOfPrompting", FeaturePermissions, "refuse what would ask; not from a project's file", fromClaudeCode},
+	{"blockReadsOutsideWorkingDirectories", FeaturePermissions, "true: Read, Grep and Glob refuse paths outside the working directories, in every mode", fromClaudeCode},
+	{"blockWritesOutsideWorkingDirectories", FeaturePermissions, "true: Write, Edit and NotebookEdit refuse paths outside the working directories, in every mode", fromClaudeCode},
 }
 
 // claudeCodeKeys are the settings keys Claude Code documents that gnosh
 // has not built (spec/cc/settings.md). One of them in a config file stops
 // startup like any other key gnosh does not read, and the message says
-// whose key it is. The two that gnosh has under "options", with Claude
+// whose key it is. Those that gnosh has under "options", with Claude
 // Code's names and meaning, are in the options table instead.
 var claudeCodeKeys = []string{
-	"cleanupPeriodDays", "attribution", "includeCoAuthoredBy", "includeGitInstructions",
-	"fileCheckpointingEnabled", "viewMode", "respondToBashCommands",
-	"respectGitignore", "fileSuggestion", "claudeMdExcludes", "askUserQuestionTimeout",
-	"bashOutputMaxChars", "showTurnDuration", "language", "spinnerVerbs", "spinnerTipsEnabled",
+	"cleanupPeriodDays",
+	"spinnerVerbs", "spinnerTipsEnabled",
 	"skipDangerousModePermissionPrompt",
-	"effortLevel", "fallbackModel", "alwaysThinkingEnabled", "showThinkingSummaries", "plansDirectory",
-	"autoMemoryEnabled", "autoMemoryDirectory", "idleCompaction", "tui", "theme", "enabledMcpjsonServers",
+	"effortLevel", "alwaysThinkingEnabled", "showThinkingSummaries", "plansDirectory",
+	"autoMemoryEnabled", "autoMemoryDirectory", "idleCompaction", "tui", "enabledMcpjsonServers",
 	"disabledMcpjsonServers", "enableAllProjectMcpServers", "allowedMcpServers", "deniedMcpServers",
-	"allowedHttpHookUrls", "httpHookAllowedEnvVars", "worktree", "sandbox",
+	"worktree",
 	"apiKeyHelper", "awsAuthRefresh", "forceLoginMethod", "allowedProviders", "availableModels", "modelPicker",
 	"modelPricing", "advisorModel", "fastMode", "enabledPlugins", "extraKnownMarketplaces",
 	"strictKnownMarketplaces", "pluginConfigs", "feedbackDrafts", "feedbackSurveyRate", "autoMode",
 	"useAutoModeDuringPlan",
 }
-
-// claudeCodePermissionKeys are the keys of Claude Code's permissions object
-// that gnosh has not built (spec/cc/permissions.md).
-var claudeCodePermissionKeys = []string{"blockReadsOutsideWorkingDirectories", "blockWritesOutsideWorkingDirectories"}
 
 // providerType describes one value of a provider's "type".
 type providerType struct {
@@ -230,7 +235,7 @@ type hookEvent struct {
 	blocks bool
 }
 
-// hookEvents is the nineteen events, in the spec's order. Names are exact:
+// hookEvents is the events gnosh has, in the spec's order. Names are exact:
 // no other letter case and no underscore form is an event.
 var hookEvents = []hookEvent{
 	{"PreToolUse", "the tool's name", true},
@@ -248,10 +253,16 @@ var hookEvents = []hookEvent{
 	{"InstructionsLoaded", "the load reason", false},
 	{"PermissionRequest", "the tool's name", false},
 	{"Notification", "the type", false},
+	{"PreModelSwitch", "the model switched to", true},
 	{"PostModelSwitch", "the model switched to", false},
 	{"DirectoryAdded", "the source", false},
 	{"CwdChanged", "", false},
 	{"UserPromptExpansion", "the command's name", true},
+	{"ConfigChange", "the source", true},
+	{"PostToolBatch", "", true},
+	{"FileChanged", "the file's name", false},
+	{"Elicitation", "the MCP server's name", true},
+	{"ElicitationResult", "the MCP server's name", true},
 }
 
 // HookEventNames returns the names of the hook events gnosh knows, in the
@@ -311,12 +322,21 @@ var hookFields = map[string]string{
 	"server":         "",
 	"tool":           "",
 	"input":          "",
+	// The fields of a prompt hook (prompt and model those of an agent hook
+	// too).
+	"prompt":          "",
+	"model":           "",
+	"continueOnBlock": "",
 }
 
-// hookFieldSame is the one value each "same" field may have.
-var hookFieldSame = map[string]string{
-	"shell":     `"bash"`,
-	"onFailure": `"continue"`,
+// hookFieldSame is the values each "same" field may have: what gnosh does
+// anyway. A hook that fails blocks in gnosh, whatever "onFailure" says:
+// "block" says just that, and "continue", Claude Code's default, is taken
+// as leaving the field out. ("block" stopped startup, though Claude Code's
+// command, http and mcp_tool hooks take it: Claude Code 2.1.328.)
+var hookFieldSame = map[string][]string{
+	"shell":     {`"bash"`},
+	"onFailure": {`"continue"`, `"block"`},
 }
 
 // permissionModes is every mode a session can start in. "manual" is

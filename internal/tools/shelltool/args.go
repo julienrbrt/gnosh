@@ -22,6 +22,7 @@ type bashArgs struct {
 	host        *Host         // the machine it is for; nil for this one
 	spool       int64         // how much of its output its file may hold, when that is not Options.MaxSpoolBytes; 0 for that
 	watch       bool          // a Monitor's: what it prints is passed on as it comes
+	sandboxed   bool          // it runs inside the sandbox (Options.Sandbox)
 }
 
 // summary is the one line that says what the call would do: the model's
@@ -80,6 +81,11 @@ func (m *Manager) bashArgs(raw json.RawMessage) (bashArgs, error) {
 	if err := unknownArg(fields); err != nil {
 		return a, err
 	}
+	leave, err := boolField(fields, argNoSandbox)
+	if err != nil {
+		return a, err
+	}
+	a.sandboxed = m.sandboxes(a.command, a.host, leave)
 
 	// A foreground command always has a limit. A background one has one
 	// only if the model or the options give it one. A timeout over the
@@ -221,4 +227,12 @@ func millisField(fields map[string]json.RawMessage, name string) (time.Duration,
 		return year, nil
 	}
 	return time.Duration(math.Ceil(ms)) * time.Millisecond, nil
+}
+
+// sandboxes reports whether a command runs inside the sandbox: a command
+// on this machine, when there is a sandbox, but one it says runs outside
+// (excludedCommands, or the model's asking, where that is let).
+func (m *Manager) sandboxes(command string, host *Host, leave bool) bool {
+	sb := m.opt.Sandbox
+	return sb != nil && host == nil && (sb.Outside == nil || !sb.Outside(command, leave && sb.Unsandboxed))
 }

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"reflect"
 	"strings"
@@ -137,7 +138,7 @@ func TestShellLineOfThePersonsOwn(t *testing.T) {
 			return 1
 		}
 		start := find(f, "the long command's start", func(e *agent.ToolStartEvent) bool { return strings.Contains(string(e.Input), "sleep 30") })
-		if !c.Background(start.CallID) {
+		if !c.Background(start.CallID, start.Name) {
 			t.Error("the running command could not be moved to the background")
 		}
 		end := find(f, "the long command's call to return", func(e *agent.ToolEndEvent) bool { return e.CallID == start.CallID })
@@ -152,7 +153,7 @@ func TestShellLineOfThePersonsOwn(t *testing.T) {
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
-		if c.Background("no-such-call") {
+		if c.Background("no-such-call", "Read") {
 			t.Error("Background found a command for a call that is not there")
 		}
 		_ = c.Wait(ctx)
@@ -377,4 +378,30 @@ func TestShowPastOnResume(t *testing.T) {
 	r := run(t, w, "-c", "-p", "-y", "run it")
 	r.wantCode(t, 0)
 	has(t, "a command run in a session opened with -c", toolResult(t, w, len(w.Model.Requests())-1, "c1"), "restarted=unset")
+}
+
+// A command of several lines is asked about as it is written: the prompt
+// mark on each line where a command starts, the text of a here-document
+// set under its first line, tabs as tabs, and every other control
+// character escaped.
+func TestPermissionQuestionShowsAManyLineCommand(t *testing.T) {
+	cmd := "cat > a.go <<'EOF'\npackage a\n\nfunc F() {\n\treturn\n}\nEOF\necho \x1b[2Jdone"
+	args, _ := json.Marshal(map[string]string{"command": cmd})
+	w := apptest.NewWorld(t, apptest.Reply{Calls: []apptest.Call{{ID: "c1", Name: "Bash", Args: string(args)}}}, apptest.Reply{Text: "Left it."})
+	var q agent.Question
+	_, r := attach(t, w, nil, func(ctx context.Context, c SessionControls, f *scripted) int {
+		if _, err := c.Submit(agent.Prompt{Text: "write it"}); err != nil {
+			return 1
+		}
+		q = find(f, "the question", func(e *agent.QuestionEvent) bool { return true }).Question
+		if err := c.Answer(q.ID, agent.Answer{Choice: "no", Text: "not now"}); err != nil {
+			t.Errorf("Answer: %v", err)
+		}
+		_ = c.Wait(ctx)
+		c.Quit("prompt_input_exit")
+		return 0
+	})
+	r.wantCode(t, 0)
+	has(t, "the question", q.Text, "  $ cat > a.go <<'EOF'\n    package a\n    \n    func F() {\n    \treturn\n    }\n    EOF\n  $ echo \\x1b[2Jdone\n")
+	hasNot(t, "the question", q.Text, "$ package", `\x09`, "\x1b")
 }

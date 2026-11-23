@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // started is a server for a test: a register with one video and one
@@ -57,7 +58,7 @@ func TestServerServesDeliveredFiles(t *testing.T) {
 	if got := header.Get("Content-Type"); got != "video/mp4" {
 		t.Errorf("the video is served as %q", got)
 	}
-	for name, want := range map[string]string{"X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Cache-Control": "no-cache", "Accept-Ranges": "bytes"} {
+	for name, want := range map[string]string{"X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Cache-Control": "no-store", "Accept-Ranges": "bytes"} {
 		if got := header.Get(name); got != want {
 			t.Errorf("%s is %q, want %q", name, got, want)
 		}
@@ -70,9 +71,10 @@ func TestServerServesDeliveredFiles(t *testing.T) {
 	if status != http.StatusOK || header.Get("Content-Type") != "image/png" || body != pngHead+"the bytes of an image" {
 		t.Errorf("the image: %d, %q, %q", status, header.Get("Content-Type"), body)
 	}
-	// The token alone finds the file too.
-	if status, _, body := fetch(t, http.MethodGet, s.srv.base+"/"+s.image.Token); status != http.StatusOK || !strings.HasPrefix(body, pngHead) {
-		t.Errorf("by its token alone: %d %q", status, body)
+	// The token alone is no address: a service worker there could claim
+	// every address on the origin.
+	if status, _, _ := fetch(t, http.MethodGet, s.srv.base+"/"+s.image.Token); status != http.StatusNotFound {
+		t.Errorf("by its token alone: %d", status)
 	}
 
 	// HEAD: the same headers, and no body.
@@ -314,4 +316,126 @@ func TestServerReadsTheRegisterBack(t *testing.T) {
 	if status, _, _ := fetch(t, http.MethodGet, stranger.base+"/"+s.video.Token+"/ad.mp4"); status != http.StatusNotFound {
 		t.Errorf("a server with another key served the file: %d", status)
 	}
+}
+
+// The server shares its origin with every service of this machine's
+// loopback: a page or a picture that can run a script is served
+// sandboxed, a service worker is never served, and a request that names
+// another host (a page of another site that rebinds its name to this
+// machine) is not answered (the deliverables review of 2026-11-19).
+func TestServerKeepsItsOriginSafe(t *testing.T) {
+	s := startServer(t)
+	page := file(t, "report.html", "<script>fetch('http://127.0.0.1:9/')</script>")
+	rec, err := s.reg.add(t.Context(), "", page, page, "the report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, header, _ := fetch(t, http.MethodGet, s.srv.address(rec))
+	if got := header.Get("Content-Security-Policy"); !strings.HasPrefix(got, "sandbox allow-scripts") || strings.Contains(got, "allow-same-origin") {
+		t.Errorf("the page's policy: %q", got)
+	}
+	if _, header, _ := fetch(t, http.MethodGet, s.srv.address(s.image)); header.Get("Content-Security-Policy") != "" {
+		t.Errorf("a PNG was given a policy: %q", header.Get("Content-Security-Policy"))
+	}
+	if status, _, _ := fetch(t, http.MethodGet, s.srv.address(rec), "Service-Worker", "script"); status != http.StatusForbidden {
+		t.Errorf("a service worker's fetch: %d", status)
+	}
+	host := func(h string) int {
+		req, err := http.NewRequest(http.MethodGet, s.srv.address(s.image), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = h
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	for h, want := range map[string]int{"evil.example": http.StatusMisdirectedRequest, "evil.example:7777": http.StatusMisdirectedRequest,
+		"localhost:9999": http.StatusOK, "127.0.0.1:7777": http.StatusOK, "[::1]:7777": http.StatusOK, "127.0.0.2": http.StatusOK} {
+		if got := host(h); got != want {
+			t.Errorf("Host %s: %d, want %d", h, got, want)
+		}
+	}
+}
+
+// A delivered file whose folder has since become a link is not served:
+// what was delivered is the file as its links were then (the deliverables
+// review of 2026-11-19).
+func TestServerRefusesAPathThatLeadsElsewhereNow(t *testing.T) {
+	s := startServer(t)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "out")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	page := filepath.Join(dir, "report.txt")
+	if err := os.WriteFile(page, []byte("the report"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.reg.add(t.Context(), "", page, page, "the report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _, body := fetch(t, http.MethodGet, s.srv.address(rec)); status != http.StatusOK || body != "the report" {
+		t.Fatalf("before: %d %q", status, body)
+	}
+	other := filepath.Join(root, "other")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "report.txt"), []byte("not the report"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, dir); err != nil {
+		t.Skip("no links here:", err)
+	}
+	if status, _, body := fetch(t, http.MethodGet, s.srv.address(rec)); status != http.StatusNotFound || strings.Contains(body, "not the report") {
+		t.Errorf("after its folder became a link: %d %q", status, body)
+	}
+}
+
+// The server holds a fixed number of connections at once: one more waits
+// until one closes, and is then answered.
+func TestServerHoldsSoManyConnections(t *testing.T) {
+	defer func(n int) { maxConns = n }(maxConns)
+	maxConns = 2
+	s := startServer(t)
+	addr := strings.TrimPrefix(s.srv.base, "http://")
+	var held []net.Conn
+	for range 2 {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, c)
+	}
+	got := make(chan int, 1)
+	go func() {
+		status, _, _ := fetch(t, http.MethodGet, s.srv.address(s.image))
+		got <- status
+	}()
+	select {
+	case status := <-got:
+		t.Fatalf("a third connection was answered (%d) while two were held", status)
+	case <-time.After(300 * time.Millisecond):
+	}
+	held[0].Close()
+	select {
+	case status := <-got:
+		if status != http.StatusOK {
+			t.Errorf("once a slot was free: %d", status)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the waiting connection was never answered")
+	}
+	held[1].Close()
 }

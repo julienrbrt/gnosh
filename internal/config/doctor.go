@@ -2,11 +2,30 @@ package config
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/gnosh-ai/gnosh/internal/execpath"
 )
+
+// givenPath is the PATH a program gnosh starts is given, when it is not
+// gnosh's own: the program's own env's, else the settings' env block's.
+func givenPath(cfg *Config, own map[string]string) (string, bool) {
+	if p, ok := own["PATH"]; ok {
+		return p, true
+	}
+	for _, v := range slices.Backward(cfg.Env) {
+		if v.Name == "PATH" && !v.Value.Empty() {
+			return v.Value.Reveal(), true
+		}
+	}
+	return "", false
+}
 
 // Level says how much a doctor finding matters.
 type Level int
@@ -75,6 +94,11 @@ type Probes struct {
 	LookPath func(name string) (string, error)
 	// Exists reports whether a file is there.
 	Exists func(path string) bool
+	// Sandbox tries the operating system's sandbox once: whether it can
+	// run here, why not, the program that makes it, and what it cannot do
+	// here that it does elsewhere (an old bubblewrap). Nil: it is not
+	// looked at.
+	Sandbox func() (ok bool, why, tool, weaker string)
 	// TryHost logs in to a declared host and runs nothing there. It
 	// returns the directory a command would start in, or, when a command
 	// could not be run there, why not in plain words. It reaches another
@@ -309,6 +333,69 @@ func Doctor(ctx context.Context, cfg *Config, problems []Problem, pr Probes) []F
 	// connected to, as a provider's is, and is sent nothing: an embedding
 	// server holds a model, which nothing of doctor's may disturb.
 	add("tools", Fine, "file search (Glob, Grep) is gnosh's own and needs no outside program.")
+	// Read gives a PDF's text with poppler's two programs, where they are
+	// installed: without them a PDF is not read, which is worth knowing
+	// before a model is asked to read one.
+	if pr.LookPath != nil {
+		_, info := pr.LookPath("pdfinfo")
+		_, text := pr.LookPath("pdftotext")
+		if info == nil && text == nil {
+			add("tools", Fine, "PDFs are read as text: poppler's pdfinfo and pdftotext are installed.")
+		} else {
+			add("tools", Note, "PDFs are not read as text: Read takes it with poppler's pdfinfo and pdftotext, which are not installed (apt install poppler-utils; brew install poppler).")
+		}
+	}
+	// The sandbox, when the settings turn it on.
+	if cfg.Sandbox.Enabled && pr.Sandbox != nil {
+		switch ok, why, tool, weaker := pr.Sandbox(); {
+		case ok:
+			auto := "each asks as it would without it"
+			switch {
+			case cfg.Sandbox.AutoAllow && cfg.Sandbox.Loose("filesystem.disabled"):
+				auto = "each asks as it would without it, autoAllowBashIfSandboxed or not, as the files are left open (filesystem.disabled)"
+			case cfg.Sandbox.AutoAllow:
+				auto = "they run without asking (autoAllowBashIfSandboxed)"
+			}
+			add("tools", Fine, "the sandbox is on: the shell's commands run in it (%s), and %s. (%s)", tool, auto, cfg.Sandbox.Origin)
+			if weaker != "" {
+				add("tools", Note, "the sandbox here: %s.", weaker)
+			}
+		case cfg.Sandbox.FailIfUnavailable:
+			add("tools", Fail, "the sandbox is on, with failIfUnavailable, and cannot run here: %s. (%s)", why, cfg.Sandbox.Origin)
+		default:
+			add("tools", Note, "the sandbox is on and cannot run here: %s; commands run outside it, asking as they would without it. (%s)", why, cfg.Sandbox.Origin)
+		}
+	}
+	// The language servers (lspServers): each one's program, found as it
+	// would be started, and that they wait for the folder's trust.
+	for _, srv := range cfg.LSPServers {
+		if pr.LookPath == nil {
+			break
+		}
+		exts := strings.Join(slices.Sorted(maps.Keys(srv.Extensions)), " ")
+		// (LookPath takes a path from / as itself, as exec does.)
+		find := pr.LookPath
+		if path, ok := givenPath(cfg, srv.Env); ok {
+			find = func(name string) (string, error) {
+				// (Find takes a path from / as it is written: whether a
+				// program is there is looked at here.)
+				if p, ok := execpath.Find(name, []string{"PATH=" + path}, ""); ok {
+					if info, err := os.Stat(p); err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+						return p, nil
+					}
+				}
+				return "", errors.New("not on the PATH it is given")
+			}
+		}
+		switch _, err := find(srv.Command); {
+		case err != nil:
+			add("tools", Note, "the language server %s (for %s) cannot start: %s is not installed, or not on the PATH. (%s)", srv.Name, exts, srv.Command, srv.Origin)
+		case !cfg.Trusted:
+			add("tools", Note, "the language server %s (for %s) is installed, and waits for this folder to be trusted, as it would read the folder's code. (%s)", srv.Name, exts, srv.Origin)
+		default:
+			add("tools", Fine, "the language server %s (for %s) is installed: it starts with the first file of those it is for. (%s)", srv.Name, exts, srv.Origin)
+		}
+	}
 	for _, s := range []struct {
 		name, down string
 		v          Value[string]
@@ -319,7 +406,7 @@ func Doctor(ctx context.Context, cfg *Config, problems []Problem, pr Probes) []F
 		if s.v.V == "" {
 			continue
 		}
-		at := displayURL(s.v.V)
+		at := DisplayURL(s.v.V)
 		if pr.Connect == nil {
 			add("tools", Note, "%s is %s (%s). Whether it answers was not checked.", s.name, at, s.v.Origin)
 		} else if err := pr.Connect(ctx, s.v.V); err != nil {
@@ -367,15 +454,25 @@ func Doctor(ctx context.Context, cfg *Config, problems []Problem, pr Probes) []F
 	case len(cfg.Held) == 0:
 		add("trust", Fine, "this folder is not trusted, and none of its settings waits for trust.")
 	default:
+		// Each with where it is written, a hook's above all, as Claude
+		// Code's trust question says since 2.1.329.
 		var some []string
 		for _, h := range cfg.Held[:min(len(cfg.Held), 5)] {
-			some = append(some, fmt.Sprintf("%q", h.Text))
+			s := fmt.Sprintf("%q", h.Text)
+			if o := h.Origin.String(); o != "" {
+				s += " (" + o + ")"
+			}
+			some = append(some, s)
 		}
 		more := ""
 		if len(cfg.Held) > len(some) {
 			more = fmt.Sprintf(" and %d more", len(cfg.Held)-len(some))
 		}
-		add("trust", Note, "this folder is not trusted, so %d of its settings are held: %s%s. To use them: gnosh trust, or --trust-folder for one run.", len(cfg.Held), list(some), more)
+		are := "are"
+		if len(cfg.Held) == 1 {
+			are = "is"
+		}
+		add("trust", Note, "this folder is not trusted, so %d of its settings %s held: %s%s. To use them: gnosh trust, or --trust-folder for one run.", len(cfg.Held), are, list(some), more)
 	}
 
 	// 8. Environment.
@@ -406,6 +503,16 @@ func blocksWhat(event string) string {
 		return "every tool call it matches"
 	case "UserPromptSubmit":
 		return "every prompt"
+	case "UserPromptExpansion":
+		return "every typed command it matches that expands into a prompt"
+	case "PreModelSwitch":
+		return "every switch to a model it matches"
+	case "ConfigChange":
+		return "every change to the settings files it matches, which then is not taken in"
+	case "PostToolBatch":
+		return "every turn at its first round of tool calls"
+	case "SubagentStop":
+		return "the end of every sub-agent"
 	}
 	return "the end of every turn"
 }

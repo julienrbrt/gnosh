@@ -40,13 +40,12 @@ func TestUnknownFlags(t *testing.T) {
 		{line: `gnosh -help`, kind: ErrUnknownFlag, hint: "--help"},
 
 		// A flag of another command says where it belongs.
-		{line: `gnosh --json`, kind: ErrUnknownFlag, say: []string{"--json does not go with gnosh, so nothing was started. It is a flag of gnosh session list, gnosh session show, gnosh session last and gnosh session rename."}},
+		{line: `gnosh --json`, kind: ErrUnknownFlag, say: []string{"--json does not go with gnosh, so nothing was started. It is a flag of gnosh session list, gnosh session show, gnosh session last and others."}},
 		{line: `gnosh --cwd x version --cwd y`, kind: ErrUnknownFlag, say: []string{"--cwd does not go with gnosh version, so nothing was done. It is a flag of gnosh, gnosh doctor, gnosh trust and others."}},
 		{line: `gnosh --list`, kind: ErrUnknownFlag, say: []string{"--list does not go with gnosh", "It is a flag of gnosh trust."}},
 		{line: `gnosh -f`, kind: ErrUnknownFlag, say: []string{"-f does not go with gnosh", "It is a flag of gnosh logs."}},
 
 		// What the specs list as not carried over is simply unknown.
-		{line: `gnosh --channels x`, kind: ErrUnknownFlag, say: []string{"--channels is not a flag of gnosh"}},
 		{line: `gnosh --host box`, kind: ErrUnknownFlag, say: []string{"--host is not a flag of gnosh"}},
 		{line: `gnosh -H box`, kind: ErrUnknownFlag, say: []string{"-H does not go with gnosh", "It is a flag of gnosh mcp add."}},
 		{line: `gnosh --from-pr 12`, kind: ErrUnknownFlag, say: []string{"--from-pr is not a flag of gnosh"}},
@@ -66,7 +65,7 @@ func TestUnknownFlags(t *testing.T) {
 		// Only whole names count: no flag is guessed from its start, though
 		// the start is enough for a suggestion.
 		{line: `gnosh --verb`, kind: ErrUnknownFlag, hint: "--verbose"},
-		{line: `gnosh --dangerously`, kind: ErrUnknownFlag, hint: "--dangerously-skip-permissions"},
+		{line: `gnosh --dangerously-skip`, kind: ErrUnknownFlag, hint: "--dangerously-skip-permissions"},
 		{line: `gnosh --permission-mo`, kind: ErrUnknownFlag, hint: "--permission-mode"},
 		{line: `gnosh --permission-pr`, kind: ErrUnknownFlag, hint: "--permission-prompts"},
 		// A start that two flags share suggests neither.

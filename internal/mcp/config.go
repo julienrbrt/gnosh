@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -44,6 +47,9 @@ type Config struct {
 	// URL and Headers reach an http server.
 	URL     string
 	Headers map[string]string
+	// OAuth is an http server's oauth object: how gnosh signs in to it
+	// (oauth.go). Its zero value discovers everything.
+	OAuth OAuth
 	// Timeout bounds one tool call; zero means no bound.
 	Timeout time.Duration
 	// Scope is "local", "project", "user" or "command line", and Path the
@@ -112,10 +118,7 @@ var withheld = []string{
 func LoadConfig(src Sources) ([]Config, []Problem) {
 	var probs []Problem
 	byName := map[string]Config{}
-	held := map[string]bool{}
-	for _, v := range append(append([]string(nil), withheld...), src.Withheld...) {
-		held[v] = true
-	}
+	held := heldOf(src)
 	read := func(path string) *configFile {
 		if path == "" {
 			return nil
@@ -132,6 +135,12 @@ func LoadConfig(src Sources) ([]Config, []Problem) {
 		if err := json.NewDecoder(bytes.NewReader(data)).Decode(&f); err != nil {
 			probs = append(probs, Problem{Path: path, Message: fmt.Sprintf("it is not JSON in the shape {\"mcpServers\": {...}} (%v), so none of it is used", err)})
 			return nil
+		}
+		var top map[string]json.RawMessage
+		if json.Unmarshal(data, &top) == nil {
+			if names := strays(top); len(names) > 0 {
+				probs = append(probs, Problem{Path: path, Message: fmt.Sprintf("it holds %s, outside \"mcpServers\", where no server is read: move %s inside \"mcpServers\": {...}", strayText(names), itOrThem(len(names)))})
+			}
 		}
 		return &f
 	}
@@ -193,6 +202,68 @@ func LoadConfig(src Sources) ([]Config, []Problem) {
 	return out, probs
 }
 
+// ParseServers reads servers written somewhere else in the shape of an
+// .mcp.json file's entries (an agent's mcpServers), from the file at path,
+// under the scope given: ${VAR} is filled in and credentials are withheld
+// as LoadConfig does. They come back in the order of their names.
+func ParseServers(path, scope string, servers map[string]json.RawMessage, src Sources) ([]Config, []Problem) {
+	got, probs := parseConfig(path, scope, servers, src.Root, src.Getenv, heldOf(src))
+	sort.Slice(got, func(i, j int) bool { return got[i].Name < got[j].Name })
+	return got, probs
+}
+
+// heldOf is the variables a server at a URL is never sent.
+func heldOf(src Sources) map[string]bool {
+	held := map[string]bool{}
+	for _, v := range append(append([]string(nil), withheld...), src.Withheld...) {
+		held[v] = true
+	}
+	return held
+}
+
+// strays names the entries at the top of a file of servers that are
+// servers themselves, objects with a "command" or a "url": written beside
+// "mcpServers" instead of inside it, where nothing reads them.
+func strays(top map[string]json.RawMessage) []string {
+	var out []string
+	for key, raw := range top {
+		if key == "mcpServers" || key == "projects" {
+			continue
+		}
+		var e map[string]json.RawMessage
+		if json.Unmarshal(raw, &e) != nil {
+			continue
+		}
+		_, local := e["command"]
+		_, remote := e["url"]
+		if local || remote {
+			out = append(out, key)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// strayText names servers written at the top of a file, for a message.
+func strayText(names []string) string {
+	quoted := make([]string, len(names))
+	for i, n := range names {
+		quoted[i] = strconv.Quote(n)
+	}
+	if len(quoted) == 1 {
+		return "the server " + quoted[0] + " at its top level"
+	}
+	return "the servers " + strings.Join(quoted, ", ") + " at its top level"
+}
+
+// itOrThem is the pronoun for n things.
+func itOrThem(n int) string {
+	if n == 1 {
+		return "it"
+	}
+	return "them"
+}
+
 // configFile is one file of servers: its own at the top, and the user's
 // file's servers of each project under "projects".
 type configFile struct {
@@ -224,9 +295,19 @@ func parseConfig(path, scope string, servers map[string]json.RawMessage, project
 			URL     string            `json:"url"`
 			Headers map[string]string `json:"headers"`
 			Timeout *float64          `json:"timeout"`
+			OAuth   *struct {
+				ClientID              string `json:"clientId"`
+				CallbackPort          int    `json:"callbackPort"`
+				Scopes                string `json:"scopes"`
+				AuthServerMetadataURL string `json:"authServerMetadataUrl"`
+			} `json:"oauth"`
 		}
 		if err := json.Unmarshal(raw, &e); err != nil {
 			probs = append(probs, Problem{Path: path, Server: name, Message: fmt.Sprintf("its entry cannot be read (%v)", err)})
+			continue
+		}
+		if why := blurredName(name); why != "" {
+			probs = append(probs, Problem{Path: path, Server: name, Message: why + ", so it is not used: rename it"})
 			continue
 		}
 		c := Config{Name: name, Scope: scope, Path: path}
@@ -253,6 +334,9 @@ func parseConfig(path, scope string, servers map[string]json.RawMessage, project
 		}
 		switch strings.ToLower(e.Type) {
 		case "", "stdio":
+			if e.OAuth != nil {
+				probs = append(probs, Problem{Path: path, Server: name, Message: "its oauth object is for a server reached at a URL, and is left out"})
+			}
 			if e.Type == "" && e.URL != "" {
 				probs = append(probs, Problem{Path: path, Server: name, Message: "it has a url and no type; a server reached at a URL says \"type\": \"http\""})
 				continue
@@ -284,6 +368,17 @@ func parseConfig(path, scope string, servers map[string]json.RawMessage, project
 				for k, v := range e.Headers {
 					c.Headers[k] = remote(v)
 				}
+			}
+			if o := e.OAuth; o != nil {
+				switch {
+				case o.CallbackPort < 0 || o.CallbackPort > 65535:
+					probs = append(probs, Problem{Path: path, Server: name, Message: fmt.Sprintf("its oauth.callbackPort %d is not a port", o.CallbackPort)})
+					continue
+				case o.AuthServerMetadataURL != "" && !strings.HasPrefix(o.AuthServerMetadataURL, "https://"):
+					probs = append(probs, Problem{Path: path, Server: name, Message: "its oauth.authServerMetadataUrl is not an https address"})
+					continue
+				}
+				c.OAuth = OAuth{ClientID: o.ClientID, CallbackPort: o.CallbackPort, Scopes: strings.TrimSpace(o.Scopes), AuthServerMetadataURL: o.AuthServerMetadataURL}
 			}
 		case "sse", "ws":
 			probs = append(probs, Problem{Path: path, Server: name, Message: fmt.Sprintf("the %s transport is not one gnosh speaks; it speaks stdio and http", e.Type)})
@@ -360,4 +455,45 @@ func ToolName(server, tool string) string {
 		return b.String()
 	}
 	return "mcp__" + clean(server) + "__" + clean(tool)
+}
+
+// MaxToolName is the longest tool name the model's APIs take: OpenAI's
+// function names, and Anthropic's tools', are at most 64 characters.
+const MaxToolName = 64
+
+// maxServerName is the longest name a server may have, as its tools' names
+// write it: FitToolName keeps mcp__<server>__ whole when it shortens a name.
+const maxServerName = MaxToolName - 9 - len("mcp__") - len("__")
+
+// blurredName says why a server's name is not used, or "". Its tools are
+// named mcp__<server>__<tool>, and a rule for the tools of a server reads
+// as mcp__<server>__*: the rule for github's would cover the tools of a
+// server named github__x (mcp__github__x__tool) or github_
+// (mcp__github___tool), and one for a server whose name a shortened tool
+// name cut short would cover none of them. So a name that, as the tools'
+// names write it, holds "__", ends in "_" or is longer than maxServerName
+// is refused (the MCP review of 2026-11-19).
+func blurredName(name string) string {
+	server := strings.TrimSuffix(strings.TrimPrefix(ToolName(name, ""), "mcp__"), "__")
+	switch {
+	case server == "":
+		return "a server's name cannot be empty"
+	case strings.Contains(server, "__") || strings.HasSuffix(server, "_"):
+		return fmt.Sprintf("its tools would be named mcp__%s__<tool>, and a rule for the tools of another server could cover them: a server's name holds no \"__\" and does not end in \"_\"", server)
+	case len(server) > maxServerName:
+		return fmt.Sprintf("a server's name is at most %d characters long, so that the names of its tools, which the model's APIs take up to %d characters long, keep it whole", maxServerName, MaxToolName)
+	}
+	return ""
+}
+
+// FitToolName shortens a tool's name that is longer than the model's APIs
+// take: its start is kept, and its end becomes a short hash of the whole,
+// so that two long names that begin alike stay apart. A name that fits
+// comes back as it was.
+func FitToolName(name string) string {
+	if len(name) <= MaxToolName {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	return name[:MaxToolName-9] + "_" + hex.EncodeToString(sum[:4])
 }

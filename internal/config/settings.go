@@ -46,14 +46,17 @@ func (s *source) settingsPermissions(f jfield) {
 				}
 				dir, at := absPath(d.str, s.home, s.cwd), s.at(d.line)
 				s.add(op{kind: KindAddDir, text: "additional directory " + dir, origin: at, feature: FeaturePermissions, what: "an additional directory",
-					apply: func(b *builder) { addItem(&b.dirs, dir, at) }})
+					apply: func(b *builder) { b.addDir(dir, at) }})
 			}
 		case "disableBypassPermissionsMode":
 			if m.val.kind != jString || m.val.str != "disable" {
 				s.errorf(m.line, "\"permissions.disableBypassPermissionsMode\" takes the one value \"disable\".")
 				continue
 			}
-			s.add(op{kind: KindMode, text: "disableBypassPermissionsMode", origin: o, feature: FeaturePermissions, what: "a permission setting",
+			// (It only takes a mode away, so a folder that is not trusted
+			// keeps it too, as DECISIONS 2 says; the config review of
+			// 2026-11-19 found it held as a mode.)
+			s.add(op{kind: KindRestriction, text: "disableBypassPermissionsMode", origin: o, feature: FeaturePermissions, what: "a permission setting",
 				apply: func(b *builder) { b.bypassDisabled.put(true, o) }})
 		case "disableAutoMode":
 			if m.val.kind != jString || m.val.str != "disable" {
@@ -71,11 +74,27 @@ func (s *source) settingsPermissions(f jfield) {
 			v := m.val.b
 			s.add(op{kind: KindMode, text: "denyInsteadOfPrompting", origin: o, feature: FeaturePermissions, what: "a permission setting",
 				apply: func(b *builder) { b.denyInstead.put(v, o) }})
-		default:
-			if slices.Contains(claudeCodePermissionKeys, m.key) {
-				s.errorf(m.line, "\"permissions.%s\" is a setting Claude Code has and gnosh has not built, so it would not hold anything back here. Take it out of this file.", m.key)
+		case "blockReadsOutsideWorkingDirectories", "blockWritesOutsideWorkingDirectories":
+			if m.val.kind != jBool {
+				s.errorf(m.line, "\"permissions.%s\" is true or false, and here it is %s.", m.key, m.val.kind.word())
 				continue
 			}
+			if !m.val.b {
+				// (false is the same as not set: a true in any other file
+				// still holds, so a repository can turn the block on for
+				// itself and cannot lift the person's, as in Claude Code.)
+				continue
+			}
+			reads := m.key == "blockReadsOutsideWorkingDirectories"
+			s.add(op{kind: KindRestriction, text: m.key, origin: o, feature: FeaturePermissions, what: "a permission setting",
+				apply: func(b *builder) {
+					if reads {
+						b.blockReads.put(true, o)
+					} else {
+						b.blockWrites.put(true, o)
+					}
+				}})
+		default:
 			s.errorf(m.line, "%s is not a key gnosh reads under \"permissions\". The keys are: %s.", showName(m.key), keyNames(permissionKeys))
 		}
 	}
@@ -191,14 +210,14 @@ func (s *source) settingsHandler(e *hookEvent, matcher string, n *jnode) {
 		how, known := hookFields[m.key]
 		switch {
 		case !known:
-			bad(m.line, "%s is not a field of a hook handler that gnosh knows, so the hook might not run as it was written. gnosh reads \"type\", \"command\", \"args\", \"timeout\" and \"if\".", showName(m.key))
+			bad(m.line, "%s is not a field of a hook handler that gnosh knows, so the hook might not run as it was written. gnosh reads \"type\", \"command\", \"args\", \"timeout\" and \"if\" (and the fields of http, mcp_tool, prompt and agent hooks).", showName(m.key))
 		case m.key == "type":
 			if m.val.kind != jString {
 				bad(m.line, "a hook's \"type\" is a string, and here it is %s.", m.val.kind.word())
 				break
 			}
-			if typ = m.val.str; typ != "command" && typ != "http" && typ != "mcp_tool" {
-				bad(m.line, "this hook has \"type\": %s, and gnosh runs hooks of type \"command\", \"http\" and \"mcp_tool\" only. A hook it cannot run as written is not run some other way: rewrite it as a command, or take it out.", showName(typ))
+			if typ = m.val.str; typ != "command" && typ != "http" && typ != "mcp_tool" && typ != "prompt" && typ != "agent" {
+				bad(m.line, "this hook has \"type\": %s, and gnosh runs hooks of type \"command\", \"http\", \"mcp_tool\", \"prompt\" and \"agent\" only. A hook it cannot run as written is not run some other way: rewrite it as a command, or take it out.", showName(typ))
 			}
 		case m.key == "command":
 			if m.val.kind != jString || strings.TrimSpace(m.val.str) == "" {
@@ -266,6 +285,24 @@ func (s *source) settingsHandler(e *hookEvent, matcher string, n *jnode) {
 				break
 			}
 			h.Input = m.val.marshal()
+		case m.key == "prompt":
+			if m.val.kind != jString || strings.TrimSpace(m.val.str) == "" {
+				bad(m.line, "a prompt or agent hook's \"prompt\" is the rule, the condition or the task the model is given, as a string that is not empty.")
+				break
+			}
+			h.Prompt = m.val.str
+		case m.key == "model":
+			if m.val.kind != jString {
+				bad(m.line, "a prompt or agent hook's \"model\" is a string, and here it is %s.", m.val.kind.word())
+				break
+			}
+			h.Model = m.val.str
+		case m.key == "continueOnBlock":
+			if m.val.kind != jBool {
+				bad(m.line, "a prompt hook's \"continueOnBlock\" is true or false, and here it is %s.", m.val.kind.word())
+				break
+			}
+			h.ContinueOnBlock = m.val.b
 		case m.key == "statusMessage":
 			if m.val.kind != jString {
 				bad(m.line, "a hook's \"statusMessage\" is the text shown while it runs, as a string, and here it is %s.", m.val.kind.word())
@@ -302,8 +339,8 @@ func (s *source) settingsHandler(e *hookEvent, matcher string, n *jnode) {
 			if m.val.kind == jBool {
 				got = strconv.FormatBool(m.val.b)
 			}
-			if (m.val.kind != jString && m.val.kind != jBool) || got != want {
-				bad(m.line, "this hook sets \"%s\", and gnosh can only run a hook with \"%s\": %s (which is what leaving it out means). A hook it cannot run as written is not run some other way: take the field out, or the hook.", m.key, m.key, want)
+			if (m.val.kind != jString && m.val.kind != jBool) || !slices.Contains(want, got) {
+				bad(m.line, "this hook sets \"%s\", and gnosh can only run a hook with \"%s\": %s (which changes nothing in gnosh). A hook it cannot run as written is not run some other way: take the field out, or the hook.", m.key, m.key, strings.Join(want, " or "))
 			}
 		default:
 			bad(m.line, "this hook has \"%s\". %s, or take the hook out.", m.key, how)
@@ -328,7 +365,18 @@ func (s *source) settingsHandler(e *hookEvent, matcher string, n *jnode) {
 		bad(n.line, "this command hook has a \"url\", \"headers\" or \"allowedEnvVars\", which only an http hook takes. Write \"type\": \"http\" for one.")
 	case typ == "command" && h.Command == "":
 		bad(n.line, "this hook handler has no \"command\", so it would run nothing.")
+	case typ == "prompt" && h.Prompt == "":
+		bad(n.line, "this prompt hook has no \"prompt\": the rule or the condition the model judges.")
+	case typ == "agent" && h.Prompt == "":
+		bad(n.line, "this agent hook has no \"prompt\": the task its sub-agent is given.")
+	case (typ == "prompt" || typ == "agent") && (h.Command != "" || h.Args != nil || h.URL != "" || h.Async || h.AsyncRewake):
+		bad(n.line, "this %s hook has fields of a command hook or an http hook, which it does not take.", typ)
+	case typ == "agent" && h.ContinueOnBlock:
+		bad(n.line, "an agent hook takes no \"continueOnBlock\": its \"ok\": false always goes back to the model, and the turn goes on.")
+	case typ != "prompt" && typ != "agent" && (h.Prompt != "" || h.Model != "" || h.ContinueOnBlock):
+		bad(n.line, "this hook has \"prompt\", \"model\" or \"continueOnBlock\", which only a prompt hook (or an agent hook, for \"prompt\" and \"model\") takes. Write \"type\": \"prompt\" or \"agent\" for one.")
 	}
+	h.Agent = typ == "agent"
 	if !good {
 		return
 	}
@@ -394,6 +442,92 @@ func (s *source) statusLine(f jfield) {
 		apply: func(b *builder) { b.statusLine.put(sl, sl.Origin) }})
 }
 
+// attribution reads the attribution setting: {"commit": "...", "pr":
+// "...", "sessionUrl": false}, or false for none. sessionUrl is taken and
+// adds nothing: a gnosh session has no web address to link.
+func (s *source) attribution(f jfield) {
+	a := Attribution{Origin: s.at(f.line)}
+	switch {
+	case f.val.kind == jBool && !f.val.b:
+	case f.val.kind != jObject:
+		s.errorf(f.line, "\"attribution\" is an object such as {\"commit\": \"...\", \"pr\": \"...\"}, or false for none, and here it is %s.", f.val.kind.word())
+		return
+	default:
+		good := true
+		for _, m := range s.unique(f.val, "attribution.") {
+			switch m.key {
+			case "commit", "pr":
+				if m.val.kind != jString {
+					s.errorf(m.line, "the attribution's %q is the text added, as a string (an empty one adds none).", m.key)
+					good = false
+					break
+				}
+				if m.key == "commit" {
+					a.Commit = strings.TrimSpace(m.val.str)
+				} else {
+					a.PR = strings.TrimSpace(m.val.str)
+				}
+			case "sessionUrl":
+				if m.val.kind != jBool {
+					s.errorf(m.line, "the attribution's \"sessionUrl\" is true or false.")
+					good = false
+				}
+			default:
+				s.errorf(m.line, "the attribution has no field %s; its fields are commit, pr and sessionUrl.", showName(m.key))
+				good = false
+			}
+		}
+		if !good {
+			return
+		}
+	}
+	s.add(op{kind: KindOption, text: "attribution: commit " + strconv.Quote(a.Commit) + ", pull request " + strconv.Quote(a.PR), origin: a.Origin, what: "what the model signs its commits and pull requests with",
+		apply: func(b *builder) { b.attribution.put(a, a.Origin) }})
+}
+
+// fileSuggestion reads the fileSuggestion object: {"type": "command",
+// "command": "..."}.
+func (s *source) fileSuggestion(f jfield) {
+	if f.val.kind != jObject {
+		s.errorf(f.line, "\"fileSuggestion\" is an object such as {\"type\": \"command\", \"command\": \"~/.config/gnosh/file-suggestion.sh\"}, and here it is %s.", f.val.kind.word())
+		return
+	}
+	fs := FileSuggestion{Origin: s.at(f.line)}
+	typ, good := "", true
+	bad := func(line int, format string, a ...any) {
+		s.errorf(line, format, a...)
+		good = false
+	}
+	for _, m := range s.unique(f.val, "fileSuggestion.") {
+		switch m.key {
+		case "type":
+			if m.val.kind != jString || m.val.str != "command" {
+				bad(m.line, "the file suggestion's \"type\" is \"command\", the one kind there is.")
+			}
+			typ = "command"
+		case "command":
+			if m.val.kind != jString || strings.TrimSpace(m.val.str) == "" {
+				bad(m.line, "the file suggestion's \"command\" is the command line to run, as a string that is not empty.")
+				break
+			}
+			fs.Command = m.val.str
+		default:
+			bad(m.line, "the file suggestion has no field %s; its fields are type and command.", showName(m.key))
+		}
+	}
+	if good && typ == "" {
+		bad(f.line, "the file suggestion has no \"type\". Add \"type\": \"command\".")
+	}
+	if good && fs.Command == "" {
+		bad(f.line, "the file suggestion has no \"command\", so it would run nothing.")
+	}
+	if !good {
+		return
+	}
+	s.add(op{kind: KindFileSuggest, text: "fileSuggestion: " + fs.Command, origin: fs.Origin, what: "a command that offers the paths for @",
+		apply: func(b *builder) { b.fileSuggestion.put(fs, fs.Origin) }})
+}
+
 // settingsEnv reads the env object: variables for the commands and hooks
 // gnosh starts.
 // SkillVisibilities are the values of skillOverrides, as Claude Code's,
@@ -410,7 +544,7 @@ func (s *source) settingsSkillOverrides(f jfield) {
 	}
 	for _, m := range s.unique(f.val, "skillOverrides.") {
 		if m.val.kind != jString || !slices.Contains(SkillVisibilities, m.val.str) {
-			s.errorf(m.line, "the value of \"skillOverrides.%s\" is one of %s, and here it is %s.", m.key, strings.Join(SkillVisibilities, ", "), shown(m.val))
+			s.errorf(m.line, "the value of %s is one of %s, and here it is %s.", showName("skillOverrides."+m.key), strings.Join(SkillVisibilities, ", "), shown(m.val))
 			continue
 		}
 		name, v := m.key, Value[string]{V: m.val.str, Set: true, Origin: s.at(m.line)}
@@ -433,9 +567,42 @@ func (s *source) settingsEnv(f jfield) {
 			s.errorf(m.line, "the value of \"env.%s\" is a string (put a number in quotes), and here it is %s.", m.key, m.val.kind.word())
 			continue
 		}
+		if handoffMarker(m.key) {
+			s.probs.warnf(s.file, m.line, "\"env.%s\" is not taken from a settings file: gnosh sets it itself, to tell the gnosh it starts again what happened, and a gnosh a command starts must not be told so (it would take a move or a restart that never was).", m.key)
+			continue
+		}
+		if movesOwnDirs(m.key) && (s.scope == "project" || s.scope == "local") {
+			s.probs.warnf(s.file, m.line, "\"env.%s\" is not taken from a project's file: it moves where gnosh and the programs it starts keep their own files. Set it in your own gnosh.json if you mean it.", m.key)
+			continue
+		}
 		s.secrets.add(m.val.str)
 		v := EnvVar{Name: m.key, Value: NewSecret(m.val.str), Origin: s.at(m.line)}
 		s.add(op{kind: KindEnv, text: "env " + m.key, origin: v.Origin, feature: FeatureEnv, what: "a variable for commands",
 			apply: func(b *builder) { b.setEnv(v) }})
 	}
+}
+
+// handoffMarker reports whether a variable is one gnosh puts on the gnosh
+// it starts again (/restart, /cd, a work tree, a run in the background),
+// which the new one takes at its word: a settings file's env block put it
+// on every command, so a gnosh a command started was told of a move that
+// never was (the cd review of 2026-11-19).
+func handoffMarker(name string) bool {
+	switch name {
+	case "GNOSH_RESTARTED", "GNOSH_MOVED_FROM", "GNOSH_TREE_MOVE", "GNOSH_RUN_ASKS":
+		return true
+	}
+	return false
+}
+
+// movesOwnDirs reports whether a variable moves where gnosh, or a program
+// it starts, keeps its own files and reads its own settings: a
+// repository's files must not set those (spec/cc/settings.md 2; a trusted
+// project's env block could, until the config review of 2026-11-19).
+func movesOwnDirs(name string) bool {
+	switch name {
+	case "HOME", "TMPDIR", "CLAUDE_CONFIG_DIR":
+		return true
+	}
+	return strings.HasPrefix(name, "XDG_") || strings.HasPrefix(name, "GNOSH_") && strings.HasSuffix(name, "_DIR")
 }

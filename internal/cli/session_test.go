@@ -50,6 +50,18 @@ func TestInvocationForms(t *testing.T) {
 		{line: `gnosh -m qwen help doctor`, want: Invocation{Command: CmdHelp, HelpFor: []string{"doctor"}}},
 		{line: `gnosh -y version`, want: Invocation{Command: CmdVersion}},
 		{line: `gnosh --bogus help`, kind: ErrUnknownFlag, say: []string{"--bogus is not a flag of gnosh"}},
+
+		// --bg sends off a run in print mode, so the flags print mode takes
+		// go with it at a terminal as they do from a script; -p does not.
+		{line: `gnosh --bg --max-turns 5 "fix it"`, want: inter(Invocation{Background: true, MaxTurns: 5, Prompt: "fix it"})},
+		{line: `gnosh --bg --max-turns 5 "fix it"`, env: &captured, want: pr(Invocation{Background: true, MaxTurns: 5, Prompt: "fix it", PrintImplied: true})},
+		{line: `gnosh --bg -p "fix it"`, kind: ErrConflict, say: []string{"--bg sends a session to the background, and -p does not go with it"}},
+		// It may send off a session -c or -r names, but not a copy, and
+		// not with nobody there to pick one from a list.
+		{line: `gnosh --bg -r 01a1eea5-4a18 "go on"`, want: inter(Invocation{Background: true, Conversation: ConversationResume, Resume: "01a1eea5-4a18", Prompt: "go on"})},
+		{line: `gnosh --bg -c "go on"`, want: inter(Invocation{Background: true, Conversation: ConversationContinue, Prompt: "go on"})},
+		{line: `gnosh --bg -r`, kind: ErrUsage, say: []string{"-r with --bg needs the session's ID or name after it"}},
+		{line: `gnosh --bg --fork-session -c "go on"`, kind: ErrConflict, say: []string{"--bg sends a session to the background, and --fork-session does not go with it"}},
 	})
 }
 

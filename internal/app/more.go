@@ -16,7 +16,9 @@ import (
 	"github.com/gnosh-ai/gnosh/internal/cli"
 	"github.com/gnosh-ai/gnosh/internal/config"
 	"github.com/gnosh-ai/gnosh/internal/core"
+	"github.com/gnosh-ai/gnosh/internal/instructions"
 	"github.com/gnosh-ai/gnosh/internal/prompt"
+	"github.com/gnosh-ai/gnosh/internal/text"
 	"github.com/gnosh-ai/gnosh/internal/transcript"
 )
 
@@ -39,7 +41,7 @@ func (l *live) slashContext(ctx context.Context, c *SlashContext) error {
 	cs := l.agent.Context()
 	est := prompt.EstimateTokens
 	system := 0
-	for _, part := range l.system {
+	for _, part := range l.systemNow() {
 		system += est(part)
 	}
 	tools := 0
@@ -87,23 +89,69 @@ func (l *live) slashContext(ctx context.Context, c *SlashContext) error {
 		c.Say("%s", row)
 	}
 	if l.instr != nil {
-		c.Say("The instruction files in effect from the start:")
-		n := 0
+		// Those given as the model went to work where they apply are
+		// listed apart: they were listed as in effect from the start
+		// (the instruction-files review of 2026-11-20).
+		var start, late []instructions.File
 		for _, f := range l.instr.Files() {
-			c.Say("      %s  %s", f.Path, thousands(est(f.Text)))
-			n++
+			if f.Late {
+				late = append(late, f)
+			} else {
+				start = append(start, f)
+			}
 		}
-		if n == 0 {
+		c.Say("The instruction files in effect from the start:")
+		for _, f := range start {
+			c.Say("      %s  %s", f.Path, thousands(est(f.Text)))
+		}
+		if len(start) == 0 {
 			c.Say("      none")
+		}
+		if len(late) > 0 {
+			c.Say("Given along the way, for the work they apply to:")
+			for _, f := range late {
+				c.Say("      %s  %s", f.Path, thousands(est(f.Text)))
+			}
 		}
 	}
 	return nil
 }
 
-// cleanTitle makes a session's name of what was typed: one line, of a
-// length a list can show.
+// cleanTitle makes a session's name of what was typed: one line, of at
+// most maxTitle characters, with no control character, and nothing drawn
+// as nothing: a name, or a first prompt a name is made of, pasted from
+// coloured output kept its escape sequences, which lists then wrote out
+// (the settings-commands review of 2026-11-20; Claude Code takes such
+// characters out of a name too, and caps it at 200 characters).
 func cleanTitle(s string) string {
-	return oneLine(strings.Join(strings.Fields(s), " "), 120)
+	s, _ = text.CleanInvisible(text.Strip(s))
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+			return ' '
+		}
+		return r
+	}, s)
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > maxTitle {
+		s = strings.TrimRight(string(r[:maxTitle]), " ")
+	}
+	return s
+}
+
+// maxTitle is the most characters a session's name has, Claude Code's
+// cap.
+const maxTitle = 200
+
+// personsTitle is the name the person typed, cleaned (cleanTitle), and an
+// error when what they typed is nothing once its invisible characters are
+// taken out, as Claude Code refuses such a name wherever a session is
+// named; nothing typed is no name, and no error.
+func personsTitle(typed string) (string, error) {
+	name := cleanTitle(typed)
+	if name == "" && strings.TrimSpace(typed) != "" {
+		return "", errors.New("that name is empty once its invisible characters are taken out, so it was not given")
+	}
+	return name, nil
 }
 
 // title is the session's name: the last one the person gave, or else the
@@ -134,7 +182,8 @@ func (l *live) nameAfter(text string) {
 		return
 	}
 	first, _, _ := strings.Cut(strings.TrimSpace(text), "\n")
-	name := cleanTitle(first)
+	// (Short, as lists show a name: the person's own may be longer.)
+	name := oneLine(cleanTitle(first), 120)
 	if name == "" {
 		l.named.Store(false)
 		return
@@ -149,7 +198,10 @@ func (l *live) nameAfter(text string) {
 // slashRename is /rename: it names the session, and shows the name it
 // has.
 func (l *live) slashRename(ctx context.Context, c *SlashContext) error {
-	name := cleanTitle(c.Args)
+	name, err := personsTitle(c.Args)
+	if err != nil {
+		return err
+	}
 	if name == "" {
 		switch have, byPerson := l.title(); {
 		case have == "":
@@ -174,7 +226,10 @@ func (l *live) slashRename(ctx context.Context, c *SlashContext) error {
 // (controls.Command); a name given labels the one left behind, as Claude
 // Code's /clear does, for /resume and gnosh -r.
 func (l *live) slashClear(ctx context.Context, c *SlashContext) error {
-	name := cleanTitle(c.Args)
+	name, err := personsTitle(c.Args)
+	if err != nil {
+		return fmt.Errorf("nothing was cleared: %w", err)
+	}
 	if name == "" {
 		return nil
 	}
@@ -238,18 +293,28 @@ func (l *live) slashResume(ctx context.Context, c *SlashContext) error {
 			return nil
 		}
 		c.Say("The other sessions of this folder, the one written to last first:")
+		l.resumeShown = l.resumeShown[:0]
 		for i, ch := range choices {
 			c.Say("  %d. %s  %s  %s", i+1, ch.ID[:min(8, len(ch.ID))], ch.Modified.Local().Format("2006-01-02 15:04"), oneLine(ch.Title, 80))
+			l.resumeShown = append(l.resumeShown, ch.ID)
 		}
-		c.Say("/resume N opens one in place of this session, which is kept. An id or a name works too.")
+		c.Say("/resume N opens one in place of this session, which is kept. An id or a name works too, and so do words from a session's name or first prompt, which finds it among all of them.")
 		return nil
 	}
 	if l.busy(ctx) {
 		return errors.New("a turn is running. Stop it first, then open another session")
 	}
 	id := ""
-	if n, err := strconv.Atoi(word); err == nil && n >= 1 && n <= len(choices) {
-		id = choices[n-1].ID
+	// A number is the place in the list as it was shown, or, with none
+	// shown, as it stands.
+	shown := l.resumeShown
+	if len(shown) == 0 {
+		for _, ch := range choices {
+			shown = append(shown, ch.ID)
+		}
+	}
+	if n, err := strconv.Atoi(word); err == nil && n >= 1 && n <= len(shown) {
+		id = shown[n-1]
 	} else {
 		found, err := l.findSession(ctx, word)
 		if err != nil {
@@ -292,7 +357,10 @@ func (l *live) slashBranch(ctx context.Context, c *SlashContext) error {
 	if !slices.ContainsFunc(l.ts.Entries(), func(e transcript.Entry) bool { return e.Type == transcript.TypeUser }) {
 		return errors.New("there is nothing to copy yet: the conversation has not begun")
 	}
-	name := cleanTitle(c.Args)
+	name, err := personsTitle(c.Args)
+	if err != nil {
+		return err
+	}
 	l.branchTo = &name
 	return nil
 }
@@ -351,6 +419,15 @@ func (c *controls) resume(ctx context.Context, id string) (string, error) {
 		return "", fmt.Errorf("the session %s cannot be opened (%v), so this one stays open", id, err)
 	}
 	_ = probe.Close()
+	if probe.ID() != old.ts.ID() && transcript.InUse(probe.Path()) {
+		// Another gnosh writes it (a /fork or /background run, most
+		// likely), and one session has one writer: this one stays.
+		why := fmt.Sprintf("the session %s is open in another gnosh, and one session has one writer, so this one stays open", probe.ID())
+		if log := strings.TrimSuffix(probe.Path(), ".jsonl") + ".background.log"; fileExists(log) {
+			why += fmt.Sprintf(". If it is a run in the background, it lets go of the session when it is done: /tasks stop %s stops it", RunShort(probe.ID()))
+		}
+		return "", errors.New(why)
+	}
 	old.close("resume")
 	next, err := c.p.openSession(ctx, c.st, c.front, "resume", id)
 	if err != nil {
@@ -369,12 +446,9 @@ func (c *controls) resume(ctx context.Context, id string) (string, error) {
 
 // dirsCommand is `gnosh dirs`: the folders in use.
 func (p *program) dirsCommand(ctx context.Context, inv cli.Invocation) int {
-	st, code := p.prepare(ctx, inv, false)
-	if st == nil || st.cfg == nil {
-		if st != nil {
-			st.printProblems()
-		}
-		return max(code, cli.ExitFailure)
+	st, code := p.prepared(ctx, inv)
+	if st == nil {
+		return code
 	}
 	d := st.dirs("")
 	settings := st.cfg.Paths.UserSettings
@@ -398,14 +472,26 @@ func (p *program) dirsCommand(ctx context.Context, inv cli.Invocation) int {
 // logsCommand is `gnosh logs`: the end of the project's log. With
 // --follow it keeps printing what is added until it is stopped.
 func (p *program) logsCommand(ctx context.Context, inv cli.Invocation) int {
-	st, code := p.prepare(ctx, inv, false)
-	if st == nil || st.cfg == nil {
-		if st != nil {
-			st.printProblems()
-		}
-		return max(code, cli.ExitFailure)
+	st, code := p.prepared(ctx, inv)
+	if st == nil {
+		return code
 	}
-	path := filepath.Join(st.sessions().ProjectDir(st.cfg.Paths.Cwd), "gnosh.log")
+	dir := st.sessions().ProjectDir(st.cfg.Paths.Cwd)
+	path := filepath.Join(dir, "gnosh.log")
+	// With a session named, a run's log in place of the project's: what
+	// it printed, followed until it lets go of its session.
+	// alive says whether what is followed goes on: the project's log
+	// always, a run's while the run works.
+	alive := func() bool { return true }
+	if len(inv.Args) > 0 {
+		id, log, err := findRun(st.sessions().ProjectDirs(), inv.Args[0])
+		if err != nil {
+			p.errf("%v.", err)
+			return cli.ExitFailure
+		}
+		file := runSession(id, log)
+		path, alive = log, func() bool { return runAlive(id, log, file) }
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -417,7 +503,7 @@ func (p *program) logsCommand(ctx context.Context, inv cli.Invocation) int {
 	}
 	tail := inv.Tail
 	if tail <= 0 {
-		tail = 100
+		tail = 1000
 	}
 	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
 	if len(lines) > tail {
@@ -433,6 +519,9 @@ func (p *program) logsCommand(ctx context.Context, inv cli.Invocation) int {
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
 	for {
+		// (A run's log is followed while the run works, and read once
+		// more after it ends.)
+		done := !alive()
 		select {
 		case <-ctx.Done():
 			return cli.ExitOK
@@ -442,6 +531,9 @@ func (p *program) logsCommand(ctx context.Context, inv cli.Invocation) int {
 		}
 		f, err := os.Open(path)
 		if err != nil {
+			if done {
+				return cli.ExitOK
+			}
 			continue
 		}
 		if info, err := f.Stat(); err == nil && info.Size() < at {
@@ -459,6 +551,9 @@ func (p *program) logsCommand(ctx context.Context, inv cli.Invocation) int {
 			}
 		}
 		f.Close()
+		if done {
+			return cli.ExitOK
+		}
 	}
 }
 
@@ -466,12 +561,9 @@ func (p *program) logsCommand(ctx context.Context, inv cli.Invocation) int {
 // sends one request for the list to each address and never names a model,
 // so nothing is loaded.
 func (p *program) modelsCommand(ctx context.Context, inv cli.Invocation) int {
-	st, code := p.prepare(ctx, inv, false)
-	if st == nil || st.cfg == nil {
-		if st != nil {
-			st.printProblems()
-		}
-		return max(code, cli.ExitFailure)
+	st, code := p.prepared(ctx, inv)
+	if st == nil {
+		return code
 	}
 	cfg := st.cfg
 	if len(cfg.Providers) == 0 {
@@ -512,12 +604,9 @@ func (p *program) modelsCommand(ctx context.Context, inv cli.Invocation) int {
 
 // sessionCommandFor is `gnosh session list`, `show`, `last` and `rename`.
 func (p *program) sessionsCommand(ctx context.Context, inv cli.Invocation) int {
-	st, code := p.prepare(ctx, inv, false)
-	if st == nil || st.cfg == nil {
-		if st != nil {
-			st.printProblems()
-		}
-		return max(code, cli.ExitFailure)
+	st, code := p.prepared(ctx, inv)
+	if st == nil {
+		return code
 	}
 	store, cwd := st.sessions(), st.cfg.Paths.Cwd
 	list, err := store.List(ctx, cwd)
@@ -589,7 +678,14 @@ func (p *program) sessionsCommand(ctx context.Context, inv cli.Invocation) int {
 		if !ok {
 			return cli.ExitFailure
 		}
-		name := cleanTitle(strings.Join(inv.Args[1:], " "))
+		name, err := personsTitle(strings.Join(inv.Args[1:], " "))
+		if err == nil && name == "" {
+			err = errors.New("the new title is empty")
+		}
+		if err != nil {
+			p.errf("%s.", strings.ToUpper(err.Error()[:1])+err.Error()[1:])
+			return cli.ExitFailure
+		}
 		ts, err := store.Open(ctx, id)
 		if err != nil {
 			var locked *transcript.LockedError
@@ -671,7 +767,11 @@ func printEntry(p *program, e agent.Entry) {
 	case agent.EntryResult:
 		fmt.Fprintf(p.stdout, "  = %s\n", visible(resultLine(e.Result, e.Denied, e.Interrupted)))
 	case agent.EntrySummary:
-		fmt.Fprintf(p.stdout, "\n[%s] (the conversation up to here was replaced by a summary)\n", stamp)
+		if e.Covers != "" {
+			fmt.Fprintf(p.stdout, "\n[%s] (the conversation before an earlier prompt was replaced by a summary; what followed that prompt stays)\n", stamp)
+		} else {
+			fmt.Fprintf(p.stdout, "\n[%s] (the conversation up to here was replaced by a summary)\n", stamp)
+		}
 	case agent.EntryTurn:
 		if e.Reason != agent.EndCompleted {
 			fmt.Fprintf(p.stdout, "  -- the turn ended: %s\n", e.Reason)

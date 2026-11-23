@@ -66,6 +66,11 @@
 //	StopFailure         nothing; what it prints is not read      error kind       600 s
 //	InstructionsLoaded  nothing; what it prints is not read      load reason      600 s
 //	Notification        nothing; what it prints is not read      notification     600 s
+//	PreModelSwitch      the model is not switched                model switched to 30 s
+//	PostModelSwitch     one warning; cannot block                model switched to 30 s
+//	ConfigChange        the new settings are not taken in        source           600 s
+//	PostToolBatch       the model is not asked again             (no matcher)     600 s
+//	FileChanged         one warning; cannot block                file's name      600 s
 //
 // A hook's own "timeout" replaces the default; on SessionEnd it counts up
 // to 60 seconds. A hook on an event that takes no matcher must not have
@@ -177,7 +182,7 @@
 // The answer is read strictly. A decision word that is not exactly one of
 // those ("Deny", "reject", "defer"), a field of the wrong type, a changed
 // input that is not an object, a field gnosh does not know, and a request
-// gnosh does not carry out (updatedToolOutput, initialUserMessage) each
+// gnosh does not carry out (initialUserMessage) each
 // make it an answer that could not be read, and the message names the
 // field. Requests that are harmless to leave undone (terminalSequence,
 // sessionTitle, watchPaths, reloadSkills) are noted in the hook's Record.
@@ -251,11 +256,12 @@
 //
 // Check returns every problem at once, and NewRunner refuses a
 // configuration that has one: an event name that is not exactly one of
-// the nineteen (a misspelling, another letter case, or a Claude Code event
+// gnosh's events (a misspelling, another letter case, or a Claude Code event
 // gnosh does not have); an event this build does not fire
-// (Options.Fires); a hook type other than "command"; an "if" that is not
-// a string; "args"; a background hook; "onFailure" other than "continue"; any field
-// gnosh does not know; a name written twice in one JSON object; a matcher
+// (Options.Fires); a hook type gnosh does not have (it has "command",
+// "http", "mcp_tool", "prompt" and "agent"); an "if" that is not a string;
+// "args" that are not a list of strings; "onFailure" other than
+// "continue" or "block"; any field gnosh does not know; a name written twice in one JSON object; a matcher
 // on an event that takes none, or one that cannot be read; a missing
 // command; a timeout that is not above zero; and, in the user's own
 // configuration, a command that starts with a relative path.
@@ -282,7 +288,8 @@
 //     Code does.)
 //   - A hook's answer is read strictly, as above, and text that is too
 //     long is cut rather than saved to a file.
-//   - "onFailure" may only say "continue", which changes nothing.
+//   - "onFailure" may say "continue" or "block", and changes nothing: a
+//     hook that fails blocks either way.
 //
 // # What the agent loop does around this package
 //

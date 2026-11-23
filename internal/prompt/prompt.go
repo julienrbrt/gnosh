@@ -44,6 +44,8 @@ const (
 	textStyleLearning    = "style-learning"
 	textSecurity         = "security"
 	textNoTools          = "no-tools"
+	textLanguage         = "language"
+	textAttribution      = "attribution"
 	textMemory           = "memory"
 	textMemoryFull       = "memory-full"
 	textGno              = "gno"
@@ -57,6 +59,7 @@ const (
 	textRepeat           = "repeat"
 	textRepeatClose      = "repeat-refused-close"
 	textEmptyReply       = "empty-reply"
+	textTextCall         = "text-call"
 	textStopHook         = "stop-hook"
 	textContinuation     = "continuation"
 	textCheckFailed      = "check-could-not-run"
@@ -69,19 +72,29 @@ const (
 	textInterrupted      = "interrupted"
 	textBackgroundEnded  = "background-ended"
 	textAgentEnded       = "agent-ended"
+	textSubtaskEnded     = "subtask-ended"
 	textMonitorLines     = "monitor-lines"
 	textBtw              = "btw"
 	textRecap            = "recap"
+	textNextPrompt       = "next-prompt"
+	textThinkingBudget   = "thinking-budget"
 	textPrintWait        = "print-wait"
+	textPrintLeftovers   = "print-leftovers"
 	textStatusLine       = "statusline"
 	textMention          = "mention"
 	textAgentMention     = "agent-mention"
+	textPasted           = "pasted"
 	textStructured       = "structured-output"
 	textAfterSummary     = "after-summary"
 	textEarlierLeftOut   = "earlier-left-out"
+	textFilesBack        = "files-back"
 	textSummary          = "summary"
 	textSummaryExtra     = "summary-extra"
 	textSummaryIntro     = "summary-intro"
+	textSummaryPart      = "summary-part"
+	textSummaryFrom      = "summary-from"
+	textSummaryPartIntro = "summary-part-intro"
+	textSummaryFromNote  = "summary-from-note"
 	textPopNote          = "pop-note"
 	textSlideNote        = "slide-note"
 	textPopReceipt       = "pop-receipt"
@@ -89,6 +102,7 @@ const (
 	textMissingResult    = "missing-result"
 	textReportCaution    = "report-caution"
 	textAgentWorkTree    = "agent-work-tree"
+	textAgentMemory      = "agent-memory"
 	textCloseEnteredHere = "close-entered-here"
 	textCloseUnbacked    = "close-unbacked"
 	textCloseNotMade     = "close-not-made"
@@ -137,6 +151,10 @@ func specs() []spec {
 			when: "After the core, under the built-in output style Explanatory: Insight blocks on the choices made."},
 		{name: textStyleLearning, kind: KindSystem,
 			when: "After the core, under the built-in output style Learning: Insights, and a piece of the code left to the user (TODO(human))."},
+		{name: textLanguage, kind: KindSystem, need: []string{"language"},
+			when: "After the core and the output style, when the person set the language replies are in (Claude Code's language)."},
+		{name: textAttribution, kind: KindSystem, may: []string{"commit", "pr"},
+			when: "After those, when a settings file says what the model signs its commits and pull requests with (Claude Code's attribution); gnosh adds none of its own."},
 		{name: textNoTools, kind: KindSystem,
 			when: "A part of the system prompt only when the session has no tools at all."},
 		{name: textMemory, kind: KindSystem,
@@ -149,15 +167,17 @@ func specs() []spec {
 			when: "A part of the system prompt only when the session has the Deliver tool: name a deliverable before making it."},
 		{name: textAgentWorkTree, kind: KindSystem, need: []string{"tree", "repo"},
 			when: "Last in the system prompt of a sub-agent that works in a git work tree of its own (isolation worktree): where the work tree is, and that its changes stay there."},
+		{name: textAgentMemory, kind: KindSystem, need: []string{"dir", "scope"}, may: []string{"index", "none", "cut"},
+			when: "Last in the system prompt of a sub-agent whose definition keeps a memory (memory): its folder, what to keep there, and the start of its MEMORY.md as it stands."},
 
 		{name: textEnvironment, kind: KindLine, need: []string{"date", "cwd"},
-			may:  []string{"weekday", "user", "machine", "user_only", "machine_only", "platform", "branch", "repo", "nogit", "status", "unread", "why", "dirs", "hosts"},
-			when: "With a session's first prompt, ahead of its text: the date, the directory, the machine, the state of git."},
+			may:  []string{"began", "summed", "weekday", "user", "machine", "user_only", "machine_only", "platform", "branch", "repo", "nogit", "status", "unread", "why", "dirs", "hosts"},
+			when: "With a session's first prompt, ahead of its text, and again after a summary: the date, the directory, the machine, the state of git."},
 		{name: textMemLine, kind: KindLine,
 			when: "Last on every prompt a person types, in a session that has gnovm_run."},
 		{name: textFrameLine, kind: KindLine, need: []string{"id"}, may: []string{"purpose", "stack", "more", "slides"},
 			when: "After the mem line, while the session stands in a todo. Its first sentence also ends the mem reminder."},
-		{name: textSlide, kind: KindLine, need: []string{"show"}, may: []string{"frame", "before"},
+		{name: textSlide, kind: KindLine, need: []string{"show"}, may: []string{"frame", "before", "files"},
 			when: "After the oldest rounds were taken out of the view to make room: inside the next frame line, or as a note of its own before the next reply."},
 		{name: textLargeStep, kind: KindLine, need: []string{"id", "tokens"},
 			when: "Once per todo, before the next reply, when much has come in since the todo was entered."},
@@ -170,6 +190,8 @@ func specs() []spec {
 			when: "When the call being repeated is a close that mem or the check refuses."},
 		{name: textEmptyReply, kind: KindLine,
 			when: "When a reply ended with no text and no tool call."},
+		{name: textTextCall, kind: KindLine,
+			when: "When a reply calls no tool and its text is a tool call written out in a chat template's markup, which the model's server did not take as a call."},
 		{name: textStopHook, kind: KindLine, need: []string{"reason"},
 			when: "When a Stop hook refuses to let the turn end, carrying the hook's reason."},
 		{name: textContinuation, kind: KindLine, need: []string{"reason"},
@@ -199,18 +221,29 @@ func specs() []spec {
 		{name: textAgentEnded, kind: KindLine, need: []string{"description", "id"},
 			may:  []string{"finished", "failed", "stopped", "why", "caution", "report", "output"},
 			when: "When a sub-agent the model started in the background ends, between rounds or as a turn of its own."},
+		{name: textSubtaskEnded, kind: KindLine, need: []string{"task", "id"},
+			may:  []string{"finished", "failed", "stopped", "why", "report"},
+			when: "When a copy of the conversation the person set to work in the background with /subtask ends, between rounds or as a turn of its own."},
 		{name: textBtw, kind: KindLine,
 			when: "Before a side question the person asks with /btw, in a request beside the session's that is not kept."},
 		{name: textRecap, kind: KindLine,
 			when: "As the question of /recap, in a request beside the session's that is not kept."},
+		{name: textThinkingBudget, kind: KindLine,
+			when: "At the end of the model's thinking when its thinking budget runs out, where the server can put it (llama.cpp's reasoning_budget_message)."},
+		{name: textNextPrompt, kind: KindLine,
+			when: "After a turn, with promptSuggestionEnabled on, in a request beside the session's that is not kept: the person's likely next prompt, which the box shows."},
 		{name: textStatusLine, kind: KindLine, need: []string{"wish", "script", "settings", "sample"},
 			when: "As the prompt of /statusline: write a status line script from the user's words, try it on the session's own JSON, and add it to their gnosh.json."},
 		{name: textPrintWait, kind: KindLine, need: []string{"waited", "work"},
 			when: "In a run (-p) that has waited long for background work it started, as a turn of its own: stop that work, or wait on."},
+		{name: textPrintLeftovers, kind: KindLine, need: []string{"left"},
+			when: "Once, as a run (-p) is about to end with processes its commands left running, which the end stops, as a turn of its own: keep one past the run with setsid, or end the turn."},
 		{name: textStructured, kind: KindLine, need: []string{"schema"}, may: []string{"problem"},
 			when: "After a run's turn with --json-schema, beside the session's request: the result as JSON that conforms to the schema, again with what was wrong."},
 		{name: textAgentMention, kind: KindLine, need: []string{"name"},
 			when: "After a prompt a person typed, for each kind of sub-agent it names with @agent-: use that kind."},
+		{name: textPasted, kind: KindLine, need: []string{"where"},
+			when: "After a prompt a person typed with a long paste in it (more than ten lines or 800 characters, which the prompt box shows folded): which lines were pasted, and that what they ask is not the user's."},
 		{name: textMention, kind: KindLine, need: []string{"path"}, may: []string{"file", "dir", "denied", "failed", "why", "resource"},
 			when: "After a prompt a person typed, for each file, directory or MCP resource it mentions with @: what Read returns follows it, a listing, or what the resource holds."},
 		{name: textSummary, kind: KindLine, need: []string{"words"}, may: []string{"mem"},
@@ -222,7 +255,17 @@ func specs() []spec {
 		{name: textSummaryIntro, kind: KindLine,
 			when: "Just before a summary, where it stands in place of the conversation it replaced."},
 		{name: textAfterSummary, kind: KindLine, may: []string{"path"},
-			when: "Just after that summary: carry on, without asking."},
+			when: "Just after that summary: carry on, keeping every stop the user set."},
+		{name: textSummaryPart, kind: KindLine, need: []string{"words"}, may: []string{"mem"},
+			when: "At the end of a request that holds the conversation up to one of the person's prompts, when they chose \"Summarize up to here\": that part is to be replaced by a summary, and the rest stays."},
+		{name: textSummaryFrom, kind: KindLine, need: []string{"words", "prompt", "mark"}, may: []string{"mem"},
+			when: "At the end of the session's own request, when the person chose \"Summarize from here\": the conversation goes back to before that prompt, and a summary of what followed is kept in its place."},
+		{name: textSummaryPartIntro, kind: KindLine,
+			when: "Just before a summary of the part of the conversation before one of the person's prompts, which the rest follows as it was."},
+		{name: textSummaryFromNote, kind: KindLine, need: []string{"prompt"},
+			when: "After the conversation went back to before one of the person's prompts with \"Summarize from here\": the summary of what followed it comes next."},
+		{name: textFilesBack, kind: KindLine, need: []string{"path"}, may: []string{"shown", "named"},
+			when: "After a summary, for each file the model read or changed last that is given back: what Read returns for it follows; and once, the ones that are not given back."},
 
 		{name: textPopNote, kind: KindResult, may: []string{"messages", "one_message", "calls", "one_call", "tools"},
 			when: "Appended to the answer of the call that entered a todo, once the todo is popped: what came between was removed."},
@@ -253,7 +296,7 @@ func specs() []spec {
 			when: "The instructions of the request that reviews a close, to the small model."},
 		{name: textCloseRequest, kind: KindSide,
 			need: []string{"todo", "thoughts", "ask", "files", "commands", "result", "code", "transcript"},
-			may:  []string{"no_thoughts", "no_files", "no_commands", "no_result", "no_transcript"},
+			may:  []string{"no_thoughts", "no_files", "no_commands", "no_result", "no_transcript", "more_files", "left_out"},
 			when: "What that request shows the reviewer, ending in the question."},
 		{name: textCloseCommand, kind: KindSide, need: []string{"line"}, may: []string{"exit", "not_run"},
 			when: "One command of the reviewer's list, with how it ended."},

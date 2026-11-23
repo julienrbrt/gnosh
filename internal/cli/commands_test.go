@@ -21,8 +21,8 @@ func TestCommands(t *testing.T) {
 		{line: `gnosh --hosts`, kind: ErrUnknownFlag, say: []string{"--hosts"}},
 		{line: `gnosh doctor now`, kind: ErrUsage, say: []string{"now was typed after gnosh doctor, which takes nothing after it but flags"}},
 		{line: `gnosh doctor -- now`, kind: ErrUsage, say: []string{"now was typed after gnosh doctor"}},
-		{line: `gnosh doctor -y`, kind: ErrUnknownFlag, say: []string{"-y does not go with gnosh doctor", "It is a flag of gnosh."}},
-		{line: `gnosh -y doctor`, kind: ErrUnknownFlag, say: []string{"-y (--yolo) was typed before gnosh doctor and does not go with it", "It is a flag of gnosh; flags of gnosh doctor go after its name."}},
+		{line: `gnosh doctor -y`, kind: ErrUnknownFlag, say: []string{"-y does not go with gnosh doctor", "It is a flag of gnosh and gnosh agents."}},
+		{line: `gnosh -y doctor`, kind: ErrUnknownFlag, say: []string{"-y (--yolo) was typed before gnosh doctor and does not go with it", "It is a flag of gnosh and gnosh agents; flags of gnosh doctor go after its name."}},
 		{line: `gnosh doctor --model x`, kind: ErrUnknownFlag, say: []string{"--model does not go with gnosh doctor"}},
 		{line: `gnosh doctor -p`, kind: ErrUnknownFlag, say: []string{"-p does not go with gnosh doctor"}},
 		{line: `gnosh doctor --frobnicate`, kind: ErrUnknownFlag, say: []string{"--frobnicate is not a flag of gnosh doctor", `"gnosh doctor --help" lists the flags.`}},
@@ -51,7 +51,7 @@ func TestCommands(t *testing.T) {
 		// models
 		{line: `gnosh models`, want: Invocation{Command: CmdModels}},
 		{line: `gnosh models --cwd x`, want: Invocation{Command: CmdModels, Cwd: "x"}},
-		{line: `gnosh models --json`, kind: ErrUnknownFlag, say: []string{"--json does not go with gnosh models", "It is a flag of gnosh session list, gnosh session show, gnosh session last and gnosh session rename."}},
+		{line: `gnosh models --json`, kind: ErrUnknownFlag, say: []string{"--json does not go with gnosh models", "It is a flag of gnosh session list, gnosh session show, gnosh session last and others."}},
 		{line: `gnosh models qwen`, kind: ErrUsage, say: []string{"qwen was typed after gnosh models"}},
 
 		// session
@@ -113,7 +113,7 @@ func TestCommands(t *testing.T) {
 		{line: `gnosh logs -t 0`, kind: ErrBadValue, say: []string{"-t takes a whole number of 1 or more, and 0 is not one"}},
 		{line: `gnosh logs -t many`, kind: ErrBadValue, say: []string{"many is not one"}},
 		{line: `gnosh logs -t`, kind: ErrMissingValue, say: []string{"-t needs a value after it (<n>)"}},
-		{line: `gnosh logs 50`, kind: ErrUsage, say: []string{"50 was typed after gnosh logs"}},
+		{line: `gnosh logs 50 60`, kind: ErrUsage, say: []string{"60 is one argument too many for gnosh logs", "gnosh logs [session]"}},
 
 		// dirs
 		{line: `gnosh dirs`, want: Invocation{Command: CmdDirs}},
@@ -132,6 +132,8 @@ func TestCommands(t *testing.T) {
 		{line: `gnosh mcp add greeter`, kind: ErrUsage, say: []string{"gnosh mcp add needs more after it"}},
 		{line: `gnosh mcp add-json far '{"type":"http","url":"https://x"}'`, want: Invocation{Command: CmdMCPAddJSON, Args: []string{"far", `{"type":"http","url":"https://x"}`}}},
 		{line: `gnosh mcp add-json far -t http x`, kind: ErrUnknownFlag, say: []string{"-t does not go with gnosh mcp add-json"}},
+		{line: `gnosh mcp add-json far -`, want: Invocation{Command: CmdMCPAddJSON, Args: []string{"far", "-"}}},
+		{line: `gnosh mcp get -`, kind: ErrUsage, say: []string{"- by itself means nothing"}},
 		{line: `gnosh mcp list`, want: Invocation{Command: CmdMCPList}},
 		{line: `gnosh mcp ls --cwd /w`, want: Invocation{Command: CmdMCPList, Cwd: "/w"}},
 		{line: `gnosh mcp get far`, want: Invocation{Command: CmdMCPGet, Args: []string{"far"}}},
@@ -220,14 +222,16 @@ func TestWhatIsNotInTheTable(t *testing.T) {
 		{line: `gnosh session delete abc`, kind: ErrUnknownCommand, say: []string{"delete is not a command of gnosh session", "Its commands are list, show, last and rename."}},
 		{line: `gnosh session rm abc`, kind: ErrUnknownCommand, say: []string{"rm is not a command of gnosh session"}},
 		{line: `gnosh session web`, kind: ErrUnknownCommand, say: []string{"web is not a command of gnosh session"}},
-		{line: `gnosh prompt show`, want: inter(Invocation{Prompt: "prompt show"})},
-		{line: `gnosh "prompt"`, want: inter(Invocation{Prompt: "prompt"})},
+		{line: `gnosh prompt tools`, kind: ErrUnknownCommand, say: []string{"tools is not a command of gnosh prompt", "Its commands are show, path and export. If \"prompt tools\" is a prompt, put -- before it."}},
+		{line: `gnosh prompt context`, kind: ErrUnknownCommand, say: []string{"context is not a command of gnosh prompt"}},
+		{line: `gnosh "prompt"`, kind: ErrUsage, say: []string{"gnosh prompt needs one of its commands after it", "If prompt is a prompt, put -- before it."}},
+		{line: `gnosh -- prompt show`, want: inter(Invocation{Prompt: "prompt show"})},
 		// (gnosh ssh is built: main runs it before the table is read, and
 		// the table has it for help.)
 		{line: `gnosh ssh box.example.com`, want: Invocation{Command: CmdSSH, Args: []string{"box.example.com"}}},
 		{line: `gnosh projects`, want: inter(Invocation{Prompt: "projects"})},
 		{line: `gnosh stats`, want: inter(Invocation{Prompt: "stats"})},
-		{line: `gnosh stats --all`, kind: ErrUnknownFlag, say: []string{"--all is not a flag of gnosh"}},
+		{line: `gnosh stats --all`, kind: ErrUnknownFlag, say: []string{"--all does not go with gnosh, so nothing was started", "It is a flag of gnosh agents."}},
 		{line: `gnosh projects --json`, kind: ErrUnknownFlag, say: []string{"--json does not go with gnosh"}},
 	})
 
@@ -240,8 +244,7 @@ func TestWhatIsNotInTheTable(t *testing.T) {
 	for _, gone := range []string{
 		"run", "--quiet", "--session", "--data-dir",
 		"session delete", "session web", "session web --port",
-		"prompt show", "prompt path", "prompt export", "prompt tools", "prompt context",
-		"prompt export --force", "prompt tools --json", "prompt tools --export",
+		"prompt tools", "prompt context", "prompt tools --json", "prompt tools --export",
 		"projects", "projects --json", "stats", "stats --all", "stats --crawl-dir",
 	} {
 		if have[gone] {

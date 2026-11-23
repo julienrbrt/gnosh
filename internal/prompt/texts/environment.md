@@ -1,4 +1,4 @@
-Where this session runs, as gnosh found it when the session began (this is not kept up to date):[[
+Where this session runs, as gnosh found it [[{{began?}}when the session began]][[{{summed?}}when the conversation was summed up]] (this is not kept up to date):[[
 - Today: `{{date}}`, a {{weekday}}.]][[
 - Working directory: {{cwd}}]][[
 - You run as {{user}} on the machine {{machine}}.]][[{{user_only?}}

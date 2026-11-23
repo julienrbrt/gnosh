@@ -173,7 +173,7 @@ func TestCloseCheck(t *testing.T) {
 		"The todo: fix the typo in README.md",
 		"What the user asked in this turn:\ntidy the docs",
 		"Files the agent's edits and writes changed in the todo: none",
-		"The result the agent is closing the todo with, which is its claim:\nREADME.md now says colour, not color",
+		"The result the agent is closing the todo with, which is its claim:\n  README.md now says colour, not color",
 		"the agent called Read: {\"file_path\":\"README.md\"}",
 		"the tool returned: 1\t# The docs",
 		"Is that result what came of the todo \"fix the typo in README.md\", and not of other work?")

@@ -62,6 +62,14 @@ type SelectOptions struct {
 	// CancelHint is what the line of keys says Esc does: "cancel" when
 	// empty. A permission question says "deny".
 	CancelHint string
+	// NoWrap keeps the cursor keys from going round: Up stops at the
+	// first option and Down at the last, so that going on past no never
+	// lands on yes (a permission question's). RefuseRow is the number,
+	// from one, of the option a number past the last moves the cursor
+	// to without choosing it (the no), or zero: such a number is then
+	// not taken.
+	NoWrap    bool
+	RefuseRow int
 	// Theme is the look. The zero Theme means DefaultTheme(text.NoColor).
 	Theme Theme
 	// MaxHeight is the most rows the question takes. Zero means 20.
@@ -84,6 +92,8 @@ type Select struct {
 	body       []string
 	opts       []Option
 	cancelHint string
+	noWrap     bool // the cursor keys stop at the ends (SelectOptions.NoWrap)
+	refuseRow  int  // where a number past the last moves the cursor, from one
 
 	sel     int              // the option the cursor keys are on
 	fields  []*editor.Editor // the text field of each option that takes text, once it has been opened
@@ -104,6 +114,8 @@ func NewSelect(o SelectOptions) *Select {
 		body:       styledAll(o.Body),
 		opts:       safeOptions(o.Options),
 		cancelHint: oneLine(o.CancelHint),
+		noWrap:     o.NoWrap,
+		refuseRow:  o.RefuseRow,
 		sel:        min(max(o.Selected, 0), max(len(o.Options)-1, 0)),
 		fields:     make([]*editor.Editor, len(o.Options)),
 	}
@@ -158,8 +170,28 @@ func NewConfirm(o ConfirmOptions) *Select {
 // Selected returns the option the cursor keys are on.
 func (s *Select) Selected() int { return s.sel }
 
+// move moves the cursor by one option, up (-1) or down: round from one
+// end to the other, or, with noWrap, not past either.
+func (s *Select) move(by int) {
+	n := len(s.opts)
+	if s.noWrap {
+		s.sel = min(max(s.sel+by, 0), n-1)
+		return
+	}
+	s.sel = (s.sel + by + n) % n
+}
+
 // Typing reports whether a text field is open and taking the keys.
 func (s *Select) Typing() bool { return s.typing }
+
+// TakeTexts gives s the text fields of old, a Select with the same options
+// laid out for another width, so that what was typed under an option
+// stays with it when the question is laid out again.
+func (s *Select) TakeTexts(old *Select) {
+	if len(old.fields) == len(s.fields) {
+		copy(s.fields, old.fields)
+	}
+}
 
 // handled is the result of a key that was understood and chose nothing,
 // and unhandled that of an event that meant nothing to the question.
@@ -181,16 +213,16 @@ func (s *Select) Handle(ev term.Event) Result {
 	n := len(s.opts)
 	switch kindOf(k) {
 	case keyUp, keyBackTab:
-		s.sel = (s.sel + n - 1) % n
+		s.move(-1)
 	case keyDown:
-		s.sel = (s.sel + 1) % n
+		s.move(1)
 	case keyTab:
 		// Tab opens the note of an option that takes one, and
 		// otherwise moves on like Down.
 		if s.opts[s.sel].Text != NoText {
 			s.openField()
 		} else {
-			s.sel = (s.sel + 1) % n
+			s.move(1)
 		}
 	case keyHome:
 		s.sel = 0
@@ -236,10 +268,14 @@ func (s *Select) Handle(ev term.Event) Result {
 			}
 			s.sel = int(r[0] - '1')
 			return s.choose(s.sel)
+		case r[0] >= '1' && r[0] <= '9' && s.refuseRow > 0:
+			// A number past the last: the cursor goes to no, and
+			// nothing is chosen.
+			s.sel = min(s.refuseRow-1, n-1)
 		case r[0] == 'j':
-			s.sel = (s.sel + 1) % n
+			s.move(1)
 		case r[0] == 'k':
-			s.sel = (s.sel + n - 1) % n
+			s.move(-1)
 		default:
 			return unhandled()
 		}
@@ -294,7 +330,6 @@ func (s *Select) closeField(discard bool) {
 // handleField takes an event while a text field has the keys.
 func (s *Select) handleField(ev term.Event) Result {
 	f := s.fields[s.sel]
-	n := len(s.opts)
 	if k, ok := ev.(term.Key); ok {
 		switch kindOf(k) {
 		case keyCancel, keyTab, keyBackTab:
@@ -329,11 +364,11 @@ func (s *Select) handleField(ev term.Event) Result {
 		switch kindOf(k) {
 		case keyUp:
 			s.closeField(false)
-			s.sel = (s.sel + n - 1) % n
+			s.move(-1)
 			return handled()
 		case keyDown:
 			s.closeField(false)
-			s.sel = (s.sel + 1) % n
+			s.move(1)
 			return handled()
 		}
 	}

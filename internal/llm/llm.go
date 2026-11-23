@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gnosh-ai/gnosh/internal/core"
@@ -175,7 +176,7 @@ func New(cfg Config) (core.Provider, error) {
 	case TypeLlamaCpp:
 		return &llamaCpp{openAI{p}}, nil
 	case TypeAnthropic:
-		return &anthropic{p}, nil
+		return &anthropic{provider: p}, nil
 	default:
 		return &openAI{p}, nil
 	}
@@ -202,6 +203,20 @@ type provider struct {
 	cacheTTL         string // "" or "1h"
 	maxTokensField   string
 	defaultMaxTokens int
+
+	// noImages holds the models (by the name a request gives) whose server
+	// refused a request's images: from then on each image is sent to
+	// them as a line saying it was left out (images.go). A server that
+	// serves several models may have the eyes for one and not another.
+	noImages sync.Map
+	// taken holds the images (imageKey) of requests the server answered,
+	// and unreadable those it could not read or would not take for their
+	// size, each with the line it is sent as from then on (images.go).
+	taken, unreadable sync.Map
+	// fewImages holds the models whose server refused a request for
+	// holding many images: from then on only the newest are sent whole
+	// (images.go).
+	fewImages sync.Map
 }
 
 // newProvider checks a Config and makes the provider it describes, with

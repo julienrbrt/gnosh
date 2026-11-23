@@ -2,6 +2,8 @@ package shelltool
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -30,10 +32,16 @@ type Manager struct {
 	hostNames []string         // their names, in the order declared
 	local     string           // who and where this machine is: "dev@box"
 
-	// The two ways the manager touches other processes. They are fields so
+	// The ways the manager touches other processes. They are fields so
 	// that a test can stand in for them.
 	signal func(pid int, sig syscall.Signal) error
 	procs  func(sid int) ([]procInfo, error)
+	envHas func(pid int, entry string) (bool, error)
+
+	// mark is the value of MarkVar in every command's environment, which
+	// the processes they start inherit: one that carries it is this
+	// manager's to stop, wherever its session's id has gone since.
+	mark string
 
 	notes *notifier // tells Options.OnEnd about background commands that ended
 
@@ -54,16 +62,51 @@ type Manager struct {
 	bgRunning int                 // how many background commands have not ended
 	running   map[*job]struct{}   // commands whose end is not final yet
 	lingering map[*job][]procInfo // ended commands whose output is still held open, with the processes they left
+	detached  map[int][]procInfo  // sessions of ended commands where something that let go of their output runs on, with those processes
 	tasks     map[string]*job     // background commands by id; ended ones stay
 	order     []string            // the ids in tasks, oldest first
-	calls     map[string]*job     // foreground commands by the id of the call that waits for them
-	kept      []keptFile          // output files of finished foreground commands, oldest first
-	keptBytes int64               // how much disk those files take
+	// ended are the ids of the background commands that have ended, in
+	// the order they ended: maxEndedTasks of them are kept.
+	ended     []string
+	calls     map[string]*job // foreground commands by the id of the call that waits for them
+	pending   map[string]bool // calls about to start a foreground command, by id: true once asked to go to the background as it starts
+	remote    map[string]bool // calls described that name another machine, by id: they never go to the background
+	kept      []keptFile      // output files of finished foreground commands, oldest first
+	keptBytes int64           // how much disk those files take
+	capRuns   map[string]int  // the model's commands let run, by the text of Options.ScriptCaps they hold
 
 	wg sync.WaitGroup // every goroutine the manager has started
 
 	closeOnce sync.Once
 	closeErr  error
+}
+
+// MarkVar is the variable every command is given, set to a value of its
+// session's own: what a command leaves running is known by it when the
+// session ends (stop.go, sweep).
+const MarkVar = "GNOSH_SHELL_ID"
+
+// newMark makes a manager's mark: 16 random bytes, in hex.
+func newMark() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// markEntry is the manager's mark as an entry of an environment.
+func (m *Manager) markEntry() string { return MarkVar + "=" + m.mark }
+
+// marked keeps the processes of ps whose environment holds the manager's
+// mark: what a command of this session started, and what that started in
+// turn, unless one began its program with an environment of its own.
+func (m *Manager) marked(ps []procInfo) []procInfo {
+	var out []procInfo
+	for _, p := range ps {
+		if ok, err := m.envHas(p.pid, m.markEntry()); err == nil && ok {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // keptFile is the output file of a finished foreground command.
@@ -89,12 +132,17 @@ func New(opts Options) *Manager {
 		opt:    opts.withDefaults(),
 		signal: syscall.Kill,
 		procs:  sessionProcs,
+		envHas: procEnvHas,
+		mark:   newMark(),
 
 		maxLingering: defaultMaxLingering,
 		running:      make(map[*job]struct{}),
 		lingering:    make(map[*job][]procInfo),
+		detached:     make(map[int][]procInfo),
 		tasks:        make(map[string]*job),
 		calls:        make(map[string]*job),
+		pending:      make(map[string]bool),
+		remote:       make(map[string]bool),
 	}
 	m.shell = m.opt.Shell
 	if m.shell == "" {
@@ -143,6 +191,26 @@ func (m *Manager) SetHosts(hosts []Host) {
 func (m *Manager) HostNames() []string {
 	_, names := m.hostSet()
 	return slices.Clone(names)
+}
+
+// Hosts are the machines calls may name, as declared now, in that order.
+func (m *Manager) Hosts() []Host {
+	return listed(m.hostSet())
+}
+
+// Declared is hosts as SetHosts takes them: without a name that is empty,
+// "local", or given before.
+func Declared(hosts []Host) []Host {
+	return listed(hostTable(hosts))
+}
+
+// listed is a table of hosts as a list, in the order of names.
+func listed(table map[string]*Host, names []string) []Host {
+	out := make([]Host, 0, len(names))
+	for _, n := range names {
+		out = append(out, *table[n])
+	}
+	return out
 }
 
 // hostSet is the table of declared hosts as it stands.
@@ -210,12 +278,19 @@ func (m *Manager) Stop(ctx context.Context, id string) (Task, error) {
 // Background moves the foreground command that the tool call callID is
 // waiting for to the background, where it keeps running; the call returns
 // at once with the command's task id. It is for the person's own controls.
-// It reports whether there was such a command to ask. A command on another
-// machine is not one: it runs for as long as its call holds the connection,
-// and stays in the foreground.
+// It reports whether there was such a command to ask. A call whose command
+// is about to start goes to the background as it starts: the person sees
+// the call before its command is running, and asking then is not asking
+// too early. A command on another machine is not one: it runs for as long
+// as its call holds the connection, and stays in the foreground.
 func (m *Manager) Background(callID string) bool {
 	m.mu.Lock()
 	j := m.calls[callID]
+	if _, waiting := m.pending[callID]; j == nil && waiting && !m.opt.NoBackground {
+		m.pending[callID] = true
+		m.mu.Unlock()
+		return true
+	}
 	m.mu.Unlock()
 	if j == nil || j.host != nil || m.opt.NoBackground {
 		return false
@@ -225,6 +300,142 @@ func (m *Manager) Background(callID string) bool {
 	default:
 	}
 	return true
+}
+
+// BackgroundSoon is Background for a call the caller knows is a call of
+// this manager's Bash tool in flight, which may not have reached the
+// manager yet: the person sees it while its permission is checked and its
+// PreToolUse hooks run. Its command goes to the background as it starts,
+// and one that runs already goes now. A request for a call that never
+// runs (refused, or stopped first) stays on the books until the session
+// ends: a few bytes.
+func (m *Manager) BackgroundSoon(callID string) bool {
+	m.mu.Lock()
+	if j := m.calls[callID]; j == nil {
+		// (A call for another machine stays in the foreground: one asked
+		// for while its question was open said it had gone, and kept the
+		// turn. The hosts review of 2026-11-19.)
+		ok := callID != "" && !m.opt.NoBackground && !m.closed && !m.remote[callID]
+		if ok {
+			m.pending[callID] = true
+		}
+		m.mu.Unlock()
+		return ok
+	}
+	m.mu.Unlock()
+	return m.Background(callID)
+}
+
+// remoteCall notes, as a call is described, whether it names another
+// machine, for BackgroundSoon.
+func (m *Manager) remoteCall(callID string, remote bool) {
+	if callID == "" {
+		return
+	}
+	m.mu.Lock()
+	if remote {
+		m.remote[callID] = true
+	} else {
+		delete(m.remote, callID)
+	}
+	m.mu.Unlock()
+}
+
+// expect notes that the call callID is about to start a foreground
+// command here, so that Background can be asked for it before it starts;
+// the function it returns forgets the call. (A request made before expect,
+// by BackgroundSoon, is kept.)
+func (m *Manager) expect(callID string) (forget func()) {
+	m.mu.Lock()
+	if _, ok := m.pending[callID]; !ok {
+		m.pending[callID] = false
+	}
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		delete(m.pending, callID)
+		m.mu.Unlock()
+	}
+}
+
+// LeftRunning says what Close would stop of what finished commands left
+// running, holding their output or not (cmd >log 2>&1 &, nohup cmd &):
+// each process group still there, with its programs, as the command's
+// result named it ("process group 4242 (python3)"). What started a
+// session of its own (setsid) is not in it: Close leaves that alone. It is
+// what a run tells the model before it ends (app's printwait.go), so that
+// a server the task needs is not stopped unseen.
+func (m *Manager) LeftRunning() []string {
+	m.mu.Lock()
+	sessions := make(map[int][]procInfo, len(m.lingering)+len(m.detached))
+	for j, procs := range m.lingering {
+		sessions[j.pid] = append(sessions[j.pid], procs...)
+	}
+	for sid, procs := range m.detached {
+		sessions[sid] = append(sessions[sid], procs...)
+	}
+	m.mu.Unlock()
+	var out []string
+	for sid, then := range sessions {
+		if sid <= 1 || len(then) == 0 {
+			continue
+		}
+		// As sweep finds them: the same processes, or else those that
+		// carry the session's mark.
+		now, err := m.procs(sid)
+		if err != nil || len(now) == 0 {
+			continue
+		}
+		if !sameProcess(now, then) {
+			if now = m.marked(now); len(now) == 0 {
+				continue
+			}
+		}
+		if text, _ := describeGroups(now); text != "" {
+			out = append(out, text)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// StopLeftRunning stops what finished commands left running, as Close
+// does at the end, and returns what LeftRunning said of it: a run about to
+// end stops them before it tells the model, so that one started again to
+// outlive the run (with setsid) finds its port and its files free. The
+// manager goes on.
+func (m *Manager) StopLeftRunning() []string {
+	left := m.LeftRunning()
+	m.stopLeft(false)
+	return left
+}
+
+// stopLeft stops what finished commands left behind, still holding their
+// output, and what they left that let go of it; closing, it also closes
+// their output and waits for what was read of it.
+func (m *Manager) stopLeft(closing bool) {
+	m.mu.Lock()
+	left := make(map[*job][]procInfo, len(m.lingering))
+	for j, procs := range m.lingering {
+		left[j] = procs
+	}
+	detached := m.detached
+	m.detached = make(map[int][]procInfo)
+	m.mu.Unlock()
+	var sweeps sync.WaitGroup
+	for j, procs := range left {
+		sweeps.Go(func() {
+			m.sweep(j.pid, procs)
+			if closing {
+				j.pipe.Close()
+				waitFor(j.pumped, m.opt.PipeGrace+time.Second)
+			}
+		})
+	}
+	for sid, procs := range detached {
+		sweeps.Go(func() { m.sweep(sid, procs) })
+	}
+	sweeps.Wait()
 }
 
 // Close stops every command the manager started and is still running,
@@ -282,23 +493,7 @@ func (m *Manager) close() error {
 		}
 	}
 
-	// What finished commands left behind, still holding their output.
-	m.mu.Lock()
-	left := make(map[*job][]procInfo, len(m.lingering))
-	for j, procs := range m.lingering {
-		left[j] = procs
-	}
-	m.mu.Unlock()
-	var sweeps sync.WaitGroup
-	for j, procs := range left {
-		sweeps.Go(func() {
-			m.sweep(j.pid, procs)
-			j.pipe.Close()
-			waitFor(j.pumped, m.opt.PipeGrace+time.Second)
-		})
-	}
-	sweeps.Wait()
-
+	m.stopLeft(true)
 	m.notes.close()
 
 	// Every goroutine should be done by now. One that is not is waiting on
@@ -381,6 +576,13 @@ func (m *Manager) admit(j *job, background bool, callID string) (name string, er
 	} else if callID != "" {
 		j.callID = callID
 		m.calls[callID] = j
+		if m.pending[callID] && j.host == nil {
+			// Asked to go to the background before it started.
+			select {
+			case j.move <- struct{}{}:
+			default:
+			}
+		}
 	}
 	m.running[j] = struct{}{}
 	return name, nil
@@ -442,36 +644,181 @@ func (m *Manager) unlist(j *job) {
 // stays on that list until its output closes (see settle). It reports false
 // when the manager is already closing, or is listening to as many such
 // commands as it will; the caller then deals with this one at once.
+//
+// When the output closed in the meantime, settle has come and gone and
+// found nothing on the list: what is still in the command's session let
+// go of the output, and goes on the books of what did (detached), as settle
+// would have put it.
 func (m *Manager) linger(j *job, left []procInfo) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed || len(m.lingering) >= m.maxLingering {
+		m.mu.Unlock()
 		return false
 	}
 	if !closed(j.pumped) {
-		// Otherwise the output closed in the meantime, and nothing is left
-		// to deal with.
 		m.lingering[j] = left
+		m.mu.Unlock()
+		return true
+	}
+	m.mu.Unlock()
+	if now, err := m.procs(j.pid); err == nil && len(now) > 0 {
+		j.letGo.Store(true)
+		if !m.keepDetached(j.pid, now) {
+			m.sweep(j.pid, now) // (the manager is closing)
+		}
 	}
 	return true
 }
 
-// settle is called when a command's output has closed for good: nothing of
-// it is left behind that the manager need remember.
-func (m *Manager) settle(j *job) {
+// keepDetached records that the ended command whose session is sid left
+// processes running there that let go of its output, so that Close stops
+// them. Sessions on the books whose processes have all ended are forgotten
+// first. It reports false when the manager is already closing.
+func (m *Manager) keepDetached(sid int, left []procInfo) bool {
+	m.pruneDetached()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.lingering, j)
+	if m.closed {
+		return false
+	}
+	m.detached[sid] = left
+	return true
 }
 
-// release takes a command that has ended off the list of running ones. It
-// is called once for each command that started.
-func (m *Manager) release(j *job) {
+// pruneDetached forgets the sessions on the books (detached) in which no
+// process is left. The sessions are looked at without the lock held; one
+// put on the books again meanwhile, under the same id, is kept. A session
+// must look empty twice, pruneRecheck apart: a look at a session is not one
+// moment, and a process that started a last one and ended while it was
+// looked at can make it look empty. (A clean-copy CI saw it: a launcher's
+// shell started its server and ended as the session was looked at, the
+// session was forgotten, and Close left the server running.)
+func (m *Manager) pruneDetached() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	books := make(map[int][]procInfo, len(m.detached))
+	for sid, procs := range m.detached {
+		books[sid] = procs
+	}
+	m.mu.Unlock()
+	empty := make(map[int][]procInfo)
+	for sid, then := range books {
+		if now, err := m.procs(sid); err != nil || len(now) > 0 {
+			continue
+		}
+		empty[sid] = then
+	}
+	if len(empty) == 0 {
+		return
+	}
+	time.Sleep(pruneRecheck)
+	for sid, then := range empty {
+		if now, err := m.procs(sid); err != nil || len(now) > 0 {
+			continue
+		}
+		m.mu.Lock()
+		if cur, ok := m.detached[sid]; ok && len(cur) > 0 && len(then) > 0 && cur[0] == then[0] {
+			delete(m.detached, sid)
+		}
+		m.mu.Unlock()
+	}
+}
+
+// stillThere looks at a session again, pruneRecheck later, and keeps of
+// left the processes that are still in it. A look at a session is not one
+// moment: a process that closed the output as it ended may be seen before
+// it is gone (a CI run on a busy machine saw `(sleep 0.1; echo late) &`
+// reported as left running).
+func (m *Manager) stillThere(sid int, left []procInfo) []procInfo {
+	time.Sleep(pruneRecheck)
+	again, err := m.procs(sid)
+	if err != nil {
+		return left
+	}
+	var out []procInfo
+	for _, p := range left {
+		if slices.ContainsFunc(again, func(q procInfo) bool { return q.pid == p.pid && q.start == p.start }) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// pruneRecheck is how long pruneDetached waits before it looks again at a
+// session that looked empty.
+const pruneRecheck = 50 * time.Millisecond
+
+// settle is called when a command's output has closed for good. A command
+// whose leftovers held it open (lingering) is taken off that list; when
+// processes are still in its session, what held the output let go of it
+// and runs on, and it goes on the books as what let go of the output as
+// the command ended does (detached), so that Close stops it all the same.
+// It goes on those books in the same moment it leaves the list, so that a
+// Close at any point finds it on one of them. Once the manager is closing
+// it stays on the list: close looks at the list only after it is marked
+// closed, so the command is in what it looked at, or in what it will.
+func (m *Manager) settle(j *job) {
+	m.mu.Lock()
+	_, held := m.lingering[j]
+	closing := m.closed
+	m.mu.Unlock()
+	if !held || closing {
+		return
+	}
+	now, err := m.procs(j.pid)
+	left := err == nil && len(now) > 0
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.lingering, j)
+	if left {
+		m.detached[j.pid] = now
+		j.letGo.Store(true)
+	}
+	m.mu.Unlock()
+	if left {
+		m.pruneDetached()
+	}
+}
+
+// maxEndedTasks is how many ended background commands are kept, each with
+// its output's start and end in memory and its output file on disk.
+var maxEndedTasks = 100
+
+// release takes a command that has ended off the list of running ones. It
+// is called once for each command that started, its ending recorded.
+//
+// A long session (a /loop, say) runs many background commands: of those
+// that ended, the last maxEndedTasks are kept, and an older one is let go
+// of, its output file with it unless something it left running still
+// writes there. They all stayed until the session ended, in memory and on
+// disk.
+func (m *Manager) release(j *job) {
+	var drop []*job
+	m.mu.Lock()
 	delete(m.running, j)
-	if j.taskID() != "" {
+	if id := j.taskID(); id != "" {
 		m.bgRunning--
+		m.ended = append(m.ended, id)
+		for len(m.ended) > maxEndedTasks {
+			old := m.ended[0]
+			m.ended = m.ended[1:]
+			if oj := m.tasks[old]; oj != nil {
+				delete(m.tasks, old)
+				m.order = slices.DeleteFunc(m.order, func(x string) bool { return x == old })
+				drop = append(drop, oj)
+			}
+		}
+	}
+	m.mu.Unlock()
+	for _, oj := range drop {
+		oj.mu.Lock()
+		held := oj.end != nil && oj.end.held
+		oj.mu.Unlock()
+		if !held && oj.out != nil {
+			os.Remove(oj.out.path)
+		}
 	}
 }
 

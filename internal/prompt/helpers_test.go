@@ -21,8 +21,9 @@ var controlSequences = []string{
 }
 
 // ownTagRE finds gnosh's own tags however they are spelt: opening or
-// closing, in any letter case, with blanks inside the brackets.
-var ownTagRE = regexp.MustCompile(`(?i)<[ \t\r\n]*/?[ \t\r\n]*(gnosh|mem)[ \t\r\n]*>`)
+// closing, in any letter case, with blanks inside the brackets, and the
+// start of one with more in it, as in <gnosh source="x"> or <mem/>.
+var ownTagRE = regexp.MustCompile(`(?i)<[ \t\r\n]*/?[ \t\r\n]*(gnosh|mem)[\s\x0b\pZ\p{Cf}]*>|</?(gnosh|mem)[\s\x0b\pZ\p{Cf}/]`)
 
 // control returns the first control sequence in s, or "".
 func control(s string) string {

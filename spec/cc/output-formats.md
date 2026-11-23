@@ -539,8 +539,8 @@ in P0/P1; without a host, a call that would prompt is denied (see
 
 - [ ] `structured_output` (`--json-schema`), `error_max_budget_usd`,
       `error_max_structured_output_retries`.
-- [ ] `hook_started` / `hook_progress` / `hook_response`,
-      `thinking_tokens`, `session_state_changed`, `commands_changed`,
+- [x] `hook_started` / `hook_response` (no `hook_progress`: DECISIONS 368).
+- [ ] `hook_progress`, `thinking_tokens`, `session_state_changed`, `commands_changed`,
       `conversation_reset`, `tool_use_summary`, `deferred_tool_use`,
       `user_message_uuid(s)`, `result_index`, timing extras.
 

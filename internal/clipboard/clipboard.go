@@ -9,6 +9,7 @@ package clipboard
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -53,16 +54,56 @@ func Tool(goos string, getenv func(string) string, look func(string) (string, er
 	return nil
 }
 
+// Plain is text as it may go on a clipboard. What it is pasted into next
+// may be a terminal, so its control characters go, but for tab and the
+// line breaks: a carriage return becomes a newline, and goes before one.
+// An escape sequence (ESC [201~ ends a bracketed paste) could otherwise
+// have the rest of it taken as typed. /copy copies so (the TUI review of
+// 2026-11-19), and so does gnosh ssh what the far machine copies, which
+// went on this machine's clipboard as it came (the relay review of the
+// same day).
+func Plain(s string) string {
+	s = strings.ReplaceAll(strings.ToValidUTF8(s, "\uFFFD"), "\r\n", "\n")
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\t' || r == '\n':
+			return r
+		case r == '\r':
+			return '\n'
+		case r < 0x20 || r == 0x7f || r >= 0x80 && r < 0xa0:
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// rich names what pbcopy keeps text as, other than text, by how it
+// begins: rich text or PostScript; "" for text.
+func rich(text string) string {
+	switch {
+	case strings.HasPrefix(text, `{\rtf`):
+		return "rich text (RTF)"
+	case strings.HasPrefix(text, "%!PS-Adobe"):
+		return "PostScript (EPS)"
+	}
+	return ""
+}
+
 // Copy runs tool with text on its standard input, in the environment env
 // (as os.Environ gives it; nil is this process's own). pbcopy reads its
 // input in the encoding of the locale, and where none is set in an
 // encoding that is not UTF-8, so it is given a UTF-8 locale: the text is
-// UTF-8.
+// UTF-8. Text that begins as rich text or PostScript is not given to
+// pbcopy, which would keep it as that, with its links and hidden text,
+// and not as the text it is.
 func Copy(ctx context.Context, tool []string, env []string, text string) error {
 	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, tool[0], tool[1:]...)
 	if filepath.Base(tool[0]) == "pbcopy" {
+		if kind := rich(text); kind != "" {
+			return fmt.Errorf("the text begins as %s does, which pbcopy would keep as that and not as text", kind)
+		}
 		if env == nil {
 			env = os.Environ()
 		}

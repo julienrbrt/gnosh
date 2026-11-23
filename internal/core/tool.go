@@ -37,6 +37,11 @@ type ToolResult struct {
 	// Meta holds facts about the call for hooks and the transcript: the
 	// path written, the exit code. Values must be JSON-encodable.
 	Meta map[string]any
+
+	// Notes are short lines for the person, shown under the call, never
+	// sent to the model: what came of the call besides its result (the
+	// new problems a language server found after an edit).
+	Notes []string
 }
 
 // TextResult makes a result that shows the model s.

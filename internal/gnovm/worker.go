@@ -137,7 +137,16 @@ func serve(in io.Reader, out io.Writer, setup func(hello)) error {
 			mu.Lock()
 			running, cancel = 0, nil
 			mu.Unlock()
-			if err := w.send(reply); err != nil {
+			err := w.send(reply)
+			var big frameTooLarge
+			if errors.As(err, &big) {
+				// A reply too big to send is said, not dropped: the client
+				// waited for one that never came, then stopped the worker
+				// and could not say what had become of the call (the gno
+				// review of 2026-11-19).
+				err = w.send(&frame{ID: f.ID, Type: reply.Type, Err: toWire(fmt.Errorf("the call ran, and its reply was %d bytes, more than the %d one can carry, so none of it is shown: return less", big.size, maxFrame))})
+			}
+			if err != nil {
 				log.Printf("gnovm worker: reply to %d: %v", f.ID, err)
 			}
 		}

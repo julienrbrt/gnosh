@@ -79,9 +79,12 @@ func (e *Editor) menuKey(cmd command) (res Result, done bool) {
 		// typed or the person chose it with the arrows. Otherwise Enter
 		// means what it always means, and what is sent is what was
 		// typed: a command typed in full runs, and a candidate that
-		// only resembles the word never takes its place unasked.
+		// only resembles the word never takes its place unasked. On a
+		// shell line Enter takes one only when it was chosen with the
+		// arrows: a command run before begins with what was typed, and
+		// Enter must run the line as typed, not an older one.
 		cand := c.items[c.sel]
-		if c.typed(cand) || !c.moved && !c.extends(cand) {
+		if c.typed(cand) || !c.moved && (!c.extends(cand) || e.Mode() == ModeShell) {
 			e.comp = nil
 			return Result{}, false
 		}
@@ -123,6 +126,17 @@ func (e *Editor) accept(cand Candidate) {
 		}
 		e.comp = nil
 	}
+}
+
+// Recomplete asks the application for candidates again, as when the text
+// has just changed, where a list is open or would open by itself at the
+// cursor: for candidates that came in after the list was made (a command
+// of the person's own that answered later). Elsewhere it does nothing.
+func (e *Editor) Recomplete() {
+	if e.comp == nil && !e.inTriggerWord() {
+		return
+	}
+	e.refresh(false, false)
 }
 
 // refresh asks the application for candidates and opens, updates or
@@ -210,7 +224,15 @@ func (e *Editor) wordStart() pos {
 // itself: in a word that begins with one of the trigger characters, or
 // anywhere on the line of a command, whose words after the first are for
 // the command to complete (the name of a model after "/model").
+//
+// A shell line never opens it by itself, and a slash opens it only where
+// it begins the box and makes the line a command: elsewhere (a path, a
+// command named in a prompt, a route such as /me) Tab opens it, so that
+// Enter sends or runs what was typed.
 func (e *Editor) inTriggerWord() bool {
+	if e.Mode() == ModeShell {
+		return false
+	}
 	start := e.wordStart()
 	if e.cur.line == 0 && e.Mode() == ModeCommand && start.col > 0 {
 		return true
@@ -218,7 +240,11 @@ func (e *Editor) inTriggerWord() bool {
 	if start.col >= e.cur.col {
 		return false
 	}
-	return strings.IndexByte(e.triggers, e.lines[start.line].s[start.col]) >= 0
+	c := e.lines[start.line].s[start.col]
+	if c == '/' && (start.line > 0 || start.col > 0) {
+		return false
+	}
+	return strings.IndexByte(e.triggers, c) >= 0
 }
 
 // atTrigger reports whether typing should open the list now: the cursor

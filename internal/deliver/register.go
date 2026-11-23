@@ -79,12 +79,11 @@ type register struct {
 	now  func() time.Time
 
 	mu sync.Mutex
-	// read says the file has been looked at; size and mod are the file as
-	// it then was, and gone that there was none.
+	// read says the file has been looked at; info is the file as it then
+	// was, and gone that there was none.
 	read bool
 	gone bool
-	size int64
-	mod  time.Time
+	info os.FileInfo
 	// all is every entry of the file, and sealed, by token, the ones this
 	// account's gnosh wrote: only those are served.
 	all    []record
@@ -125,18 +124,26 @@ func (r *register) seal(rec record) string {
 // register's leaves the register empty: nothing is served from a file
 // gnosh cannot make sense of.
 func (r *register) load() error {
-	st, err := os.Stat(r.path())
+	st, err := os.Lstat(r.path())
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		r.read, r.gone, r.all, r.sealed = true, true, nil, nil
 		return nil
 	case err != nil:
 		return fmt.Errorf("the register of delivered files, %s, cannot be looked at: %w", r.path(), err)
+	case !st.Mode().IsRegular() || st.Size() > maxRegister:
+		// A link (to /dev/zero, to a terminal), a pipe, or a file far
+		// bigger than one gnosh writes: a cloned repository may hold
+		// any of them there, and reading one would never end, or fill
+		// the memory, as every session in the folder starts (the
+		// deliverables review of 2026-11-19).
+		r.read, r.gone, r.all, r.sealed = false, false, nil, nil
+		return fmt.Errorf("the register of delivered files, %s, is not a file gnosh wrote (it is %s), so nothing in it is served. Move it away and deliver the files again", r.path(), registerKind(st))
 	}
-	if r.read && !r.gone && st.Size() == r.size && st.ModTime().Equal(r.mod) {
+	if r.read && !r.gone && os.SameFile(st, r.info) && st.Size() == r.info.Size() && st.ModTime().Equal(r.info.ModTime()) {
 		return nil
 	}
-	data, err := os.ReadFile(r.path())
+	data, err := readRegister(r.path(), st)
 	if err != nil {
 		return fmt.Errorf("the register of delivered files, %s, cannot be read: %w", r.path(), err)
 	}
@@ -145,7 +152,7 @@ func (r *register) load() error {
 		r.read, r.gone, r.all, r.sealed = false, false, nil, nil
 		return fmt.Errorf("the register of delivered files, %s, is not the JSON gnosh wrote (%v), so nothing in it is served. Move it away and deliver the files again", r.path(), err)
 	}
-	r.read, r.gone, r.size, r.mod = true, false, st.Size(), st.ModTime()
+	r.read, r.gone, r.info = true, false, st
 	r.all, r.sealed = file.Files, make(map[string]record, len(file.Files))
 	for _, rec := range file.Files {
 		if rec.Token == "" || rec.File == "" || !hmac.Equal([]byte(rec.Seal), []byte(r.seal(rec))) {
@@ -306,11 +313,37 @@ func (r *register) makeFolder() error {
 	if err := os.MkdirAll(r.dir, 0o700); err != nil {
 		return fmt.Errorf("the folder for delivered files, %s, could not be made: %w", r.dir, err)
 	}
+	if err := noLinks(filepath.Dir(r.dir), r.dir); err != nil {
+		return err
+	}
 	if fresh {
 		_ = os.WriteFile(filepath.Join(project, ".gitignore"), []byte("*\n"), 0o600)
 	}
 	if ignore := filepath.Join(r.dir, ".gitignore"); !exists(ignore) {
 		_ = os.WriteFile(ignore, []byte("*\n"), 0o600)
+	}
+	return nil
+}
+
+// noLinks says why gnosh writes nothing in dir when a folder on the way
+// from base down to it is a link: a repository can carry one in the data
+// folder, and the register, its ignore file and the copies of delivered
+// files would be written wherever it leads (the deliverables review of
+// 2026-11-19). dir lies under base.
+func noLinks(base, dir string) error {
+	rel, err := filepath.Rel(base, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%s is not inside %s", dir, base)
+	}
+	at := base
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "." || part == "" {
+			continue
+		}
+		at = filepath.Join(at, part)
+		if st, err := os.Lstat(at); err == nil && st.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("the folder %s is a link, and gnosh writes nothing for delivered files through one: remove the link", at)
+		}
 	}
 	return nil
 }
@@ -332,6 +365,41 @@ func fileName(p string) string {
 		return "file"
 	}
 	return name
+}
+
+// maxRegister is the most of a register's file that is read: one gnosh
+// writes holds a few lines for each file delivered.
+const maxRegister = 16 << 20
+
+// registerKind says what is at the register's place instead of a file.
+func registerKind(st os.FileInfo) string {
+	switch m := st.Mode(); {
+	case m&os.ModeSymlink != 0:
+		return "a link"
+	case m.IsDir():
+		return "a folder"
+	case !m.IsRegular():
+		return "not a plain file"
+	}
+	return fmt.Sprintf("%d bytes, more than one gnosh writes", st.Size())
+}
+
+// readRegister reads the register's file, which st describes, up to
+// maxRegister bytes, and only while it is still the file st describes.
+func readRegister(path string, st os.FileInfo) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if now, err := f.Stat(); err != nil || !os.SameFile(st, now) {
+		return nil, errors.New("it was changed while it was read")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxRegister+1))
+	if err == nil && len(data) > maxRegister {
+		err = errors.New("it grew past what a register holds while it was read")
+	}
+	return data, err
 }
 
 // exists reports whether something is at path.

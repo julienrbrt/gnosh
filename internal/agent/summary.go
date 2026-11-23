@@ -31,25 +31,39 @@ var errNothingToSummarize = errors.New("there is no conversation to summarize ye
 // conversation stays as it was.
 //
 // t is the turn the summary is made in, or nil for one the person asked
-// for between turns.
-func (a *Agent) summarize(ctx context.Context, t *turn, trigger, instructions string) (err error) {
+// for between turns. part, when not nil, is the part of the conversation
+// the person asked a summary of (SummaryPart).
+func (a *Agent) summarize(ctx context.Context, t *turn, trigger, instructions string, part *SummaryPart) (err error) {
 	su := a.setup()
 	v, err := a.view()
 	if err != nil {
 		return err
 	}
-	if !slices.ContainsFunc(v.Messages, func(m core.Message) bool { return m.Role == core.RoleAssistant }) {
+	msgs, which := v.Messages, ""
+	if part != nil {
+		msgs, which = part.Messages, "after"
+		if part.Covers != "" {
+			which = "before"
+		}
+	}
+	if !slices.ContainsFunc(msgs, func(m core.Message) bool { return m.Role == core.RoleAssistant }) {
 		return errNothingToSummarize
 	}
 	lim := a.limits(su)
 	full := a.assemble(su, v.Messages)
 	pre := a.predict(a.estimate(full, su.model), su.model)
-	info := SummaryInfo{Trigger: trigger, Instructions: instructions, PreTokens: pre}
+	if part != nil {
+		full = a.assemble(su, msgs)
+	}
+	info := SummaryInfo{Trigger: trigger, Instructions: instructions, PreTokens: pre, Window: lim.window}
 
 	// The request is gnosh's own line: the asking, then on lines of their
 	// own what the person and their hooks want of the summary, and the
 	// marker around all of it.
 	ask := a.texts.SummaryRequest
+	if part != nil && part.Ask != "" {
+		ask = part.Ask
+	}
 	if strings.TrimSpace(instructions) != "" {
 		ask += "\n" + fmt.Sprintf(a.texts.SummaryExtra, strings.TrimSpace(instructions))
 	}
@@ -66,11 +80,16 @@ func (a *Agent) summarize(ctx context.Context, t *turn, trigger, instructions st
 	}
 	ask = a.mark(ask)
 
-	a.emit(&SummaryEvent{Phase: "start", Trigger: trigger, PreTokens: pre})
+	a.emit(&SummaryEvent{Phase: "start", Trigger: trigger, Part: which, PreTokens: pre})
 	a.setPhase(PhaseSummary, "writing a summary of the conversation")
 	post := 0
 	defer func() {
-		ev := &SummaryEvent{Phase: "end", Trigger: trigger, PreTokens: pre, PostTokens: post}
+		if errors.Is(err, errFellBack) {
+			// Not a summary that failed: the fallback model is asked for
+			// it, and says so with an end of its own.
+			return
+		}
+		ev := &SummaryEvent{Phase: "end", Trigger: trigger, Part: which, PreTokens: pre, PostTokens: post}
 		if err != nil && !errors.Is(err, errStopped) {
 			ev.Err = err
 		}
@@ -122,6 +141,11 @@ func (a *Agent) summarize(ctx context.Context, t *turn, trigger, instructions st
 			return false, xerr
 		case rep.stop == core.StopMaxTokens:
 			return false, nil // cut short: not accepted
+		case len(rep.msg.ToolUses()) > 0 || rep.stop == core.StopToolUse || rep.stop == core.StopRefusal:
+			// The model began a call ("Let me check the test first.")
+			// or refused: not a summary, which would stand for the whole
+			// conversation. The bare try has no tools to call.
+			return false, nil
 		}
 		text = strings.TrimSpace(rep.msg.Text())
 		return text != "", nil
@@ -129,7 +153,7 @@ func (a *Agent) summarize(ctx context.Context, t *turn, trigger, instructions st
 
 	// As the session's own requests; then bare; then with the earliest
 	// part left out, cut at one of the model's own messages.
-	done, err := try(withAsk(full, v.Messages, ask))
+	done, err := try(withAsk(full, msgs, ask))
 	if err != nil {
 		return err
 	}
@@ -137,23 +161,70 @@ func (a *Agent) summarize(ctx context.Context, t *turn, trigger, instructions st
 		bare := a.assemble(su, nil)
 		bare.System, bare.Tools = nil, nil
 		sent = 0 // the bare request is tried whatever its size
-		done, err = try(withAsk(bare, v.Messages, ask))
+		done, err = try(withAsk(bare, msgs, ask))
 		if err != nil {
 			return err
 		}
-		for i := 1; !done && i < len(v.Messages); i++ {
-			if v.Messages[i].Role != core.RoleAssistant {
-				continue
-			}
-			rest := append([]core.Message{core.UserText(a.mark(a.texts.TrimNote))}, v.Messages[i:]...)
-			done, err = try(withAsk(bare, rest, ask))
-			if err != nil {
-				return err
+		// The earliest part is left out, cut at one of the model's own
+		// messages: first keeping the first message (the task as it was
+		// set, or the summary made before this one, on which all after it
+		// builds), with the note of what was left out after it; and only
+		// when nothing fits so, without it as well.
+		first := msgs[0]
+		for _, keepFirst := range []bool{true, false} {
+			for i := 1; !done && i < len(msgs); i++ {
+				if part != nil && part.Keep > 0 && i > part.Keep {
+					// (What the summary is of stays whole.)
+					break
+				}
+				if msgs[i].Role != core.RoleAssistant {
+					continue
+				}
+				lead := core.UserText(a.mark(a.texts.TrimNote))
+				if keepFirst {
+					lead = core.Message{Role: core.RoleUser, Blocks: append(slices.Clone(first.Blocks), core.Text(a.mark(a.texts.TrimNote)))}
+				}
+				rest := append([]core.Message{lead}, msgs[i:]...)
+				done, err = try(withAsk(bare, rest, ask))
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
 	if !done {
 		return errSummaryDidNotFit
+	}
+	if part != nil && part.Covers == "" {
+		// Not kept: it is the command's, which takes the part it stands
+		// for off the conversation.
+		if part.Done != nil {
+			part.Done(text, nil)
+		}
+		return nil
+	}
+	if part != nil {
+		// It stands for the part up to the entry it covers; what came
+		// after that stays as it was, and goes on after it.
+		a.anchor.ok = false
+		intro := part.Intro
+		if intro == "" {
+			intro = a.texts.SummaryIntro
+		}
+		if err := a.appendLog(Entry{Kind: EntrySummary, Trigger: trigger, PreTokens: pre, Covers: part.Covers,
+			Blocks: []core.Block{core.Text(a.mark(intro)), core.Text(text)}}); err != nil {
+			return err
+		}
+		if nv, verr := a.view(); verr == nil {
+			now := a.setup()
+			after := a.assemble(now, nv.Messages)
+			post = a.predict(a.estimate(after, now.model), now.model)
+			a.noteContext(now, a.limits(now), post)
+		}
+		if part.Done != nil {
+			part.Done(text, nil)
+		}
+		return nil
 	}
 
 	// The summary stands for everything before it. The estimates are no
@@ -181,11 +252,24 @@ func (a *Agent) summarize(ctx context.Context, t *turn, trigger, instructions st
 	if f := a.opts.Moments.AfterSummary; f != nil {
 		info.Summary = text
 		parts, ferr, ok := await(ctx, a, "the after-summary moment", func(ctx context.Context) ([]Part, error) { return f(ctx, info) })
-		switch {
-		case !ok || ctx.Err() != nil:
-		case ferr != nil:
-			a.notice(LevelWarning, "summary", fmt.Sprintf("What the session is given back after a summary could not be put together (%v).", ferr))
-		default:
+		var h *StopWork
+		halted := errors.As(ferr, &h)
+		if halted && t != nil {
+			// It said stop: the turn the summary was made in ends here,
+			// once what it gave back is kept. (After /compact no turn
+			// runs, and there is nothing to end.)
+			t.halt = firstNonEmpty(h.Reason, "the end of the summary stopped the turn")
+		}
+		if ferr != nil && !halted && ok && ctx.Err() == nil {
+			// What could not be made is said; what was made is still
+			// given back below (the instructions the session started with,
+			// its skills: lost, they stayed lost for the session).
+			a.notice(LevelWarning, "summary", fmt.Sprintf("Not all of what the session is given back after a summary could be put together (%v).", ferr))
+		}
+		// What the moment made is kept even when the turn is being stopped,
+		// as the summary is, with which it goes; only a moment that did not
+		// finish gives nothing back.
+		if ok {
 			var notes []Entry
 			for _, p := range parts {
 				if strings.TrimSpace(p.Text) != "" {

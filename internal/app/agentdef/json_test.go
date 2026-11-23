@@ -23,7 +23,7 @@ func TestFromJSON(t *testing.T) {
 		strings.Join(r.AgentTypes, ",") != "helper,x" || r.Model != "" || !r.InheritModel || r.MaxTurns != 5 || r.Scope != ScopeCommandLine || r.Source != "--agents" {
 		t.Errorf("reviewer = %+v", r)
 	}
-	if strings.Join(w.Tools, ",") != "Read,Edit" || strings.Join(w.Disallowed, ",") != "Bash" || !w.Background || len(w.Other) != 0 || w.Hooks != nil ||
+	if strings.Join(w.Tools, ",") != "Read,Edit" || strings.Join(w.Disallowed, ",") != "Bash" || !w.Background || w.Hooks != nil ||
 		strings.Join(w.Skills, ",") != "style,terms" || w.Effort != "max" || w.InitialPrompt != "Begin." {
 		t.Errorf("writer = %+v", w)
 	}
@@ -48,7 +48,7 @@ func TestFromJSON(t *testing.T) {
 // A definition given with --agents is used in place of one of the same
 // name from a file or gnosh's own, and listed after them.
 func TestOver(t *testing.T) {
-	base := LoadFrom(nil, nil)
+	base := LoadFrom(nil, nil, nil)
 	defs, err := FromJSON(`{"Explore": {"description": "My own explorer."}, "extra": {"description": "One more."}}`)
 	if err != nil {
 		t.Fatal(err)

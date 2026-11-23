@@ -407,3 +407,49 @@ func TestRestoreOnPanic(t *testing.T) {
 		t.Error("RestoreOnPanic restored the terminal although nothing panicked")
 	}
 }
+
+// The whole screen a Panel takes is given back with the terminal, whatever
+// gives it up (an editor, a stop, a panic), and taken again with it. The
+// shell was left on the alternate screen with mouse reporting on, every
+// click typed into it (the TUI review of 2026-11-19).
+func TestPanelScreenGoesWithTheTerminal(t *testing.T) {
+	p := openTerminal(t, Options{NoSignals: true})
+	panel, err := OpenPanel(p.term, 120, 30, func(s string) int { return len(s) }, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.wrote(altScreenOn + AutoWrapOff + mouseOn)
+	if err := p.term.Release(); err != nil {
+		t.Fatal(err)
+	}
+	p.wrote(mouseOff + altScreenOff)
+	if err := p.term.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	p.wrote(altScreenOn + AutoWrapOff + mouseOn)
+	func() {
+		defer func() { _ = recover() }()
+		defer p.term.RestoreOnPanic()
+		panic("boom")
+	}()
+	p.wrote(mouseOff + altScreenOff)
+
+	// A panel that was closed leaves nothing to give back.
+	q := openTerminal(t, Options{NoSignals: true})
+	panel2, err := OpenPanel(q.term, 120, 30, func(s string) int { return len(s) }, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := panel2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	q.wrote(altScreenOff)
+	if err := q.term.Release(); err != nil {
+		t.Fatal(err)
+	}
+	q.wrote(ShowCursor)
+	if strings.Contains(q.output, altScreenOff) {
+		t.Errorf("a closed panel's screen was given back again: %q", q.output)
+	}
+	_ = panel
+}

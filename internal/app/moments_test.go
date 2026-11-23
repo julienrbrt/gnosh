@@ -41,6 +41,34 @@ func TestHookAddsContext(t *testing.T) {
 	}
 }
 
+// A PostToolUse hook's updatedToolOutput is what the model reads in place
+// of what the tool returned: a redaction keeps the secret out of the
+// conversation. A replacement gnosh cannot read as text withholds the
+// output rather than show it (where Claude Code shows the original).
+func TestHookReplacesToolOutput(t *testing.T) {
+	w := apptest.NewWorld(t,
+		apptest.Reply{Calls: []apptest.Call{{ID: "c1", Name: "Bash", Args: `{"command":"printf 'token=sk-%s\\n' SECRET-123"}`}}},
+		apptest.Reply{Text: "Done."},
+		apptest.Reply{Calls: []apptest.Call{{ID: "c2", Name: "Bash", Args: `{"command":"printf 'token=sk-%s\\n' SECRET-456"}`}}},
+		apptest.Reply{Text: "Done again."})
+	redact := w.Script(w.Home+"/hooks/redact.sh", `cat > /dev/null; echo '{"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {"stdout": "token=[redacted]", "stderr": "", "interrupted": false, "isImage": false}}}'`)
+	w.Hook("PostToolUse", "Bash", redact)
+	run(t, w, "-y", "-p", "show the token").wantCode(t, 0)
+	got := toolResult(t, w, 1, "c1")
+	has(t, "what the model read", got, "token=[redacted]")
+	hasNot(t, "what the model read", got, "sk-SECRET-123")
+	for _, req := range w.Model.Requests() {
+		hasNot(t, "every request", string(req.Body), "sk-SECRET-123")
+	}
+
+	odd := w.Script(w.Home+"/hooks/odd.sh", `cat > /dev/null; echo '{"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": {"lines": 3}}}'`)
+	w.Hook("PostToolUse", "Bash", odd)
+	run(t, w, "-y", "-c", "-p", "show it again").wantCode(t, 0)
+	got = toolResult(t, w, 3, "c2")
+	has(t, "what the model read", got, "withheld")
+	hasNot(t, "what the model read", got, "sk-SECRET-456")
+}
+
 // A hook that cannot run does not pass: the call it guards is not run.
 func TestHookThatCannotRunFailsClosed(t *testing.T) {
 	w := apptest.NewWorld(t,
@@ -195,6 +223,25 @@ func TestTheRarerHookEventsFire(t *testing.T) {
 		if got := strings.Join(loggedEvents(t, w), "\n"); got != "PreCompact manual\nPostCompact manual\nSessionStart compact" {
 			t.Errorf("the hooks that ran: %q", got)
 		}
+	})
+	t.Run("instruction files given again after a summary", func(t *testing.T) {
+		w := apptest.NewWorld(t, apptest.Reply{Text: "The first answer."}, apptest.Reply{Text: "SUMMARY: nothing much."})
+		w.Write("AGENTS.md", "A rule.\n")
+		eventLog(w, "InstructionsLoaded")
+		s := sit(t, w)
+		s.see("Type a prompt and Enter.")
+		s.typeLine("remember this")
+		s.see("The first answer.")
+		s.typeLine("/compact")
+		s.see("The conversation was summarized")
+		// (The hooks are not waited for: a session that ends at once may
+		// end before one has run.)
+		waitFor(t, "InstructionsLoaded after the summary", func() bool {
+			return strings.Contains(strings.Join(loggedEvents(t, w), "\n"), "InstructionsLoaded compact")
+		})
+		has(t, "the hooks that ran", strings.Join(loggedEvents(t, w), "\n"), "InstructionsLoaded session_start")
+		s.typeLine("/exit")
+		s.exit()
 	})
 	t.Run("a session that waits for its person", func(t *testing.T) {
 		defer func(a, i time.Duration) { askNotifyAfter, idleNotifyAfter = a, i }(askNotifyAfter, idleNotifyAfter)

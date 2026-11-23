@@ -12,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gnosh-ai/gnosh/internal/agent"
 	"github.com/gnosh-ai/gnosh/internal/cli"
@@ -51,6 +52,11 @@ type Options struct {
 	// the session's front end decides; once the program has begun to shut
 	// down, another one calls Exit at once. Nil means no signals arrive.
 	Signals <-chan os.Signal
+	// AnswerWait, when not nil, is how long after the plain front end puts
+	// a question a line typed is still taken for one typed before the
+	// question could be read (the default is answerWait; the tests, which
+	// type at once, set none).
+	AnswerWait *time.Duration
 	// Exit, when not nil, ends the process at once with the code it is
 	// given. It is called for a second signal, when the first is already
 	// being acted on, and for nothing else.
@@ -86,6 +92,11 @@ type Options struct {
 	// session in place of the plain one that reads lines. It is where a
 	// full interface is attached.
 	Interactive func(FrontendInfo) Frontend
+	// AgentView, when not nil, is the agent view gnosh agents opens on a
+	// terminal (agentview.go): it runs until the person leaves it, and
+	// returns the exit code. Nil means there is no terminal to draw it on,
+	// and gnosh agents prints the list.
+	AgentView func(AgentViewInfo) int
 
 	// OpenTerminal, when not nil, opens the terminal the process is
 	// attached to for reading, whatever standard input is: it is how a
@@ -130,12 +141,28 @@ type program struct {
 	lastMu   sync.Mutex
 	lastStop func()
 
+	// runAsks is the base of the files the permission questions of this
+	// run in the background go through to the agent view (runasks.go), or
+	// "" when there is nobody to ask. runOut, for such a run, is what it
+	// prints on its way into its log.
+	runAsks string
+	runOut  *runOutput
+
 	// started is the program file as gnosh started from it (nil when it
 	// is not known), and restart the command line /restart asked to start
 	// again with, once the session is closed. restarted says this gnosh is
-	// one that /restart started (restartedEnv): the session it opens is
+	// one that /restart started (RestartedEnv): the session it opens is
 	// still on the screen.
 	restarted bool
+	// restartedFrom is the BuildID of the gnosh that /restart came from,
+	// when it said (whatsNew).
+	restartedFrom string
+	// movedFrom is the folder the session left, in a gnosh /cd started
+	// (MovedEnv).
+	movedFrom string
+	// treeMove is what EnterWorktree or ExitWorktree did, in the gnosh
+	// they started (TreeMoveEnv).
+	treeMove  treeMove
 	started   os.FileInfo
 	restartMu sync.Mutex
 	restart   []string
@@ -143,6 +170,24 @@ type program struct {
 	// is closed, instead of a restart: the run's log, its prompt and the
 	// session it resumes.
 	detached *detachPlan
+	// moving is the folder /cd moves the session from, for the gnosh it
+	// starts, and treeMoving what EnterWorktree or ExitWorktree did, for
+	// the one they start (TreeMoveEnv, as JSON).
+	moving, treeMoving string
+	// runs are the /fork and /subtask runs a session of this program
+	// started and watches, by id (*watchedRun): kept here, and watched
+	// again, when the session is opened again (a rewind), so that a
+	// rewind of the files still waits for them and a /subtask's answer
+	// still comes back.
+	runs sync.Map
+}
+
+// watchedRun is a /fork or /subtask run a session watches.
+type watchedRun struct {
+	// session is the session that started it; what is "fork" or
+	// "subtask"; log and path are its log and its session's file; task
+	// is what a /subtask run was set to do.
+	session, what, log, path, task string
 }
 
 // lockedWriter lets several goroutines write whole lines to one stream.
@@ -156,6 +201,78 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.w.Write(p)
+}
+
+// printsFromOutside reports whether a command prints text that comes in
+// part from outside gnosh, to be made plain on a terminal. Sessions draw
+// through their own renderer, and the agent view and attach take the
+// terminal over.
+func printsFromOutside(c cli.Command) bool {
+	switch c {
+	case cli.CmdInteractive, cli.CmdPrint, cli.CmdAgents, cli.CmdAttach, cli.CmdSSH, cli.CmdHelp, cli.CmdVersion:
+		return false
+	}
+	return true
+}
+
+// plainWriter writes what it is given with every control character but
+// the line break and the tab, every C1 control, and every mark that
+// turns the order text is drawn in written out as its escape (\x1b,
+// \u202e), so that nothing printed acts on the terminal: a cloned
+// repository's .mcp.json naming a server with an escape sequence in it
+// moved the cursor, set the title or wrote the clipboard when gnosh mcp
+// list printed it (the terminal review of 2026-11-19).
+type plainWriter struct{ w io.Writer }
+
+func (pw plainWriter) Write(b []byte) (int, error) {
+	if _, err := io.WriteString(pw.w, plainText(string(b))); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+// plainText is s with what would act on a terminal written as escapes.
+func plainText(s string) string {
+	clean := true
+	for _, r := range s {
+		if actsOnTerminal(r) || r == utf8.RuneError {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			fmt.Fprintf(&b, `\x%02x`, s[i])
+		case r < 0x80 && actsOnTerminal(r):
+			fmt.Fprintf(&b, `\x%02x`, r)
+		case actsOnTerminal(r):
+			fmt.Fprintf(&b, `\u%04x`, r)
+		default:
+			b.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	return b.String()
+}
+
+// actsOnTerminal reports whether r, printed, could act on a terminal or
+// change how the text around it is drawn.
+func actsOnTerminal(r rune) bool {
+	switch {
+	case r == '\n', r == '\t':
+		return false
+	case r < 0x20, r == 0x7f, r >= 0x80 && r < 0xa0:
+		return true
+	case r == 0x200e, r == 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069, r == 0xfeff:
+		return true
+	}
+	return false
 }
 
 // Main runs gnosh and returns the process's exit code. It is the whole
@@ -174,6 +291,7 @@ func Main(ctx context.Context, o Options) (code int) {
 		if v := recover(); v != nil {
 			code = p.crashed("", v, debug.Stack())
 		}
+		p.runEnded(code)
 	}()
 	code = p.run(ctx)
 	if args := p.restartArgs(); args != nil && code == cli.ExitOK {
@@ -216,12 +334,42 @@ func newProgram(o Options) *program {
 		}
 	}
 	p.home = p.env["HOME"]
-	if p.env[restartedEnv] != "" {
+	if p.env[RestartedEnv] != "" {
 		// /restart's word to the gnosh it starts, and no one else's: it
 		// is gone before anything reads the environment.
-		p.restarted = p.env[restartedEnv] == "1"
-		delete(p.env, restartedEnv)
-		p.o.Environ = slices.DeleteFunc(slices.Clone(p.o.Environ), func(kv string) bool { return strings.HasPrefix(kv, restartedEnv+"=") })
+		p.restarted = true
+		if from := p.env[RestartedEnv]; from != "1" {
+			p.restartedFrom = from
+		}
+		delete(p.env, RestartedEnv)
+		p.o.Environ = slices.DeleteFunc(slices.Clone(p.o.Environ), func(kv string) bool { return strings.HasPrefix(kv, RestartedEnv+"=") })
+	}
+	if base, ok := p.env[AsksEnv]; ok {
+		// The word of the gnosh that started this run in the background
+		// (runasks.go), as /restart's is.
+		if filepath.IsAbs(base) {
+			p.runAsks = filepath.Clean(base)
+			p.runOut = &runOutput{w: p.stdout.w}
+			p.stdout.w, p.stderr.w = p.runOut.to(p.stdout.w), p.runOut.to(p.stderr.w)
+		}
+		delete(p.env, AsksEnv)
+		p.o.Environ = slices.DeleteFunc(slices.Clone(p.o.Environ), func(kv string) bool { return strings.HasPrefix(kv, AsksEnv+"=") })
+	}
+	if from, ok := p.env[MovedEnv]; ok {
+		// /cd's word, as /restart's is.
+		if p.restarted && filepath.IsAbs(from) {
+			p.movedFrom = filepath.Clean(from)
+		}
+		delete(p.env, MovedEnv)
+		p.o.Environ = slices.DeleteFunc(slices.Clone(p.o.Environ), func(kv string) bool { return strings.HasPrefix(kv, MovedEnv+"=") })
+	}
+	if move, ok := p.env[TreeMoveEnv]; ok {
+		// EnterWorktree's and ExitWorktree's word, as /cd's is.
+		if p.restarted {
+			p.treeMove = readTreeMove(move)
+		}
+		delete(p.env, TreeMoveEnv)
+		p.o.Environ = slices.DeleteFunc(slices.Clone(p.o.Environ), func(kv string) bool { return strings.HasPrefix(kv, TreeMoveEnv+"=") })
 	}
 	if o.Executable != "" {
 		p.started, _ = os.Stat(o.Executable)
@@ -250,11 +398,12 @@ func (p *program) warnf(format string, args ...any) {
 // not built has no row (spec/DECISIONS.md, 26).
 var built = []string{
 	"doctor", "doctor --hosts", "trust", "trust --list", "trust --forget",
-	"dirs", "logs", "logs --tail", "logs --follow", "models", "ssh", "--worktree",
+	"dirs", "agents", "agents --json", "agents --all", "logs", "logs --tail", "logs --follow", "stop", "attach", "--bg", "models", "ssh", "--worktree",
 	"session list", "session show", "session last", "session rename",
 	"session --json",
-	"--fork-session", "--name", "--no-session-persistence", "--include-partial-messages",
-	"--reasoning-effort", "--small-model",
+	"prompt show", "prompt path", "prompt export", "prompt export --force",
+	"--fork-session", "--name", "--no-session-persistence", "--include-partial-messages", "--include-hook-events",
+	"--reasoning-effort", "--small-model", "--fallback-model",
 	"--permission-mode",
 	"--permission-mode=default", "--permission-mode=plan", "--permission-mode=acceptEdits",
 	"--permission-mode=dontAsk", "--permission-mode=bypassPermissions",
@@ -265,11 +414,11 @@ var built = []string{
 	"--debug", "--debug-file", "--verbose",
 	"--output-format=json", "--output-format=stream-json", "--input-format=stream-json", "--replay-user-messages", "--json-schema",
 	"--permission-prompts", "--permission-prompts=host", "--permission-prompts=none",
-	"mcp add", "mcp add-json", "mcp get", "mcp list", "mcp remove",
+	"mcp add", "mcp add-json", "mcp get", "mcp list", "mcp remove", "mcp login", "mcp logout", "mcp --no-browser",
 	"mcp --scope", "mcp --scope=local", "mcp --scope=user", "mcp --scope=project",
 	"mcp --transport", "mcp --transport=stdio", "mcp --transport=http",
 	"mcp --env", "mcp --header",
-	"--mcp-config", "--strict-mcp-config",
+	"--mcp-config", "--strict-mcp-config", "--channels", "--dangerously-load-development-channels",
 }
 
 // buildTable makes the command-line table of this build: the table as it
@@ -323,6 +472,12 @@ func (p *program) run(ctx context.Context) int {
 		return cli.ExitFailure
 	}
 
+	if p.o.StdoutIsTerminal && printsFromOutside(inv.Command) {
+		// What these print comes in part from outside gnosh (a server's
+		// name, a session's title, a fact mem keeps, a path in a cloned
+		// repository's files): to a terminal it goes plain.
+		p.stdout.w, p.stderr.w = plainWriter{p.stdout.w}, plainWriter{p.stderr.w}
+	}
 	switch inv.Command {
 	case cli.CmdHelp:
 		text, err := table.Help(inv.HelpFor...)
@@ -343,16 +498,27 @@ func (p *program) run(ctx context.Context) int {
 	case cli.CmdTrust:
 		return p.trustCommand(ctx, inv)
 	case cli.CmdInteractive, cli.CmdPrint:
+		if inv.Background {
+			return p.backgroundCommand(ctx, inv)
+		}
 		return p.sessionCommand(ctx, inv)
 	case cli.CmdDirs:
 		return p.dirsCommand(ctx, inv)
+	case cli.CmdPromptShow, cli.CmdPromptPath, cli.CmdPromptExport:
+		return p.promptCommand(ctx, inv)
+	case cli.CmdAgents:
+		return p.agentsCommand(ctx, inv)
 	case cli.CmdLogs:
 		return p.logsCommand(ctx, inv)
+	case cli.CmdStop:
+		return p.stopCommand(ctx, inv)
+	case cli.CmdAttach:
+		return p.attachCommand(ctx, inv)
 	case cli.CmdModels:
 		return p.modelsCommand(ctx, inv)
 	case cli.CmdSessionList, cli.CmdSessionShow, cli.CmdSessionLast, cli.CmdSessionRename:
 		return p.sessionsCommand(ctx, inv)
-	case cli.CmdMCPAdd, cli.CmdMCPAddJSON, cli.CmdMCPGet, cli.CmdMCPList, cli.CmdMCPRemove:
+	case cli.CmdMCPAdd, cli.CmdMCPAddJSON, cli.CmdMCPGet, cli.CmdMCPList, cli.CmdMCPRemove, cli.CmdMCPLogin, cli.CmdMCPLogout:
 		return p.mcpCommand(ctx, inv)
 	case cli.CmdSSH:
 		// main runs gnosh ssh before anything is read; it comes here only
@@ -437,6 +603,34 @@ func (p *program) versionLine() string {
 		b.Commit = p.o.BuildID
 	}
 	return cli.VersionLine(b)
+}
+
+// runEnded ends the log of a run in the background, as its last line, with
+// how the run ended (runDone, runFailed, runSignalled), for gnosh agents
+// and the agent view, as Claude Code's list tells a session that failed
+// from one that is done. A run whose process is gone and whose log has no
+// such line ended without a word: it was killed, or its machine stopped.
+func (p *program) runEnded(code int) {
+	if p.runAsks == "" {
+		return
+	}
+	p.runOut.flush()
+	f, err := os.OpenFile(p.runAsks+".log", os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	how := runDone
+	switch {
+	case code > 128:
+		how = fmt.Sprintf("%s (exit status %d).", runSignalled, code)
+	case code != cli.ExitOK:
+		how = fmt.Sprintf("%sit ended with exit status %d.", runFailed, code)
+	}
+	// (To the millisecond: a session's status line counts the runs that
+	// ended since it last looked, which it may have done in the same
+	// second. readRunLog's RFC3339 reads the fraction.)
+	fmt.Fprintf(f, "gnosh: %s%s\n", p.now().UTC().Format("2006-01-02T15:04:05.000Z07:00"), how)
 }
 
 // signalExit is the exit code of a program that a signal stopped: 130 for

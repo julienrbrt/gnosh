@@ -15,12 +15,12 @@ func TestKindsMatchTheTrustPackage(t *testing.T) {
 	got := []string{
 		KindProvider, KindModel, KindHost, KindHook, KindHookOff,
 		KindAllowRule, KindAskRule, KindDenyRule, KindMode, KindAddDir, KindEnv, KindOption, KindExtraPath,
-		KindAddress, KindHiddenSkill, KindRemoval,
+		KindAddress, KindHiddenSkill, KindRemoval, KindStatusLine, KindFileSuggest, KindLSPServer, KindSandboxWider,
 	}
 	want := []string{
 		"provider", "model", "host", "hook", "hook-off",
 		"allow-rule", "ask-rule", "deny-rule", "mode", "add-dir", "env", "option", "extra-path",
-		"address", "hidden-skill", "removal",
+		"address", "hidden-skill", "removal", "status-line", "file-suggestion", "lsp", "sandbox-wider",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("the kinds changed:\n got %q\nwant %q\nChange internal/trust/kinds.go and its test to match.", got, want)
@@ -152,14 +152,14 @@ func TestOptionTable(t *testing.T) {
 		}
 	}
 	// Every hook event has an entry, in the spec's order, and exactly the
-	// three with nothing to match take no matcher.
+	// five with nothing to match take no matcher.
 	var none []string
 	for _, e := range hookEvents {
 		if e.matcher == "" {
 			none = append(none, e.name)
 		}
 	}
-	if len(hookEvents) != 19 || !slices.Equal(none, []string{"UserPromptSubmit", "Stop", "SubagentStop", "CwdChanged"}) {
+	if len(hookEvents) != 25 || !slices.Equal(none, []string{"UserPromptSubmit", "Stop", "SubagentStop", "CwdChanged", "PostToolBatch"}) {
 		t.Errorf("hook events: %d, without a matcher %q", len(hookEvents), none)
 	}
 	if !slices.Equal(HookEventNames()[:6], []string{"PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit", "SessionStart", "Stop"}) {

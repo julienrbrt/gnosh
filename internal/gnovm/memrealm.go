@@ -10,7 +10,6 @@
 package gnovm
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -314,7 +313,10 @@ func (r *memRealm) call(code string, ctx memContext) (call memCall, err error) {
 	wc := &writeCounter{Store: kv}
 	tx := r.b.store.BeginTransaction(wc, wc, nil, nil)
 	tx.SetPackageGetter(nil)
-	var out bytes.Buffer
+	// What a call prints is capped as a VM's is: a loop printing a big
+	// string grew an unbounded buffer for as long as the call ran, while
+	// it held mem's lock (the gno review of 2026-11-19).
+	out := &capWriter{max: maxOutput}
 	now := r.clock()
 	call.At = now.Unix()
 	ctx.ExecContext = execContext(0, now)
@@ -361,7 +363,7 @@ func (r *memRealm) call(code string, ctx memContext) (call memCall, err error) {
 			}
 		}
 	}()
-	opts := gno.MachineOptions{Output: &out, Store: tx, Context: ctx, BoundedPanicRender: true, GasMeter: meter, Alloc: gno.NewAllocator(memCapBytes)}
+	opts := gno.MachineOptions{Output: out, Store: tx, Context: ctx, BoundedPanicRender: true, GasMeter: meter, Alloc: gno.NewAllocator(memCapBytes)}
 	m := gno.NewMachineWithOptions(opts)
 	defer m.Release()
 	_, pv := m.RunMemPackage(mpkg, false)

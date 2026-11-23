@@ -409,7 +409,10 @@ ignoring a trailing dot.
 - **Cd**: governs the user's `/cd` command only (the model cannot call it).
   Bare `Cd` deny disables `/cd`; any `Cd` allow rule turns `/cd` into an
   allowlist. Paths use the same anchors but match whole directory paths
-  (`*` = one segment, `**` = any depth). (P2)
+  (`*` = one segment, `**` = any depth). (P2; built with /cd, DECISIONS
+  77: deny rules are checked against the folder as typed, by way of each
+  link and as resolved; allow rules against it as resolved; a Cd ask rule
+  is a mistake, as there is nobody else to ask.)
 
 ## 8. Where rules live, and which win
 
