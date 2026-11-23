@@ -66,12 +66,13 @@ export default async function (pi: ExtensionAPI) {
 
   // What this extension keeps of the session: the slides gnosh planned (sent
   // back in every view), whether the session has had a prompt yet, the
-  // conversation as the last request had it, and whether a slide was made
-  // since the model last answered (pi's own count is from before it).
+  // conversation as the last request had it.
   let slides: Entry[] = [];
   let prompted = false;
   let last: PiMessage[] = [];
-  let slidSinceReply = false;
+  // freedSinceReply is what slides took out since the model last answered:
+  // pi's own count is from before them.
+  let freedSinceReply = 0;
   const stats = { slides: 0, freed: 0, compactions: 0, cancelled: 0, notes: 0, pushes: 0, pops: 0, calls: 0 };
   const statsFile = process.env.PI_GNOSH_STATS;
   const log = (line: string) => {
@@ -179,7 +180,7 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.on("message_end", async (event) => {
-    if ((event.message as { role?: string }).role === "assistant") slidSinceReply = false;
+    if ((event.message as { role?: string }).role === "assistant") freedSinceReply = 0;
   });
 
   /** point is where pi compacts: its window less its reserve. */
@@ -199,32 +200,32 @@ export default async function (pi: ExtensionAPI) {
     if (!r.freed || !r.new_slides?.length) return undefined;
     slides.push(...r.new_slides);
     pi.appendEntry(SLIDES, r.new_slides);
-    slidSinceReply = true;
+    freedSinceReply += r.freed;
     stats.slides++;
     stats.freed += r.freed;
     log(`slid instead of compacting at ~${used} tokens (point ${p.point}): ${r.notice ?? ""}`);
     return r.parts ?? [];
   }
 
-  // Where pi would compact, gnosh slides; pi compacts only when nothing can.
+  // Where pi would compact, gnosh slides; pi compacts only when the slides
+  // cannot bring the conversation under its point, as in a gnosh session.
   pi.on("session_before_compact", async (event, ctx) => {
     if (event.reason === "manual") return undefined;
-    if (slidSinceReply) {
+    const p = point(ctx);
+    const before = event.preparation.tokensBefore;
+    const under = () => !!p && before - freedSinceReply <= p.point;
+    if (event.reason === "threshold" && !under()) {
+      const notes = await slide(ctx, before - freedSinceReply);
+      for (const n of notes ?? []) pi.sendMessage({ customType: NOTE, content: n, display: false }, { deliverAs: "steer" });
+      stats.notes += notes?.length ?? 0;
+    }
+    if (event.reason === "threshold" && freedSinceReply > 0 && under()) {
       // pi's count is from before the slide; the next request is smaller.
       stats.cancelled++;
       return { cancel: true };
     }
-    if (event.reason === "threshold") {
-      const notes = await slide(ctx, event.preparation.tokensBefore);
-      if (notes) {
-        stats.cancelled++;
-        for (const n of notes) pi.sendMessage({ customType: NOTE, content: n, display: false }, { deliverAs: "steer" });
-        stats.notes += notes.length;
-        return { cancel: true };
-      }
-    }
     stats.compactions++;
-    log(`pi compacts (${event.reason}): nothing could slide`);
+    log(`pi compacts (${event.reason}) at ~${before} tokens: the slides freed ${freedSinceReply}, not enough`);
     return undefined;
   });
 
@@ -235,10 +236,10 @@ export default async function (pi: ExtensionAPI) {
     const p = point(ctx);
     if (!p) return undefined;
     const notes: string[] = [];
-    if (p.used > p.point && !slidSinceReply) {
+    if (p.used - freedSinceReply > p.point) {
       // last is the request just answered; the results came after it.
       last = [...last, event.message as unknown as PiMessage, ...(event.toolResults as unknown as PiMessage[])];
-      notes.push(...((await slide(ctx, p.used)) ?? []));
+      notes.push(...((await slide(ctx, p.used - freedSinceReply)) ?? []));
     }
     if (has("step")) {
       const msgs = [...last];
