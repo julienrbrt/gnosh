@@ -325,9 +325,11 @@ in the first pi benchmark one run slid twelve times inside one todo with no
 thought or result kept. A host may ask, with `covered: true` on `room` and
 `step`, that the bridge slide only what mem covers:
 
-- `room` makes the cut only when a reply that keeps something in mem (a
+- `room` makes the cut only when a call that kept something in mem (a
   thought, fact, rule, todo, result, a reopened or dropped todo) came at or
-  after the first entry the cut would take. When one of the planned cuts is
+  after the first entry the cut would take. Kept is read from the call's
+  result among the entries: a call mem refused (an error, as a refused
+  close is) or that failed kept nothing. When one of the planned cuts is
   not covered, nothing slides: `freed` is 0, `notice` says why, and the
   host makes room its own way, by a summary.
 - `step` adds the slide-soon line once per todo, and again after each slide

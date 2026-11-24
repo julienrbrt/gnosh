@@ -30,7 +30,7 @@ process.
 | 7.3 | after a pop the popped work is gone and the push's result holds the note | `transcript.View` | `TestBridgePushWorkPop` |
 | 7.4 | the prefix through the push is byte for byte the same; a later request extends it | `transcript.View` | `TestBridgePushWorkPop` |
 | 8 | the error codes; the bridge goes on after an error but `protocol` | `fail`, `Handle` | `TestSpec3And8Errors`, `TestSpec4Hello` |
-| 10.4 | `covered`: room cuts only work mem got a record of since, else frees nothing with a notice; step's slide-soon line once per todo and after each slide | `room`, `step`, `covered`, `recordedSince`; `memjoin` `recordsMem` | `TestBridgeCoveredSlide`, `TestRecordsMem` |
+| 10.4 | `covered`: room cuts only work mem got a record of since (read from the call and its result: refused or failed calls keep nothing), else frees nothing with a notice; step's slide-soon line once per todo and after each slide | `room`, `step`, `covered`, `recordedSince`; `memjoin` `recordsMem` | `TestBridgeCoveredSlide`, `TestRecordsMem` |
 | 11 | `prompt` with `text` starts a turn | `prompt`, `Turns.Prompt` | `TestSpec11CallAndPrompt` |
 | 11 | a refused close is the call's error; a refused close the turn would end in sends the model back once | `memjoin` `checkCloses`, `closeDriver` | `TestBridgeCloseCheckAndSendBack` |
 | 11.0 | `end` asks a session's drivers in order, with checkpoints | `end`; `agent.HostDrivers`; `memjoin` `bridgeHost.End` | `TestBridgeReviewAndJudge`, `TestHostDrivers` |

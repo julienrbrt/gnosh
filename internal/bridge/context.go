@@ -251,15 +251,34 @@ func (s *Server) covered(entries []transcript.Entry, removed []string) bool {
 	return true // nothing of the host's is cut
 }
 
-// recordedSince reports whether a reply at or after entries[from] keeps
-// something in mem.
+// recordedSince reports whether a call at or after entries[from] kept
+// something in mem: a call whose result, among the entries, says so.
 func (s *Server) recordedSince(entries []transcript.Entry, from int) bool {
 	if s.opts.RecordsMem == nil {
 		return false
 	}
+	results := map[string]core.Block{}
+	for _, e := range entries {
+		if e.Type != transcript.TypeUser {
+			continue
+		}
+		for _, b := range e.Message.Blocks {
+			if b.Type == core.BlockToolResult {
+				results[b.ToolUseID] = b
+			}
+		}
+	}
 	for i := max(from, 0); i < len(entries); i++ {
-		if entries[i].Type == transcript.TypeAssistant && s.opts.RecordsMem(entries[i].Message) {
-			return true
+		if entries[i].Type != transcript.TypeAssistant {
+			continue
+		}
+		for _, b := range entries[i].Message.Blocks {
+			if b.Type != core.BlockToolUse {
+				continue
+			}
+			if r, ok := results[b.ID]; ok && s.opts.RecordsMem(b, r) {
+				return true
+			}
 		}
 	}
 	return false

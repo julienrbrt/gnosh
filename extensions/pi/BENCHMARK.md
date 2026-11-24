@@ -93,10 +93,31 @@ this extension and a gnosh binary uploaded and gnosh put on `PATH`),
     cd bench
     (cd ../../.. && CGO_ENABLED=0 GOOS=linux go build -trimpath -o /tmp/gnosh .)
     export GNOSH_BIN=/tmp/gnosh OPENAI_BASE_URL=https://openrouter.ai/api/v1 OPENAI_API_KEY=...
-    ARM=vanilla JOBNAME=r1-vanilla ./run.sh
-    ARM=gnosh   JOBNAME=r1-gnosh   ./run.sh
-    python3 analyze.py jobs/r1-vanilla jobs/r1-gnosh
+    ARM=vanilla JOBNAME=r2-vanilla ./run.sh
+    ARM=gnosh   JOBNAME=r2-gnosh   ./run.sh
+    python3 analyze.py jobs/r2-vanilla jobs/r2-gnosh
 
-The runs here also pinned the provider and set max effort on pi's summary
-calls through a small local proxy; without it OpenRouter may route to
-different providers per request.
+The runs here also went through a small local proxy, which:
+
+- pins the provider (BaseTen);
+- sets max reasoning effort on the main requests and on pi's summary
+  calls;
+- sets low effort on gnosh's own check requests (tools-less, at most 2,048
+  tokens: the close review, the goal judge and the namer). gnosh asks its
+  lowest thinking for those.
+
+Without the proxy, OpenRouter may route each request to a different
+provider.
+
+## Settings for the next round, and why
+
+| setting | round 1 | next | why |
+| :- | :- | :- | :- |
+| window | 64K | 128K | Both arms use the same window. The model's own window is 1M, so the window is artificial on purpose: with no compaction there is nothing to compare. At 64K, plain pi compacted 83 times on six tasks (43 on vpp-loss-divergence alone, a 157-minute run). The gnosh arm carried about 2.8K more fixed prefix (4.4–5.1K against 1.6–2.3K) and slid inside todos 19 times. 128K is still small enough that the long tasks compact (vpp-loss-divergence, intrastat-meldung, wal-recovery-ordering, dna-assembly), and it is the regime gnosh's frames are designed for (`frames.md` §8.8: "for the intended regime run 32K or more"). |
+| reserve | 16K | 32K | pi caps each answer at window − input − margin (pi-ai `clampMaxTokensToContext`). In round 1 that cap cut replies to one token: vanilla's 400 errors "max_tokens must be at least 2" and the length stops that ended both vpp runs. A 32K reserve leaves about 28K of answer at the point, above the largest reply seen (21K). |
+| keep recent | 20K | 20K | pi's default |
+| max output | 32K | 32K | no reply came near it (largest 21K) |
+| timeouts | ×1 | ×1 | the tasks' own; `TMULT` changes it for both arms |
+| trials | 1 | 3 per task and arm, 7 tasks | |
+
+The gnosh arm's own fix for the one-token cap is in the extension (`staleUsage`). After a pop or slide, pi sized requests from a reply's usage that still counted the removed work.

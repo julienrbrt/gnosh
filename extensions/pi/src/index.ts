@@ -33,13 +33,17 @@ import { appendFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Bridge, BridgeCallError } from "./bridge.ts";
-import { FRAMES, fromView, type PiMessage, toEntries } from "./map.ts";
+import { FRAMES, fromView, type PiMessage, staleUsage, toEntries } from "./map.ts";
 import type { Block, Entry, Message, Reply, SideAnswer, SideRequest } from "./protocol.ts";
 
 const CLIENT = "pi-gnosh 0.3.0";
 /** The custom type of the notes this extension adds to the conversation, and of its kept slides. */
 const NOTE = "gnosh";
 const SLIDES = "gnosh-slides";
+/** Custom entries kept for the record only: side requests, slides refused, turn-end verdicts. */
+const SIDE = "gnosh-side";
+const UNCOVERED = "gnosh-uncovered";
+const END = "gnosh-end";
 
 function piContent(blocks: Block[] | undefined) {
   return (blocks ?? []).map((b) =>
@@ -130,6 +134,9 @@ export default async function (pi: ExtensionAPI) {
           } as never,
         )
         .result();
+      // Kept in the session for the record (not sent to the model): what
+      // gnosh's checks cost, beside the requests pi makes itself.
+      pi.appendEntry(SIDE, { purpose: req.purpose, stop: res.stopReason, usage: res.usage, error: res.errorMessage });
       if (res.stopReason === "error" || res.stopReason === "aborted") {
         stats.sideFailed++;
         return { failed: res.errorMessage || res.stopReason };
@@ -243,7 +250,8 @@ export default async function (pi: ExtensionAPI) {
     const { entries, byUuid } = entriesOf(msgs, ctx);
     if (!entries.some((e) => e.type === "frame")) return undefined;
     const view = await (await ensure()).call({ op: "view", session: sessionOf(ctx), entries });
-    return { messages: fromView({ messages: view.messages ?? [], sources: view.sources ?? [] }, byUuid) as unknown as typeof event.messages };
+    const sent = fromView({ messages: view.messages ?? [], sources: view.sources ?? [] }, byUuid);
+    return { messages: staleUsage(sent, msgs) as unknown as typeof event.messages };
   });
 
   pi.on("message_end", async (event) => {
@@ -274,6 +282,7 @@ export default async function (pi: ExtensionAPI) {
       finished: reply.stopReason === "stop",
     });
     for (const n of r.notices ?? []) log(n);
+    pi.appendEntry(END, { action: r.action ?? "end", driver: r.driver, objection: r.objection, stopped: r.stopped });
     if (r.action !== "continue" || !r.send) return;
     stats.sentBack++;
     log(`gnosh's ${r.driver ?? "check"} sends the model back: ${r.objection ?? ""}`);
@@ -300,6 +309,7 @@ export default async function (pi: ExtensionAPI) {
       if (r.notice) {
         stats.uncovered++;
         log(r.notice);
+        pi.appendEntry(UNCOVERED, { notice: r.notice, used });
       }
       return undefined;
     }
