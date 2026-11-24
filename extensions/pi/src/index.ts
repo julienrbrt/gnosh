@@ -14,9 +14,15 @@
 //   no model call (room). pi compacts only when nothing can slide, as a
 //   gnosh session does;
 // - between two rounds adds the notes a gnosh session adds (step);
-// - as the run would end with a top todo closed and not yet checked, or
-//   one still open, sends the model back to check it against the task,
-//   as a gnosh session's turn-end check does (check.ts).
+// - sends a call to mem with the conversation through the calling reply,
+//   so that gnosh checks it as it checks a session's: the fresh guard, the
+//   close check and its review, the pop's receipt (call);
+// - as pi's run would end, asks gnosh's turn-end checks: a refused close
+//   sends the model back, and the goal judge judges every top todo closed
+//   as done (end);
+// - answers the model requests those checks make (the close review, the
+//   goal judge, the namer) with pi's own model, as a gnosh session answers
+//   them with its small model (side requests).
 //
 // mem and its frames are gnosh's, built on gnosh: https://gnosh.ai
 
@@ -27,11 +33,10 @@ import { appendFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Bridge, BridgeCallError } from "./bridge.ts";
-import { Check, Stack } from "./check.ts";
-import { FRAMES, framesOf, fromView, type PiMessage, toEntries } from "./map.ts";
-import type { Block, Entry, Reply } from "./protocol.ts";
+import { FRAMES, fromView, type PiMessage, toEntries } from "./map.ts";
+import type { Block, Entry, Message, Reply, SideAnswer, SideRequest } from "./protocol.ts";
 
-const CLIENT = "pi-gnosh 0.2.0";
+const CLIENT = "pi-gnosh 0.3.0";
 /** The custom type of the notes this extension adds to the conversation, and of its kept slides. */
 const NOTE = "gnosh";
 const SLIDES = "gnosh-slides";
@@ -77,11 +82,13 @@ export default async function (pi: ExtensionAPI) {
   // freedSinceReply is what slides took out since the model last answered:
   // pi's own count is from before them.
   let freedSinceReply = 0;
-  const stats = { slides: 0, freed: 0, compactions: 0, cancelled: 0, notes: 0, pushes: 0, pops: 0, calls: 0, checks: 0 };
-  // The frames mem reported, for the check before the run ends.
-  let stack = new Stack();
-  const check = new Check();
-  const checking = process.env.PI_GNOSH_CHECK !== "0";
+  // since is what pi stored after the last request: the reply and the
+  // results that a call's checks and the turn's end read with last.
+  let since: PiMessage[] = [];
+  // ctxNow is the context of the event being handled, for the side
+  // requests the bridge makes while it answers.
+  let ctxNow: ExtensionContext | undefined;
+  const stats = { slides: 0, freed: 0, compactions: 0, cancelled: 0, notes: 0, pushes: 0, pops: 0, calls: 0, sentBack: 0, sides: 0, sideFailed: 0 };
   const statsFile = process.env.PI_GNOSH_STATS;
   const log = (line: string) => {
     process.stderr.write(`pi-gnosh: ${line}\n`);
@@ -94,9 +101,42 @@ export default async function (pi: ExtensionAPI) {
     }
   };
 
+  /**
+   * side answers a side request of gnosh's checks with pi's model, as a
+   * gnosh session answers it with its small model (the benchmark ran gnosh
+   * with the same model for both): the request's own system prompt and
+   * prompt alone, no reasoning asked for, its temperature, token limit and
+   * time.
+   */
+  async function side(req: SideRequest): Promise<SideAnswer> {
+    const ctx = ctxNow;
+    if (!ctx?.model) return { failed: "pi has no model selected" };
+    stats.sides++;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), req.timeout_ms || 120_000);
+    try {
+      const res = await ctx.modelRegistry.complete(
+        ctx.model,
+        { systemPrompt: req.system, messages: [{ role: "user", content: [{ type: "text", text: req.prompt }], timestamp: Date.now() }] },
+        { maxTokens: req.max_tokens || undefined, temperature: req.temperature, signal: ac.signal, cacheRetention: "none" } as never,
+      );
+      if (res.stopReason === "error" || res.stopReason === "aborted") {
+        stats.sideFailed++;
+        return { failed: res.errorMessage || res.stopReason };
+      }
+      const text = res.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("");
+      return { answer: text, stop: res.stopReason === "length" ? "max_tokens" : "end_turn" };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async function ensure(): Promise<Bridge> {
     if (bridge?.alive) return bridge;
-    starting ??= Bridge.start({ program: program(), cwd, client: CLIENT, log: (l) => process.stderr.write(`gnosh: ${l}\n`) }).finally(() => (starting = undefined));
+    starting ??= Bridge.start({ program: program(), cwd, client: CLIENT, side, log: (l) => process.stderr.write(`gnosh: ${l}\n`) }).finally(() => (starting = undefined));
     bridge = await starting;
     return bridge;
   }
@@ -123,10 +163,6 @@ export default async function (pi: ExtensionAPI) {
       if (e.type === "custom" && e.customType === SLIDES && Array.isArray(e.data)) slides.push(...(e.data as Entry[]));
     }
     prompted = slides.length > 0 || ctx.sessionManager.getEntries().some((e) => (e as { type: string }).type === "message");
-    stack = new Stack();
-    for (const e of ctx.sessionManager.getEntries() as { type: string; message?: PiMessage }[]) {
-      if (e.type === "message" && e.message?.role === "toolResult") stack.add(framesOf(e.message), session);
-    }
   });
   pi.on("session_shutdown", async () => {
     log(`end ${JSON.stringify(stats)}`);
@@ -141,7 +177,11 @@ export default async function (pi: ExtensionAPI) {
       description: t.description,
       parameters: Type.Unsafe(t.input_schema),
       async execute(callId, params, _signal, _onUpdate, ctx) {
-        const req = { op: "call", session: sessionOf(ctx), call_id: callId, name: t.name, input: params };
+        ctxNow = ctx;
+        const req: Record<string, unknown> = { op: "call", session: sessionOf(ctx), call_id: callId, name: t.name, input: params };
+        // A call to mem is checked against the conversation through the
+        // reply that makes it (bridge.md §11).
+        if ((params as { name?: string } | undefined)?.name === "mem") req.entries = entriesOf([...last, ...since], ctx).entries;
         let r: Reply;
         try {
           r = await (await ensure()).call(req);
@@ -155,7 +195,7 @@ export default async function (pi: ExtensionAPI) {
         }
         stats.calls++;
         for (const f of r.frames ?? []) f.kind === "push" ? stats.pushes++ : stats.pops++;
-        stack.add(r.frames ?? [], sessionOf(ctx));
+        for (const n of r.notices ?? []) log(n);
         return { content: piContent(r.content), details: { [FRAMES]: r.frames ?? [] }, isError: !!r.is_error };
       },
     });
@@ -171,8 +211,10 @@ export default async function (pi: ExtensionAPI) {
   // time; the mem line (and the frame line, in a frame) after the prompt.
   if (has("prompt")) {
     pi.on("before_agent_start", async (event, ctx) => {
-      check.reset();
-      const r = await (await ensure()).call({ op: "prompt", session: sessionOf(ctx), first: !prompted, entries: entriesOf(last, ctx).entries });
+      ctxNow = ctx;
+      // A prompt starts a turn: gnosh's turn-end checks count from it.
+      const text = event.messageType === "user" ? event.prompt : "";
+      const r = await (await ensure()).call({ op: "prompt", session: sessionOf(ctx), first: !prompted, text, entries: entriesOf(last, ctx).entries });
       prompted = true;
       const parts = (r.parts ?? []).filter((p) => p.trim());
       return {
@@ -187,6 +229,7 @@ export default async function (pi: ExtensionAPI) {
   pi.on("context", async (event, ctx) => {
     const msgs = event.messages as unknown as PiMessage[];
     last = msgs;
+    since = [];
     const { entries, byUuid } = entriesOf(msgs, ctx);
     if (!entries.some((e) => e.type === "frame")) return undefined;
     const view = await (await ensure()).call({ op: "view", session: sessionOf(ctx), entries });
@@ -194,8 +237,38 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.on("message_end", async (event) => {
-    if ((event.message as { role?: string }).role === "assistant") freedSinceReply = 0;
+    const m = event.message as unknown as PiMessage;
+    if (m.role === "assistant") freedSinceReply = 0;
+    if (m.role === "assistant" || m.role === "toolResult") since.push(m);
   });
+
+  /**
+   * end asks gnosh's turn-end checks about the reply pi's run would end on
+   * (bridge.md §11). Sent back, the model reads gnosh's words as a note of
+   * this extension's, and the run goes on. A reply that was stopped or
+   * failed ends the run, as a stopped or failed turn ends in gnosh.
+   */
+  async function end(reply: PiMessage, ctx: ExtensionContext) {
+    if (!has("end") || reply.stopReason === "aborted" || reply.stopReason === "error") return;
+    const msgs = [...last];
+    for (const m of [...since, reply]) if (!msgs.includes(m)) msgs.push(m);
+    const text = Array.isArray(reply.content)
+      ? reply.content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("")
+      : String(reply.content ?? "");
+    const message: Message = { role: "assistant", content: text ? [{ type: "text", text }] : [] };
+    const r = await (await ensure()).call({
+      op: "end",
+      session: sessionOf(ctx),
+      entries: entriesOf(msgs, ctx).entries,
+      reply: message,
+      finished: reply.stopReason === "stop",
+    });
+    for (const n of r.notices ?? []) log(n);
+    if (r.action !== "continue" || !r.send) return;
+    stats.sentBack++;
+    log(`gnosh's ${r.driver ?? "check"} sends the model back: ${r.objection ?? ""}`);
+    pi.sendMessage({ customType: NOTE, content: r.send, display: false }, { deliverAs: "followUp" });
+  }
 
   /** point is where pi compacts: its window less its reserve. */
   const point = (ctx: ExtensionContext) => {
@@ -210,7 +283,7 @@ export default async function (pi: ExtensionAPI) {
     const need = Math.max(1, used - p.point + Math.floor(p.window / 10));
     const { entries } = entriesOf(last, ctx);
     const prompt = [...entries].reverse().find((e) => e.type === "user" && e.source === "prompt")?.uuid;
-    const r = await (await ensure()).call({ op: "room", session: sessionOf(ctx), entries, need, prompt, edit_tools: ["edit", "write"] });
+    const r = await (await ensure()).call({ op: "room", session: sessionOf(ctx), entries, need, prompt });
     if (!r.freed || !r.new_slides?.length) return undefined;
     slides.push(...r.new_slides);
     pi.appendEntry(SLIDES, r.new_slides);
@@ -246,14 +319,11 @@ export default async function (pi: ExtensionAPI) {
   // Between two rounds: the slide when over pi's point (before pi's own
   // check), and the notes a gnosh session adds before the next reply.
   pi.on("turn_end", async (event, ctx) => {
+    ctxNow = ctx;
     if (!event.toolResults?.length) {
-      // The model answered with no call: the run would end here.
-      if (!checking) return undefined;
-      const n = check.decide(stack, (event.message as { stopReason?: string }).stopReason);
-      if (!n) return undefined;
-      stats.checks++;
-      log(`sent back to check before stopping: ${n}`);
-      pi.sendMessage({ customType: NOTE, content: n, display: false }, { deliverAs: "followUp" });
+      // The model answered with no call: the run would end here, and
+      // gnosh's turn-end checks are asked, as in a gnosh session.
+      await end(event.message as unknown as PiMessage, ctx);
       return undefined;
     }
     const p = point(ctx);

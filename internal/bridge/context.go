@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -28,11 +29,18 @@ var editTools = []string{"Edit", "Write", "MultiEdit"}
 // prompt answers prompt: the system prompt's part about mem, and the
 // lines that go after a prompt a person typed. With first, the digest of
 // mem comes first among them.
-func (s *Server) prompt(req Request) Reply {
+func (s *Server) prompt(ctx context.Context, req Request) Reply {
 	if req.Session == "" {
 		return fail(req.ID, CodeBadRequest, "prompt needs session")
 	}
 	rep := Reply{OK: true, ID: req.ID, Parts: []string{}}
+	if tu := s.opts.Turns; tu != nil {
+		// A prompt the person typed starts a turn (§11).
+		if len(req.Entries) > 0 && uniqueUUIDs(req.Entries) == "" {
+			tu.Sync(req.Session, req.Entries)
+		}
+		tu.Prompt(ctx, req.Session, req.Text)
+	}
 	t := s.opts.Texts
 	if t == nil {
 		return rep

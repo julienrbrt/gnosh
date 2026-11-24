@@ -85,6 +85,7 @@ with the error `protocol` and the bridge ends.
 - `ops` lists the requests this bridge answers, so a host can tell which
   of the **later** ones it has.
 - `client` is only for the bridge's messages on standard error.
+- `side`, when true, says the host answers side requests (§11.1).
 
 ## 5. `tools`: what the model may call
 
@@ -147,11 +148,12 @@ the entries of the session's last `view` (`transcript.Stack`), with the
 frames of the calls the bridge ran for that session since then applied in
 order. A session the bridge has seen no view of starts at the root.
 
-In version 1 the bridge does not apply mem's refusal to pop a fresh frame
-(`MemFresh`), which needs the calling reply's place in the conversation:
-the reply is not in the last view when its calls run. **Later**: `call`
-may carry the session's entries through the calling reply, and the bridge
-then decides freshness as a session does.
+A call may carry `entries`, the session's conversation through the calling
+reply (§7.2, the results of the reply's earlier calls included). The bridge
+then checks the call as a session's (§11): mem's refusal to pop a fresh
+frame (`MemFresh`), the close check, the pop's receipt. A call without
+`entries` is checked against the last conversation the session sent, and
+its closes against nothing (they are kept unchecked).
 
 ### 6.4 A host that never asks for the view
 
@@ -313,3 +315,62 @@ are listed in `ops`; protocol 1 is unchanged.
   as a session gives it: the large-step line (frames.md §8.7), measured
   from `used` when the top frame was entered, and the mem reminder after
   ten replies with no call on mem.
+
+## 11. A session's checks: the call, the turn's end, and side requests
+
+A gnosh session does not take its model's word that work is done
+(`close-check.md`, `internal/memjoin/goal.go`). The bridge gives each host
+session the same join a gnosh session gets (`memjoin/bridgehost.go`), so the
+checks are gnosh's own code. They read the conversation the host sends with
+`call` (§6.3), `prompt` and `end`.
+
+- `prompt` with `text`, what the person typed, starts a turn: the turn-end
+  checks count from it.
+- A `call` to mem goes through the fresh guard, the namer and the close
+  check (the entered-and-closed check, the claim check, and the review of
+  the close by a model); a refused close is the call's error, as in a
+  session, and mem keeps nothing of the call. A pop's result says what left
+  the model's context (`frames.md` §5). `notices` are lines for the person.
+
+### 11.0 `end`
+
+    → {"op":"end","session":"S","entries":[…],"reply":{"role":"assistant","content":[{"type":"text","text":"Done."}]},"finished":true}
+    ← {"ok":true,"action":"continue","send":"The check of `ship` found it not met: …","driver":"mem-goal","objection":"…","notices":["…"]}
+
+- The host asks as its turn would end: its model answered with no tool call.
+  `finished` says the model ended the reply itself (not cut off at its
+  length). A turn that was stopped or failed is not asked about.
+- The bridge asks gnosh's drivers in a session's order: a refused close that
+  the turn would end in sends the model back once a turn; then every
+  top-level todo closed as done in the turn, and not already approved by the
+  review, is judged by a model; one found not met is opened again in mem.
+- `action` `continue`: the host sends `send` to its model as a hidden
+  prompt of its own and goes on. `end`: the turn may end. Every tenth
+  send-back in a row of one driver asks the model first whether there is a
+  genuine reason to stop; its reply ending in the marker `<!-- GNOSH_STOP -->`
+  ends the turn (`stopped` holds its reason), as in a session
+  (`harness-agent-loop.md` LOOP-20).
+
+### 11.1 Side requests
+
+The close review, the goal judge and the namer ask a model. The bridge has
+none: while it answers a request it writes, as a line of its own,
+
+    ← {"side":{"id":1,"purpose":"goal-judge","system":"…","prompt":"…","max_tokens":300,"temperature":0,"timeout_ms":120000}}
+
+and waits for the host's answer before it goes on:
+
+    → {"op":"side_answer","side_id":1,"answer":"{\"ok\": false, …}","stop":"end_turn"}
+    → {"op":"side_answer","side_id":1,"failed":"the provider failed"}
+
+- Only a host whose `hello` said `side: true` is asked; for any other the
+  checks find no model, and do what a session with none does (a close is
+  kept unchecked, the judge's check stands unchecked).
+- The host asks its model with `system` as the system prompt and `prompt`
+  as the one user message, at `temperature` with at most `max_tokens`, and
+  no more thinking than the model needs (a session's side requests think
+  as little as possible). `stop` `max_tokens` makes the answer none.
+- Requests the host writes while a side request waits are answered after
+  the request that asked it. An answer to a side request the bridge no
+  longer waits on (its time ran out) is dropped while another side request
+  waits, and refused with `bad_request` otherwise.

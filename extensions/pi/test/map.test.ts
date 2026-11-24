@@ -26,10 +26,29 @@ test("an entry keeps its uuid when the messages before it go", () => {
   assert.ok(b.includes("r:c1") && b.includes("u:9") && a.includes("u:9"));
 });
 
-test("edits name their file as gnosh's view reads it", () => {
-  const edit: PiMessage = { role: "assistant", content: [{ type: "toolCall", id: "e1", name: "edit", arguments: { path: "a.go", edits: [] } }] };
+test("pi's file and command tools go by gnosh's names, with their file as gnosh reads it", () => {
+  const edit: PiMessage = {
+    role: "assistant",
+    content: [
+      { type: "toolCall", id: "e1", name: "edit", arguments: { path: "a.go", edits: [] } },
+      { type: "toolCall", id: "e2", name: "read", arguments: { path: "b.go" } },
+      { type: "toolCall", id: "e3", name: "bash", arguments: { command: "go test" } },
+    ],
+  };
   const { entries } = toEntries([prompt, edit], "S");
-  assert.deepEqual(entries[1].message?.content[0].input, { path: "a.go", edits: [], file_path: "a.go" });
+  const uses = entries[1].message?.content ?? [];
+  assert.deepEqual(uses.map((b) => b.name), ["Edit", "Read", "Bash"]);
+  assert.deepEqual(uses[0].input, { path: "a.go", edits: [], file_path: "a.go" });
+  assert.deepEqual(uses[1].input, { path: "b.go", file_path: "b.go" });
+});
+
+test("entries carry their message's time, and a frame its result's", () => {
+  const timed = { ...result, timestamp: 2000 };
+  const { entries } = toEntries([prompt, call, timed], "S");
+  assert.equal(entries[0].timestamp, "1970-01-01T00:00:00.001Z");
+  assert.equal(entries[1].timestamp, undefined); // a message with no time has none
+  assert.equal(entries[3].type, "frame");
+  assert.equal(entries[3].timestamp, "1970-01-01T00:00:02.000Z");
 });
 
 test("the view comes back as pi's own messages, with notes added to results", () => {

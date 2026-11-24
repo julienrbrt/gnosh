@@ -22,6 +22,20 @@ import (
 // session's stack and mem's disagreeing.
 const stopGrace = 30 * time.Second
 
+// sessionLog is the log a join reads and writes: the session's file, or
+// for `gnosh bridge` the conversation as its host sent it last
+// (bridgehost.go). *transcript.Session is one.
+type sessionLog interface {
+	ID() string
+	Entries() []transcript.Entry
+	View(opts transcript.ViewOptions) ([]core.Message, transcript.ViewInfo)
+	Stack() []transcript.Frame
+	Preview(next []transcript.Entry, opts transcript.ViewOptions) ([]transcript.Cut, []transcript.Frame)
+	Append(e transcript.Entry) (transcript.Entry, error)
+	AppendAll(entries ...transcript.Entry) ([]transcript.Entry, error)
+	Redact(edit func(e *transcript.Entry) bool) (int, error)
+}
+
 // join is the join for one session: everything the harness does for mem
 // and frames in that session hangs off it.
 type join struct {
@@ -37,8 +51,13 @@ type join struct {
 	dir     string
 	project string
 	id      string
-	ts      *transcript.Session
+	ts      sessionLog
 	texts   *prompt.Set
+
+	// side, when not nil, answers the side requests of the checks, the
+	// judge and the namer in place of the session's agent: `gnosh bridge`
+	// has no agent, and asks its host's model (bridgehost.go).
+	side func(ctx context.Context, sr agent.SideRequest) (agent.SideResult, error)
 
 	// main says a person is in this session: it is not a sub-agent's.
 	// run says gnovm_run is among its tools.
@@ -81,7 +100,6 @@ func (p *process) session(ctx context.Context, s *app.Session) (*app.Contributio
 		dir:      dir,
 		project:  s.Dirs.ProjectRoot,
 		id:       s.ID,
-		ts:       s.Transcript,
 		texts:    s.Texts,
 		main:     !s.SubAgent,
 		kept:     map[string]*keptCall{},
@@ -89,6 +107,9 @@ func (p *process) session(ctx context.Context, s *app.Session) (*app.Contributio
 	}
 	if j.project == "" {
 		j.project = s.Dirs.Cwd
+	}
+	if s.Transcript != nil {
+		j.ts = s.Transcript
 	}
 	if j.ts != nil && j.ts.ID() != "" {
 		j.id = j.ts.ID()
@@ -307,6 +328,38 @@ func (j *join) env() *core.ToolEnv {
 		}
 	}
 	return &core.ToolEnv{Cwd: j.s.Dirs.Cwd, SessionID: j.id, Store: new(sync.Map)}
+}
+
+// sider is what answers a side request: the session's agent, or the
+// host's model through side.
+type sider interface {
+	Side(ctx context.Context, sr agent.SideRequest) (agent.SideResult, error)
+}
+
+type sideFunc func(ctx context.Context, sr agent.SideRequest) (agent.SideResult, error)
+
+func (f sideFunc) Side(ctx context.Context, sr agent.SideRequest) (agent.SideResult, error) {
+	return f(ctx, sr)
+}
+
+// model returns what answers the join's side requests, or nil when
+// nothing can: side when it is set, else the agent of the call (with
+// fromCall) or the session's.
+func (j *join) model(ctx context.Context, fromCall bool) sider {
+	if j.side != nil {
+		return sideFunc(j.side)
+	}
+	var a *agent.Agent
+	if fromCall {
+		a = agent.FromContext(ctx)
+	}
+	if a == nil {
+		a = j.theAgent()
+	}
+	if a == nil {
+		return nil
+	}
+	return a
 }
 
 // theAgent returns the session's agent, or nil before it exists.

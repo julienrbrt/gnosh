@@ -14,34 +14,43 @@ gnosh **slides**: the oldest rounds leave the context (mem still holds what
 they found) with no summary and no extra model call. pi's compaction is used
 only when nothing can slide.
 
-This extension gives pi exactly that, and the check gnosh makes before a
-turn ends, and nothing else of gnosh.
+This extension gives pi exactly that, with the checks gnosh runs around it
+(the close check of every todo closed as done, and the judge as a turn would
+end), and nothing else of gnosh.
 
 ## What it does in pi
 
 | pi hook | what pi-gnosh does (all of it gnosh's own code, through `gnosh bridge`) |
 | :- | :- |
-| tools | registers gnosh's `gnovm_run`, `gnovm_new`, `gnovm_list`, `gnovm_drop` (mem is `gnovm_run` with `name: "mem"`; the scratch machine does the maths) |
+| tools | registers gnosh's `gnovm_run`, `gnovm_new`, `gnovm_list`, `gnovm_drop` (mem is `gnovm_run` with `name: "mem"`; the scratch machine does the maths). A call to mem carries the conversation through its reply, so gnosh checks it as it checks a session's: the fresh guard, the close check (the claim check and the model's review of the close), the pop's receipt of what left the context |
 | `before_agent_start` | adds gnosh's `<memory>` part after pi's system prompt (same bytes every time, so the provider's cache holds) and the mem line after the prompt |
 | `context` | sends gnosh's view of the conversation: popped work and slid rounds are gone; pi's own message objects are reused, so the cached prefix stays byte for byte |
 | `turn_end` | when over pi's compaction point, asks gnosh to slide; adds gnosh's notes (the slide line, "this todo is large", the mem reminder) as durable hidden messages |
 | `session_before_compact` | cancels pi's summary when slides brought the conversation under pi's point; otherwise lets pi summarize, as a gnosh session does with no frame to cut |
-| `turn_end`, no tool call | the check before stopping (`src/check.ts`): when the model would end the run with a top todo closed as done and not yet checked, or one still open, it is sent back, at most twice per prompt, to check the work against the task with its tools. `PI_GNOSH_CHECK=0` turns it off |
+| `turn_end`, no tool call | asks gnosh's turn-end checks (`end`): a turn that would end in a todo whose close was refused is sent back once, and every top-level todo closed as done in the turn, and not already approved by the close review, is judged; one found not met is opened again in mem and the model is sent back with gnosh's words. Every tenth send-back in a row asks the model first whether there is a genuine reason to stop |
+| side requests | the close review, the goal judge and the namer ask a model; the bridge asks pi's, through `modelRegistry.complete`, with gnosh's own system prompt, prompt, temperature and token limit, and no reasoning asked for (gnosh's side requests think as little as the model allows) |
 
-### The check before stopping
+### The checks around a close and a turn's end
 
-A gnosh session never ends a turn on the model's word alone: as a turn would
-end, every top-level todo closed as done is judged against the conversation,
-and one found not met is opened again and the model sent back
-([`internal/memjoin/goal.go`](../../internal/memjoin/goal.go),
-[`spec/gnosh/close-check.md`](../../spec/gnosh/close-check.md)). `gnosh
-bridge` does not run that loop. Without it, in pi, a model that pops its plan
-takes that for the task done: in the first benchmark round the pi-gnosh arm
-ended its runs after a third of plain pi's output and failed on the answers,
-not on lost context (see [BENCHMARK.md](BENCHMARK.md)). The extension's check
-is the cheap form of gnosh's: the same model is sent back once per new close
-(or open frame), with no judge call. It is the one piece of logic the
-extension holds itself; a bridge op for gnosh's own judge would replace it.
+A gnosh session never takes the model's word that a todo is done. When a
+call to mem closes a todo the work was done in, mem keeps nothing of it until
+the close is approved: nothing done in the todo, or a result that says a file
+changed that nothing in the todo changed or showed, is refused at once, and
+otherwise a small model reads what happened in the todo and approves or
+refuses it ([`spec/gnosh/close-check.md`](../../spec/gnosh/close-check.md)).
+As a turn would end, every top-level todo closed as done that the review did
+not already approve is judged against mem and the whole conversation, popped
+work included, and one found not met is opened again and the model sent back
+([`internal/memjoin/goal.go`](../../internal/memjoin/goal.go)).
+
+Through `gnosh bridge` these are gnosh's own code: each host session gets the
+join a gnosh session gets (`internal/memjoin/bridgehost.go`), reading the
+conversation the extension sends, and the model requests it makes are
+answered by pi's model on the same pipe (bridge.md §11). In the benchmark
+gnosh ran with the same model as its small model, so pi's model is the one
+it would have asked. The repetition guard and the empty-reply nudge of
+gnosh's loop are not brought over: they are the loop's, not mem's, and pi
+has neither for either arm.
 
 The extension holds none of gnosh's logic. It starts `gnosh bridge` (JSON
 lines over stdio; the protocol is [`spec/gnosh/bridge.md`](../../spec/gnosh/bridge.md)) and maps
@@ -61,7 +70,7 @@ from your context when you pop it").
 
 ## Use
 
-Needs a gnosh with `gnosh bridge` (ops `prompt`, `room` and `step`) on `PATH`,
+Needs a gnosh with `gnosh bridge` (ops `prompt`, `room`, `step` and `end`) on `PATH`,
 or `PI_GNOSH_PROGRAM=/path/to/gnosh`. Build it from this repository's root:
 
     CGO_ENABLED=0 go build -o ~/bin/gnosh .

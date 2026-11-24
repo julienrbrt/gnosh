@@ -67,8 +67,21 @@ export interface Mapped {
   byUuid: Map<string, PiMessage[]>;
 }
 
-/** The tools whose `path` argument names a file they write: gnosh's view reads it as `file_path`. */
-const EDIT_TOOLS = new Set(["edit", "write"]);
+/**
+ * pi's tools that gnosh has under other names. gnosh's checks read a
+ * conversation by its own names: a command run with Bash, a file shown by
+ * Read and changed by Edit or Write, named by `file_path` (close-check.md
+ * §3), and so does a slide's line of the files edited.
+ */
+const GNOSH_NAMES: Record<string, string> = { bash: "Bash", read: "Read", edit: "Edit", write: "Write" };
+const FILE_TOOLS = new Set(["read", "edit", "write"]);
+
+/** stampOf is a message's time as gnosh writes it, or undefined. */
+function stampOf(m: PiMessage): string | undefined {
+  const ts = m.timestamp;
+  const ms = typeof ts === "number" ? ts : typeof ts === "string" ? Date.parse(ts) : NaN;
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
+}
 
 /**
  * keyOf is a message's own name, the same in every request of the session
@@ -90,10 +103,11 @@ function keyOf(m: PiMessage, i: number): string {
 export function toEntries(msgs: readonly PiMessage[], session: string): Mapped {
   const entries: Entry[] = [];
   const byUuid = new Map<string, PiMessage[]>();
-  const add = (e: Omit<Entry, "uuid">, from: PiMessage[], key: string) => {
+  const add = (e: Omit<Entry, "uuid">, from: PiMessage[], key: string, at?: PiMessage) => {
     let uuid = key;
     for (let n = 2; byUuid.has(uuid); n++) uuid = `${key}#${n}`;
-    entries.push({ ...e, uuid } as Entry);
+    const timestamp = stampOf(at ?? from[0] ?? ({} as PiMessage));
+    entries.push({ ...e, uuid, ...(timestamp ? { timestamp } : {}) } as Entry);
     byUuid.set(uuid, from);
   };
   for (let i = 0; i < msgs.length; i++) {
@@ -107,8 +121,8 @@ export function toEntries(msgs: readonly PiMessage[], session: string): Mapped {
         else if (c.type === "thinking") content.push({ type: "thinking", text: c.thinking ?? "" });
         else if (c.type === "toolCall") {
           const args = (c.arguments ?? {}) as Record<string, unknown>;
-          const input = EDIT_TOOLS.has(c.name ?? "") && typeof args.path === "string" ? { ...args, file_path: args.path } : args;
-          content.push({ type: "tool_use", id: c.id, name: c.name, input });
+          const input = FILE_TOOLS.has(c.name ?? "") && typeof args.path === "string" ? { ...args, file_path: args.path } : args;
+          content.push({ type: "tool_use", id: c.id, name: GNOSH_NAMES[c.name ?? ""] ?? c.name, input });
         }
       }
       const calls = content.some((b) => b.type === "tool_use");
@@ -134,7 +148,7 @@ export function toEntries(msgs: readonly PiMessage[], session: string): Mapped {
         framesOf(r).forEach((f, k) => {
           if (f.session !== session) return;
           const common = { type: "frame" as const, sessionId: session, frame: f.id, label: f.purpose ?? "", toolUseId: r.toolCallId };
-          add(f.kind === "push" ? { ...common, op: "push" } : { ...common, op: "pop", result: f.result ?? "" }, [], `f:${r.toolCallId}:${k}`);
+          add(f.kind === "push" ? { ...common, op: "push" } : { ...common, op: "pop", result: f.result ?? "" }, [], `f:${r.toolCallId}:${k}`, r);
         });
       }
     } else if ((m as { excludeFromContext?: boolean }).excludeFromContext !== true) {

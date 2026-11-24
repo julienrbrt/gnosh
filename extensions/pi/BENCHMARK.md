@@ -48,8 +48,9 @@ What it shows, and what it does not:
   top-level todo closed as done before a turn may end, and sends the model
   back when it does not hold (`internal/memjoin/goal.go`). `gnosh bridge` did
   not run that check, so pi stopped on the model's word. vpp-loss-divergence
-  even stopped with its frame still open. The extension now has a check
-  before stopping (`src/check.ts`); round 1 ran without it.
+  even stopped with its frame still open. Round 1 ran without gnosh's
+  checks: neither the close check with its review nor the turn-end judge.
+  Both now run in the bridge, as gnosh's own code (see the README).
 - **One trial per task is noise.** One rerun of dna-insert with the check
   (below) ran 28 minutes instead of 4.7, before the check ever fired. 4/7
   against 1/7 is not a significant difference either way, and gcode-to-text
@@ -57,24 +58,30 @@ What it shows, and what it does not:
 - The 64K window is smaller than pi's default 128K. It was chosen so that
   compaction happens at all on these tasks.
 
-### With the check before stopping (one trial)
+### With a self-check before stopping (one trial; since replaced)
 
-| task | pi + pi-gnosh with the check |
+Between round 1 and the bridge's own checks, the extension sent the same
+model back to check its work itself before the run could end. That was not
+gnosh's check (no separate judge, no close review), and it has been replaced
+by gnosh's own.
+
+| task | pi + pi-gnosh with the self-check |
 | :- | :- |
 | dna-insert | fail, 28.0m, 192K out, $0.35, 0 compactions, 7 slides, 8 / 8. The check fired once, after the top todo's pop. The model re-checked with its tools and kept the same wrong primer split (Tm difference 7.4 °C by the verifier's annealing region, against the 5 °C allowed). |
 
-The check fired as intended: the run was sent back once and the model
+The self-check fired as intended: the run was sent back once and the model
 attempted verification against the files, but kept a wrong answer. This
 is not an independent judge and does not establish correctness. A single
 trial cannot say whether it closes the gap.
 
 ### What a meaningful comparison needs
 
-Three trials per task and arm on these seven tasks, with the check: about
-$20 at the prices above (plain pi about $13, most of it on
-vpp-loss-divergence and intrastat-meldung, and pi-gnosh about $3 to $7
-depending on how much longer the check makes its runs), and 5–6 hours of
-wall time at 3 trials at once.
+Three trials per task and arm on these seven tasks, with gnosh's checks in
+the bridge: about $20 to $25 at the prices above (plain pi about $13, most of
+it on vpp-loss-divergence and intrastat-meldung; pi-gnosh about $5 to $10,
+since the close reviews and judges are model calls of their own, about one
+per todo closed, with up to 1,500 tokens out each, and send-backs make runs
+longer), and 5–6 hours of wall time at 3 trials at once.
 
 ## Rerun
 

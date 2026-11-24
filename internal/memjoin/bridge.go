@@ -41,19 +41,25 @@ func (p *process) bridgeCommand(ctx context.Context, c *app.CommandContext) int 
 	vms := p.client(DataDir(c.Dirs.State), embeddings)
 	defer p.shutdown(ctx)
 
+	// Each session of the host gets a join of its own, as a gnosh session
+	// does: the checks of its calls to mem and of its turns' ends
+	// (bridgehost.go).
+	dirs := app.Dirs{Home: c.Dirs.Home, Cwd: project, ProjectRoot: project, State: c.Dirs.State}
+	host := newBridgeHost(p, vms, DataDir(c.Dirs.State), project, dirs, c.Config)
 	srv := bridge.New(bridge.Options{
 		Project: project,
 		Build:   buildinfo.BuildID,
 		Version: bridgeVersion(),
 		Tools: func(stack func(string) []string) []core.Tool {
-			return gnovmtools.New(gnovmtools.Options{
+			return gnovmtools.New(host.options(gnovmtools.Options{
 				Client:  gnovmtools.Lazy(vms),
 				Project: project,
 				MemStack: func(_ context.Context, session string) []string {
 					return stack(session)
 				},
-			}).Tools()
+			})).Tools()
 		},
+		Turns:    host,
 		Frames:   bridgeFrames,
 		Texts:    prompt.Builtin(),
 		Digest:   func() string { return gnovm.MemBlock(DataDir(c.Dirs.State), project) },

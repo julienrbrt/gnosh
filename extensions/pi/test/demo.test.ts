@@ -30,4 +30,8 @@ test("pi-gnosh slides where plain pi summarizes", { skip: !program && "GNOSH_BIN
   assert.ok(lastReq.messages.some((m) => m.includes("mem.Pop")));
   const peak = Math.max(...g.requests.map((r) => r.tokens));
   assert.ok(lastReq.tokens < peak, `${lastReq.tokens} >= ${peak}`);
+
+  // The pop's close was reviewed by the model, as gnosh reviews a close.
+  assert.ok(g.sides.some((sd) => sd.startsWith("You check whether an AI coding agent did the todo")), g.sides.join("\n"));
+  assert.equal(plain.sides.length, 0);
 });
