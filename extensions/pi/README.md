@@ -14,7 +14,8 @@ gnosh **slides**: the oldest rounds leave the context (mem still holds what
 they found) with no summary and no extra model call. pi's compaction is used
 only when nothing can slide.
 
-This extension gives pi exactly that and nothing else of gnosh.
+This extension gives pi exactly that, and the check gnosh makes before a
+turn ends, and nothing else of gnosh.
 
 ## What it does in pi
 
@@ -25,6 +26,22 @@ This extension gives pi exactly that and nothing else of gnosh.
 | `context` | sends gnosh's view of the conversation: popped work and slid rounds are gone; pi's own message objects are reused, so the cached prefix stays byte for byte |
 | `turn_end` | when over pi's compaction point, asks gnosh to slide; adds gnosh's notes (the slide line, "this todo is large", the mem reminder) as durable hidden messages |
 | `session_before_compact` | cancels pi's summary when slides brought the conversation under pi's point; otherwise lets pi summarize, as a gnosh session does with no frame to cut |
+| `turn_end`, no tool call | the check before stopping (`src/check.ts`): when the model would end the run with a top todo closed as done and not yet checked, or one still open, it is sent back, at most twice per prompt, to check the work against the task with its tools. `PI_GNOSH_CHECK=0` turns it off |
+
+### The check before stopping
+
+A gnosh session never ends a turn on the model's word alone: as a turn would
+end, every top-level todo closed as done is judged against the conversation,
+and one found not met is opened again and the model sent back
+([`internal/memjoin/goal.go`](../../internal/memjoin/goal.go),
+[`spec/gnosh/close-check.md`](../../spec/gnosh/close-check.md)). `gnosh
+bridge` does not run that loop. Without it, in pi, a model that pops its plan
+takes that for the task done: in the first benchmark round the pi-gnosh arm
+ended its runs after a third of plain pi's output and failed on the answers,
+not on lost context (see [BENCHMARK.md](BENCHMARK.md)). The extension's check
+is the cheap form of gnosh's: the same model is sent back once per new close
+(or open frame), with no judge call. It is the one piece of logic the
+extension holds itself; a bridge op for gnosh's own judge would replace it.
 
 The extension holds none of gnosh's logic. It starts `gnosh bridge` (JSON
 lines over stdio; the protocol is [`spec/gnosh/bridge.md`](../../spec/gnosh/bridge.md)) and maps

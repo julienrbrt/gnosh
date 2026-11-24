@@ -66,6 +66,7 @@ test("pi sends no popped work after a mem pop", { skip: !program && "GNOSH_BIN i
     step(run('"lots of work"')),
     step(run('mem.Pop("the port is picked free in setup")', "mem")),
     step(fauxAssistantMessage(fauxText("done"))),
+    step(fauxAssistantMessage(fauxText("checked: the port is free"))),
     step(fauxAssistantMessage(fauxText("ok"))),
   ]);
   const { session, extensionsResult } = await createAgentSession({
@@ -82,12 +83,15 @@ test("pi sends no popped work after a mem pop", { skip: !program && "GNOSH_BIN i
     assert.deepEqual(extensionsResult.errors, []);
     await session.prompt("fix the port");
     await session.prompt("thanks");
-    assert.equal(sent.length, 6);
+    assert.equal(sent.length, 7);
+    // "done" after the top todo's pop: the run is sent back once to check it.
+    assert.match(sent[5].at(-1) ?? "", /Before this run ends: you closed `fix-port`/);
+    assert.ok(!sent[6].some((m) => /Before this run ends/.test(m) && m !== sent[5].at(-1)), "sent back more than once");
     // Before the pop, the work is sent.
     assert.ok(sent[3].some((m) => m.includes("lots of work")));
     // After it, it is not; the push's answer says it came, and the prefix
     // through the push is what it was.
-    for (const s of [sent[4], sent[5]]) {
+    for (const s of [sent[4], sent[5], sent[6]]) {
       assert.ok(!s.some((m) => m.includes("1 + 1") || m.includes("lots of work")), s.join("\n"));
       assert.equal(s[0], "user: fix the port");
       assert.match(s[1], /^user: <gnosh>Use mem and Gno/); // the mem line after the prompt
@@ -96,6 +100,7 @@ test("pi sends no popped work after a mem pop", { skip: !program && "GNOSH_BIN i
       assert.match(s[4], /^assistant: call mem\.Pop/);
     }
     assert.deepEqual(sent[5].slice(0, sent[4].length), sent[4]);
+    assert.deepEqual(sent[6].slice(0, sent[5].length), sent[5]);
   } finally {
     // pi's runtime says session_shutdown before it disposes of a session.
     await (session.extensionRunner as unknown as { emit(e: unknown): Promise<unknown> }).emit({ type: "session_shutdown", reason: "quit" });
