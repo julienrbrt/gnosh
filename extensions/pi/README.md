@@ -12,7 +12,8 @@ a todo, works in it, and pops it with its result. A pop takes the frame's
 work out of what is sent; only the result stays. When the window fills anyway,
 gnosh **slides**: the oldest rounds leave the context (mem still holds what
 they found) with no summary and no extra model call. pi's compaction is used
-only when nothing can slide.
+only when nothing can slide, or when what would slide is work the model
+kept no record of in mem.
 
 This extension gives pi exactly that, with the checks gnosh runs around it
 (the close check of every todo closed as done, and the judge as a turn would
@@ -25,10 +26,10 @@ end), and nothing else of gnosh.
 | tools | registers gnosh's `gnovm_run`, `gnovm_new`, `gnovm_list`, `gnovm_drop` (mem is `gnovm_run` with `name: "mem"`; the scratch machine does the maths). A call to mem carries the conversation through its reply, so gnosh checks it as it checks a session's: the fresh guard, the close check (the claim check and the model's review of the close), the pop's receipt of what left the context |
 | `before_agent_start` | adds gnosh's `<memory>` part after pi's system prompt (same bytes every time, so the provider's cache holds) and the mem line after the prompt |
 | `context` | sends gnosh's view of the conversation: popped work and slid rounds are gone; pi's own message objects are reused, so the cached prefix stays byte for byte |
-| `turn_end` | when over pi's compaction point, asks gnosh to slide; adds gnosh's notes (the slide line, "this todo is large", the mem reminder) as durable hidden messages |
+| `turn_end` | when over pi's compaction point, asks gnosh to slide, only what mem holds a record of (a thought, a result, a fact kept during or after that work; bridge.md §10.4), so that work the model kept nowhere is summarized by pi rather than dropped; near the point, gnosh tells the model to keep what it found before it slides; adds gnosh's notes (the slide line, "this todo is large", the mem reminder) as durable hidden messages |
 | `session_before_compact` | cancels pi's summary when slides brought the conversation under pi's point; otherwise lets pi summarize, as a gnosh session does with no frame to cut |
 | `turn_end`, no tool call | asks gnosh's turn-end checks (`end`): a turn that would end in a todo whose close was refused is sent back once, and every top-level todo closed as done in the turn, and not already approved by the close review, is judged; one found not met is opened again in mem and the model is sent back with gnosh's words. Every tenth send-back in a row asks the model first whether there is a genuine reason to stop |
-| side requests | the close review, the goal judge and the namer ask a model; the bridge asks pi's, through `modelRegistry.complete`, with gnosh's own system prompt, prompt, temperature and token limit, and no reasoning asked for (gnosh's side requests think as little as the model allows) |
+| side requests | the close review, the goal judge and the namer ask a model; the bridge asks pi's, through `modelRegistry.streamSimple`, with gnosh's own system prompt, prompt, temperature and token limit, at the least reasoning the model takes, `minimal` (gnosh's side requests think as little as the model allows) |
 
 ### The checks around a close and a turn's end
 

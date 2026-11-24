@@ -35,3 +35,10 @@ test("pi-gnosh slides where plain pi summarizes", { skip: !program && "GNOSH_BIN
   assert.ok(g.sides.some((sd) => sd.startsWith("You check whether an AI coding agent did the todo")), g.sides.join("\n"));
   assert.equal(plain.sides.length, 0);
 });
+
+test("work mem holds no record of is summarized, not slid", { skip: !program && "GNOSH_BIN is not set" }, async () => {
+  const g = await runDemo({ gnosh: true, program, think: false });
+  assert.ok(g.compactions >= 1, `pi-gnosh made ${g.compactions} summaries of work mem had no record of`);
+  const all = g.requests.flatMap((r) => r.messages);
+  assert.ok(!all.some((m) => m.includes("The start of `port-fix` left your context")), "the frame's unrecorded work slid");
+});

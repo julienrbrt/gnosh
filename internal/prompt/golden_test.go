@@ -176,6 +176,13 @@ func goldenFiles() []goldenFile {
 			},
 		},
 		{
+			file:  "slide-soon",
+			texts: []string{textSlideSoon},
+			cases: func(s *Set) []goldenCase {
+				return []goldenCase{{"in a todo", s.SlideSoon("fix-flaky/find-cause")}}
+			},
+		},
+		{
 			file:  "mem-reminder",
 			texts: []string{textMemReminder, textFrameLine},
 			cases: func(s *Set) []goldenCase {

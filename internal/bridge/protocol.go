@@ -85,6 +85,11 @@ type Request struct {
 	Point int `json:"point,omitempty"`
 	Used  int `json:"used,omitempty"`
 
+	// room and step: Covered says the host slides only what mem covers
+	// (§10.4): room makes no cut that holds work mem got no record of
+	// since, and step warns the model before such a cut would be due.
+	Covered bool `json:"covered,omitempty"`
+
 	// end (Session and Entries too): the reply the turn would end on, and
 	// whether the model finished it itself (not cut off at its length).
 	Reply    *core.Message `json:"reply,omitempty"`

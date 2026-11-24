@@ -241,6 +241,13 @@ func (s *Set) LargeStep(frame string, tokens int) string {
 	})
 }
 
+// SlideSoon returns the line that tells the model, before the oldest
+// rounds of the todo called frame slide out of its context, that nothing
+// of them stays but what mem holds, and that it kept nothing there since.
+func (s *Set) SlideSoon(frame string) string {
+	return s.fill(textSlideSoon, values{"id": oneLine(frame, maxName)})
+}
+
 // Todo is one line of the session's task list, as mem has it.
 type Todo struct {
 	// Title is the todo's title.

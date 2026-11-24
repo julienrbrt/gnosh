@@ -231,6 +231,10 @@
 //     is, and that the reads made there are forgotten.
 //   - large-step (LargeStep) says, once per todo, that the todo has grown
 //     large: pop it or split it.
+//   - slide-soon (SlideSoon) says, near the point, that the oldest rounds
+//     of the todo are about to slide and nothing was kept in mem since it
+//     was entered: keep it as a thought, or pop. `gnosh bridge` gives it to
+//     a host that slides only what mem covers (bridge.md §10).
 //   - mem-reminder (MemReminder) comes after ten replies with no mem call.
 //     It calls itself a reminder to ignore if it does not apply, since not
 //     every stretch of work is a task to plan.
