@@ -1,0 +1,38 @@
+{
+  "name": "pi-gnosh",
+  "version": "0.2.0",
+  "description": "gnosh's mem stack and Gno machines in pi, in place of pi's compaction, through `gnosh bridge`.",
+  "type": "module",
+  "license": "SEE LICENSE IN ../../LICENSE.md",
+  "keywords": [
+    "pi-package",
+    "gnosh",
+    "gno"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "demo": "node demo/run.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.5.2",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^1.6.0",
+    "@earendil-works/pi-coding-agent": "^1.6.0",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.4.7",
+    "typescript": "^5.9.0"
+  },
+  "private": true
+}
