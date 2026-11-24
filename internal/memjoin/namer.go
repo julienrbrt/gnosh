@@ -77,10 +77,7 @@ func (j *join) namer(ctx context.Context, _ string, texts []string) map[string]s
 // several are asked for in one request, one name a line.
 func (j *join) askNames(ctx context.Context, texts []string) []string {
 	none := make([]string, len(texts))
-	a := agent.FromContext(ctx)
-	if a == nil {
-		a = j.theAgent()
-	}
+	a := j.model(ctx, true)
 	if a == nil {
 		return none
 	}

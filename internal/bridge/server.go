@@ -46,6 +46,20 @@ type Options struct {
 	// Log, when not nil, is told what the bridge has to say for a person:
 	// one line each, for standard error.
 	Log func(line string)
+	// Turns, when not nil, is gnosh's session work beside the tools: the
+	// close checks of a call to mem and the turn-end checks (§11). Nil
+	// means calls are run unchecked and end lets every turn end.
+	Turns Turns
+	// Side, when not nil, answers side requests in place of the host. It
+	// is for tests; Serve otherwise asks the host when hello said it
+	// answers them.
+	Side func(ctx context.Context, sr SideRequest) (SideAnswer, error)
+}
+
+// SideAnswer is the host's answer to a side request.
+type SideAnswer struct {
+	Text string
+	Stop string
 }
 
 // Server answers one host's requests. It is safe to use from one
@@ -58,6 +72,10 @@ type Server struct {
 	mu       sync.Mutex
 	sessions map[string]*session
 	hello    bool
+	// side says the host answers side requests, and asker is how Serve
+	// writes one and reads its answer.
+	side  bool
+	asker *asker
 }
 
 // session is what the bridge keeps of one host session: its stack (the
@@ -117,35 +135,39 @@ var errEnd = errors.New("the host broke the protocol, so the bridge ends")
 
 // Serve reads requests from r and writes their replies to w, one line
 // each, until r ends, ctx is cancelled between requests, or a request
-// ends the protocol. It returns nil when r ended.
+// ends the protocol. It returns nil when r ended. While a request is
+// answered the bridge may write side requests of its own and read their
+// answers (§11.1); requests the host wrote meanwhile wait their turn.
 func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
-	in := bufio.NewScanner(r)
-	in.Buffer(make([]byte, 0, 64<<10), MaxLine)
 	out := json.NewEncoder(w)
 	out.SetEscapeHTML(false)
-	for in.Scan() {
+	a := newAsker(r, out)
+	s.asker = a
+	for {
+		line, err := a.next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if errors.Is(err, bufio.ErrTooLong) {
+				_ = a.write(fail(nil, CodeBadRequest, fmt.Sprintf("a request line is longer than %d bytes", MaxLine)))
+			}
+			return fmt.Errorf("reading the host's requests: %w", err)
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		line := in.Bytes()
 		if len(line) == 0 {
 			continue
 		}
 		rep, err := s.Handle(ctx, line)
-		if werr := out.Encode(rep); werr != nil {
+		if werr := a.write(rep); werr != nil {
 			return fmt.Errorf("writing a reply to the host: %w", werr)
 		}
 		if err != nil {
 			return err
 		}
 	}
-	if err := in.Err(); err != nil {
-		if errors.Is(err, bufio.ErrTooLong) {
-			_ = out.Encode(fail(nil, CodeBadRequest, fmt.Sprintf("a request line is longer than %d bytes", MaxLine)))
-		}
-		return fmt.Errorf("reading the host's requests: %w", err)
-	}
-	return nil
 }
 
 // Handle answers one request line. A non-nil error means the bridge must
@@ -175,11 +197,15 @@ func (s *Server) Handle(ctx context.Context, line []byte) (Reply, error) {
 	case OpView:
 		return s.view(req), nil
 	case OpPrompt:
-		return s.prompt(req), nil
+		return s.prompt(ctx, req), nil
 	case OpRoom:
 		return s.room(req), nil
 	case OpStep:
 		return s.step(req), nil
+	case OpEnd:
+		return s.end(ctx, req), nil
+	case OpSideAnswer:
+		return fail(req.ID, CodeBadRequest, fmt.Sprintf("side_answer %d answers no side request the bridge is waiting on", req.SideID)), nil
 	case "":
 		return fail(req.ID, CodeBadRequest, "the request has no op"), nil
 	}
@@ -193,6 +219,7 @@ func (s *Server) helloReply(req Request) (Reply, error) {
 		return rep, errEnd
 	}
 	s.hello = true
+	s.side = req.Side
 	if s.opts.Log != nil && req.Client != "" {
 		s.opts.Log("gnosh bridge: serving " + req.Client)
 	}
@@ -237,11 +264,25 @@ func (s *Server) call(ctx context.Context, req Request) Reply {
 			return rep
 		}
 	}
+	ctx = s.withSide(ctx)
+	if tu := s.opts.Turns; tu != nil {
+		if len(req.Entries) > 0 {
+			if msg := uniqueUUIDs(req.Entries); msg != "" {
+				return fail(req.ID, CodeBadRequest, msg)
+			}
+			tu.Sync(req.Session, req.Entries)
+		}
+		tu.Calling(req.Session, call)
+	}
 	res, err := t.Run(ctx, call, env)
 	if err != nil {
 		return fail(req.ID, CodeInternal, fmt.Sprintf("running %s: %v", req.Name, err))
 	}
 	rep := Reply{OK: true, ID: req.ID, Content: res.Content, IsError: res.IsError}
+	if tu := s.opts.Turns; tu != nil {
+		tu.Called(ctx, req.Session, call, res)
+		rep.Notices = tu.Notices(req.Session)
+	}
 	if s.opts.Frames != nil {
 		for _, f := range s.opts.Frames(res) {
 			if f.Session != req.Session {

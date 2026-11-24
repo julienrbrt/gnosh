@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"context"
 	"encoding/json"
 
 	"github.com/gnosh-ai/gnosh/internal/core"
@@ -24,10 +25,16 @@ const (
 	OpPrompt = "prompt"
 	OpRoom   = "room"
 	OpStep   = "step"
+	// end is asked as a host's turn would end: gnosh's turn-end checks
+	// (bridge.md §11). side_answer is the host's answer to a side request
+	// the bridge wrote while it answered a request (§11.1); it is not
+	// listed in ops, since it is never asked on its own.
+	OpEnd        = "end"
+	OpSideAnswer = "side_answer"
 )
 
 // ops is what hello says the bridge answers.
-var ops = []string{OpHello, OpTools, OpCall, OpView, OpPrompt, OpRoom, OpStep}
+var ops = []string{OpHello, OpTools, OpCall, OpView, OpPrompt, OpRoom, OpStep, OpEnd}
 
 // The error codes of bridge.md §8.
 const (
@@ -48,6 +55,8 @@ type Request struct {
 	// hello
 	Protocol int    `json:"protocol,omitempty"`
 	Client   string `json:"client,omitempty"`
+	// Side says the host answers side requests (§11.1).
+	Side bool `json:"side,omitempty"`
 
 	// call
 	Session   string          `json:"session,omitempty"`
@@ -63,8 +72,10 @@ type Request struct {
 	KeepRounds int                `json:"keep_rounds,omitempty"`
 	Prompt     string             `json:"prompt,omitempty"`
 
-	// prompt (Session too)
-	First bool `json:"first,omitempty"`
+	// prompt (Session too). Text is what the person typed: with it, the
+	// prompt starts a turn (§11).
+	First bool   `json:"first,omitempty"`
+	Text  string `json:"text,omitempty"`
 
 	// room (Session, Entries and Prompt too)
 	Need      int      `json:"need,omitempty"`
@@ -73,6 +84,19 @@ type Request struct {
 	// step (Session and Entries too)
 	Point int `json:"point,omitempty"`
 	Used  int `json:"used,omitempty"`
+
+	// end (Session and Entries too): the reply the turn would end on, and
+	// whether the model finished it itself (not cut off at its length).
+	Reply    *core.Message `json:"reply,omitempty"`
+	Finished bool          `json:"finished,omitempty"`
+
+	// side_answer: the side request's id, and the model's answer, or why
+	// there is none. Stop is the answer's stop reason as core names them;
+	// max_tokens makes it no answer.
+	SideID int    `json:"side_id,omitempty"`
+	Answer string `json:"answer,omitempty"`
+	Stop   string `json:"stop,omitempty"`
+	Failed string `json:"failed,omitempty"`
 }
 
 // Reply is one line the bridge writes. Which fields are set depends on the
@@ -110,6 +134,65 @@ type Reply struct {
 	Parts  []string `json:"parts,omitempty"`
 	Freed  int      `json:"freed,omitempty"`
 	Notice string   `json:"notice,omitempty"`
+
+	// end: "continue" sends the model back with Send, as a hidden prompt
+	// of gnosh's own; "end" lets the turn end. Driver and Objection say
+	// which check holds the turn open and why, Stopped the model's reason
+	// when it stopped at a checkpoint. Notices are lines for the person,
+	// for call and end alike.
+	Action    string   `json:"action,omitempty"`
+	Send      string   `json:"send,omitempty"`
+	Driver    string   `json:"driver,omitempty"`
+	Objection string   `json:"objection,omitempty"`
+	Stopped   string   `json:"stopped,omitempty"`
+	Notices   []string `json:"notices,omitempty"`
+}
+
+// SideRequest is a request for the host's model that the bridge writes,
+// as a line of its own, while it answers a request (§11.1): gnosh's close
+// review, goal judge and namer ask one. The host answers it with a
+// side_answer request.
+type SideRequest struct {
+	ID          int      `json:"id"`
+	Purpose     string   `json:"purpose"`
+	System      string   `json:"system,omitempty"`
+	Prompt      string   `json:"prompt"`
+	MaxTokens   int      `json:"max_tokens,omitempty"`
+	Temperature *float64 `json:"temperature,omitempty"`
+	TimeoutMS   int64    `json:"timeout_ms,omitempty"`
+}
+
+// sideLine is how a side request is written.
+type sideLine struct {
+	Side *SideRequest `json:"side"`
+}
+
+// Turns is gnosh's session work for the host's sessions, beside the tools:
+// what a call to mem is checked against, and the checks asked as a turn
+// would end (§11). memjoin is the one implementation.
+type Turns interface {
+	// Prompt is a prompt the person typed, which starts a turn.
+	Prompt(ctx context.Context, session, text string)
+	// Sync is the session's conversation as the host has it, through the
+	// reply whose call is about to run.
+	Sync(session string, entries []transcript.Entry)
+	// Calling and Called come around every call the bridge runs.
+	Calling(session string, call core.ToolCall)
+	Called(ctx context.Context, session string, call core.ToolCall, res core.ToolResult)
+	// End is asked as the turn would end on reply.
+	End(ctx context.Context, session string, reply core.Message, finished bool) EndVerdict
+	// Notices takes the lines for the person said since it was last asked.
+	Notices(session string) []string
+}
+
+// EndVerdict is what Turns.End says.
+type EndVerdict struct {
+	Continue  bool
+	Send      string
+	Driver    string
+	Objection string
+	Stopped   string
+	Notices   []string
 }
 
 // Error is what a reply with ok false says went wrong.

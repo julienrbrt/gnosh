@@ -27,6 +27,8 @@ export interface Request {
 
 export interface DemoResult {
   requests: Request[];
+  /** The side requests gnosh's checks made, by purpose, with the scripted model's answer. */
+  sides: string[];
   compactions: number;
   slides: number;
   stats: Record<string, number>;
@@ -97,11 +99,27 @@ export async function runDemo(opts: { gnosh: boolean; program?: string; window?:
     run('mem.Pop("the port is picked free in setup; 17*23+4 = 395")', "mem"),
     fauxAssistantMessage(fauxText("done: the port is fixed")),
   ];
+  // gnosh's checks ask the model too (the close review, the goal judge,
+  // the namer), each with a system prompt of its own: the scripted model
+  // answers them as a model would that finds the work done.
+  const sides: string[] = [];
+  const side = (system: string): string | undefined => {
+    if (system.startsWith("You name notes")) return "port-fix";
+    if (system.startsWith("You check whether an AI coding agent did the todo")) return '{"ok": true, "reason": "the commands in the todo show it"}';
+    if (system.startsWith("You check whether an AI coding agent has reached the goal")) return '{"ok": true, "basis": "evidence", "reason": "the conversation shows it"}';
+    return undefined;
+  };
   // Each scripted step answers one request; a summary request in between
   // is answered with a summary and the step waits for the next request.
   const steps: ((c: { systemPrompt?: string; messages: unknown[] }) => ReturnType<typeof fauxAssistantMessage>)[] = [];
   let k = 0;
   const next = (c: { systemPrompt?: string; messages: unknown[] }) => {
+    const sys = (c.messages as Msg[]).filter((m) => m.role === "system").map((m) => (typeof m.content === "string" ? m.content : m.content.map((p) => p.text ?? "").join(""))).join("\n");
+    const answer = side(sys);
+    if (answer !== undefined) {
+      sides.push(`${sys.slice(0, 60)}… → ${answer}`);
+      return fauxAssistantMessage(fauxText(answer));
+    }
     record(c);
     const lastMsg = JSON.stringify(c.messages.at(-1) ?? "");
     if (/<conversation>/.test(lastMsg)) {
@@ -110,7 +128,7 @@ export async function runDemo(opts: { gnosh: boolean; program?: string; window?:
     }
     return script[Math.min(k++, script.length - 1)];
   };
-  for (let i = 0; i < 40; i++) steps.push(next);
+  for (let i = 0; i < 60; i++) steps.push(next);
   faux.setResponses(steps);
 
   const sessionManager = SessionManager.inMemory(cwd);
@@ -144,6 +162,7 @@ export async function runDemo(opts: { gnosh: boolean; program?: string; window?:
     }
     return {
       requests,
+      sides,
       compactions: entries.filter((e) => e.type === "compaction").length,
       slides: entries.filter((e) => e.type === "custom" && e.customType === "gnosh-slides").length,
       stats,
@@ -165,6 +184,7 @@ function report(name: string, r: DemoResult) {
     console.log(`--- request ${i + 1} (~${q.tokens} tokens)`);
     for (const m of short) console.log("   " + m);
   });
+  for (const sd of r.sides) console.log(`--- side request: ${sd}`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

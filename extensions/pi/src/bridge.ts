@@ -3,7 +3,7 @@
 
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { PROTOCOL, type Reply } from "./protocol.ts";
+import { PROTOCOL, type Reply, type SideAnswer, type SideRequest } from "./protocol.ts";
 
 /** A reply with ok false, as an Error the caller can read the code of. */
 export class BridgeCallError extends Error {
@@ -24,6 +24,12 @@ export interface StartOptions {
   /** Says what the bridge writes on standard error. */
   log?: (line: string) => void;
   env?: NodeJS.ProcessEnv;
+  /**
+   * side answers the bridge's side requests with the host's model: gnosh's
+   * close review, goal judge and namer (bridge.md §11.1). Without it the
+   * bridge is told there is no model, and those checks do not run.
+   */
+  side?: (req: SideRequest) => Promise<SideAnswer>;
 }
 
 export class Bridge {
@@ -31,9 +37,11 @@ export class Bridge {
   private readonly waiting = new Map<number, (r: Reply) => void>();
   private next = 1;
   private ended: Error | undefined;
+  private readonly side: StartOptions["side"];
   hello: Reply | undefined;
 
   private constructor(o: StartOptions) {
+    this.side = o.side;
     this.proc = spawn(o.program, ["bridge", "--cwd", o.cwd], { cwd: o.cwd, env: o.env ?? process.env, stdio: ["pipe", "pipe", "pipe"] });
     createInterface({ input: this.proc.stderr }).on("line", (l) => o.log?.(l));
     createInterface({ input: this.proc.stdout }).on("line", (l) => this.onLine(l));
@@ -49,7 +57,7 @@ export class Bridge {
   /** start starts the bridge and says hello; it fails if the bridge cannot speak this protocol. */
   static async start(o: StartOptions & { client: string }): Promise<Bridge> {
     const b = new Bridge(o);
-    b.hello = await b.call({ op: "hello", protocol: PROTOCOL, client: o.client });
+    b.hello = await b.call({ op: "hello", protocol: PROTOCOL, client: o.client, side: !!o.side });
     return b;
   }
 
@@ -58,10 +66,14 @@ export class Bridge {
   }
 
   private onLine(line: string) {
-    let r: Reply;
+    let r: Reply & { side?: SideRequest };
     try {
-      r = JSON.parse(line) as Reply;
+      r = JSON.parse(line) as Reply & { side?: SideRequest };
     } catch {
+      return;
+    }
+    if (r.side) {
+      void this.answer(r.side);
       return;
     }
     // A reply without an id answers a line the bridge could not read;
@@ -83,6 +95,18 @@ export class Bridge {
       );
       this.proc.stdin.write(JSON.stringify({ ...req, id }) + "\n");
     });
+  }
+
+  /** answer asks the host's model a side request and writes its answer back; a failure is an answer too. */
+  private async answer(req: SideRequest) {
+    let a: SideAnswer;
+    try {
+      a = this.side ? await this.side(req) : { failed: "this host answers no side requests" };
+    } catch (e) {
+      a = { failed: (e as Error).message || String(e) };
+    }
+    if (this.ended) return;
+    this.proc.stdin.write(JSON.stringify({ op: "side_answer", side_id: req.id, ...a }) + "\n");
   }
 
   close() {

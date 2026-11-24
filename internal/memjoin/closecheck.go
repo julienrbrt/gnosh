@@ -569,10 +569,7 @@ func (j *join) reviewClose(ctx context.Context, w window, callID string, cl gnov
 		// The turn was stopped: a check that did not run has not passed.
 		return j.texts.CloseCancelled(cl.Id, byName)
 	}
-	a := agent.FromContext(ctx)
-	if a == nil {
-		a = j.theAgent()
-	}
+	a := j.model(ctx, true)
 	if a == nil {
 		return unchecked("there is no model to ask")
 	}

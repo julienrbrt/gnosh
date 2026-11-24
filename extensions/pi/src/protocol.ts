@@ -26,6 +26,7 @@ export interface Message {
 export interface Entry {
   type: "user" | "assistant" | "summary" | "frame";
   uuid: string;
+  timestamp?: string;
   sessionId?: string;
   message?: Message;
   source?: "prompt" | "tool_results" | "notice";
@@ -86,4 +87,25 @@ export interface Reply {
   parts?: string[];
   freed?: number;
   notice?: string;
+  // end (bridge.md §11)
+  action?: "continue" | "end";
+  send?: string;
+  driver?: string;
+  objection?: string;
+  stopped?: string;
+  notices?: string[];
 }
+
+/** A request for the host's model the bridge writes while it answers a request (bridge.md §11.1). */
+export interface SideRequest {
+  id: number;
+  purpose: string;
+  system?: string;
+  prompt: string;
+  max_tokens?: number;
+  temperature?: number;
+  timeout_ms?: number;
+}
+
+/** The host's answer to a side request: the model's text and its stop reason, or why there is none. */
+export type SideAnswer = { answer: string; stop: "end_turn" | "max_tokens" } | { failed: string };

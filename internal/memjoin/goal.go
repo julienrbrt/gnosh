@@ -523,7 +523,7 @@ func (v goalVerdict) shown() string {
 // the todo and the end of the whole conversation, the work of popped
 // todos included: that is where the evidence is.
 func (j *join) judge(ctx context.Context, condition, show string) (goalVerdict, error) {
-	a := j.theAgent()
+	a := j.model(ctx, false)
 	if a == nil {
 		return goalVerdict{}, errors.New("there is no model to ask")
 	}
