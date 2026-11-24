@@ -12,7 +12,7 @@ extension differs.
 | :- | :- |
 | tasks | FrontierHarness `frontier-harness-eval@v1.1.0` (Harbor 0.26, Docker), the tasks where pi compacted in earlier 128K runs plus two other long ones: dna-assembly, dna-insert, gcode-to-text, intrastat-meldung, mteb-leaderboard, vpp-loss-divergence, wal-recovery-ordering |
 | model | `deepseek/deepseek-v4.1-flash-1017` on OpenRouter, provider pinned (BaseTen), reasoning effort max, also for pi's summary calls |
-| window | 65,536 tokens in pi's `models.json` for both arms (pi's default 128K made compaction rare), max output 32,768 |
+| window (round 1) | 65,536 tokens in pi's `models.json` for both arms (pi's default 128K made compaction rare), max output 32,768. Round 2 used 128K; see the settings table below. |
 | compaction | `reserveTokens` 16,384 (point 49,152), `keepRecentTokens` 20,000 |
 | pi-gnosh | slides at the same point; pi's summary only when slides cannot bring the context under it |
 
@@ -77,11 +77,113 @@ trial cannot say whether it closes the gap.
 ### What a meaningful comparison needs
 
 Three trials per task and arm on these seven tasks, with gnosh's checks in
-the bridge: about $20 to $25 at the prices above (plain pi about $13, most of
-it on vpp-loss-divergence and intrastat-meldung; pi-gnosh about $5 to $10,
-since the close reviews and judges are model calls of their own, about one
-per todo closed, with up to 1,500 tokens out each, and send-backs make runs
-longer), and 5–6 hours of wall time at 3 trials at once.
+the bridge, was the plan for round 2. The estimate beforehand was about $20
+to $32 and 6–8 hours. Round 2 ran those settings and is reported below. It
+was cut short by the API key's own $50 limit, so nine trials never got a
+model reply.
+
+
+## Results (round 2, 2026-11-24, 128K window, up to three trials)
+
+Both arms used the settings in the table below, on the same seven tasks, with
+gnosh's close review and turn-end judge in the bridge, slides only when mem
+held a record of the work, and the fix for pi's answer cap after a cut. The
+run started at 21:59 UTC+1 and the last scored trial finished at 23:58 UTC+1.
+
+The OpenRouter key's own limit is $50. That is separate from the $75 ceiling
+that had been approved for this round, and it cannot be raised from the
+runner. The local proxy was therefore capped at $47.25 so the key would not
+start refusing mid-reply. The proxy began returning 429 at 23:54 UTC+1
+(spent $47.10). In-flight replies pushed spend to $47.32. Key usage ended at
+$49.66 of $50.
+
+Nine trials that Harbor still scored as reward 0 were not real attempts: the
+agent ran for one or two seconds, the first completion came back with
+`stopReason: error` and no tokens, and the verifier then marked the untouched
+workspace as a fail. They are listed at the end and are excluded from the
+counts and means below. A raw 9/21 against 3/21 would count those as fails.
+
+| task | pi | pi + pi-gnosh |
+| :- | :- | :- |
+| dna-assembly | **2/3**, mean 16.1m, $0.22, 5 compactions | 0/3, mean 12.8m, $0.19, 0 compactions, 0 slides, 20 / 20 |
+| dna-insert | **2/2**, mean 8.7m, $0.09, 0 compactions (1 unrun) | **1/2**, mean 7.3m, $0.10, 0 slides, 12 / 12 (1 unrun) |
+| gcode-to-text | **2/3**, mean 10.2m, $0.14, 2 compactions | 0/2, mean 12.0m, $0.14, 1 slide, 8 / 6; one 15m timeout (1 unrun) |
+| intrastat-meldung | 0/2, mean 38.2m, $0.77, 16 compactions (1 unrun) | 0/2, mean 15.0m, $0.33, 3 slides, 19 / 18 (1 unrun) |
+| mteb-leaderboard | **2/3**, mean 14.3m, $0.18, 5 compactions | **2/3**, mean 18.2m, $0.14, 2 slides, 15 / 12 |
+| vpp-loss-divergence | **1/2**, mean 48.5m, $0.71, 17 compactions (1 unrun) | 0/2, mean 77.0m, $1.31, 50 slides, 23 / 16 (1 unrun) |
+| wal-recovery-ordering | 0/2, mean 10.7m, $0.15, 1 compaction (1 unrun) | 0/2, mean 10.1m, $0.15, 0 slides, 14 / 14 (1 unrun) |
+| **total (scored)** | **9/17**, 334m, 2.15M out, $5.03, 46 compactions | **3/16**, 336m, 1.62M out, $5.09, 3 compactions, 56 slides, 111 pushes / 98 pops |
+
+Costs are again from each session's own usage at the same BaseTen list
+prices, side requests included. The gnosh arm's close reviews, judges and
+namers cost $0.42 of its $5.09. Key spend for the round was about $10.35.
+`python3 bench/analyze.py` still prints every Harbor trial, including the
+nine unrun ones; drop trials with no tokens before you take a mean.
+
+What it shows, and what it does not:
+
+- **On the trials that actually ran, pi-gnosh still lost.** 3/16 against
+  9/17. It matched plain pi only on mteb-leaderboard (2/3 each) and did not
+  beat it on any task. That is not explained by the nine unrun trials, by
+  cut-off replies (there were no length stops), or by a missing close check
+  in the bridge.
+- **Early stopping is no longer the whole story.** Several short tasks had
+  similar run times on both arms. On vpp-loss-divergence the gnosh arm ran
+  longer and spent more (99.2m + 54.9m, $1.94 + $0.69) than plain pi
+  (47.7m + 49.3m, $0.74 + $0.67) and still failed both. One of those gnosh
+  runs slid 44 times, never popped a frame, and never reached the turn-end
+  judge.
+- **Some losses were not from slides.** All three dna-assembly trials on
+  the gnosh arm failed with zero slides; peak context was 42–89K, under or
+  around the 96K compaction point. The model closed its frames (20 pops)
+  and stopped. wal-recovery-ordering was the same pattern: 0/2 each, no
+  slides on the gnosh arm, similar time and cost.
+- **The mem stack did not fully replace compaction.** The gnosh arm still
+  let pi write a summary three times, when a slide was refused or could not
+  bring the context under the point (four slides were refused because mem
+  held no record). 56 slides went ahead, most of them on vpp-loss-divergence.
+- **The turn-end judge never sent the model back** (0 send-backs). It ran
+  on 12 of the 16 scored trials; five of those 12 replies were cut off at
+  300 output tokens, because reasoning used most of the small cap, and
+  those trials still ended. Four scored trials never reached a turn-end
+  judge at all: the 15-minute gcode-to-text timeout, one mteb-leaderboard
+  fail that had 11 mid-run API errors, and both vpp-loss-divergence fails.
+  Close reviews mostly completed (90 of 91). Almost every frame-namer call
+  also hit the length cap; that is a setup problem for names, and it is
+  not counted as a send-back.
+- **The Gno VM was barely used for maths** (20 scratch calls). The rest of
+  the gnovm calls are mem. This round still tests the memory stack more
+  than the VM.
+- **The 15-minute gcode-to-text timeout** is the task's own limit. One
+  gnosh trial hit it; plain pi's three trials all finished under it.
+
+### Trials that did not run
+
+All nine started after the proxy was already returning 429 (from 23:54
+UTC+1). Each agent's first model call failed; wall time was under two
+minutes, most of it setup.
+
+| arm | trial | started (UTC+1) |
+| :- | :- | :- |
+| pi | dna-insert__KVGN39S | 23:55:55 |
+| pi | wal-recovery-ordering__nG4JMf4 | 23:56:04 |
+| pi | vpp-loss-divergence__LB6zJY5 | 23:56:38 |
+| pi | intrastat-meldung__gzHtx4d | 23:57:06 |
+| pi + pi-gnosh | gcode-to-text__mrXWi2F | 23:56:12 |
+| pi + pi-gnosh | dna-insert__zdp7sh3 | 23:56:51 |
+| pi + pi-gnosh | vpp-loss-divergence__ftM9Usa | 23:57:03 |
+| pi + pi-gnosh | wal-recovery-ordering__EeYrivV | 23:57:02 |
+| pi + pi-gnosh | intrastat-meldung__iPr8oR3 | 23:57:33 |
+
+No other trial was left unrun. The one Harbor exception among the scored
+trials is gcode-to-text__F3rG7nZ on the gnosh arm (`AgentTimeoutError` at
+15 minutes); that is a real attempt and is counted in 0/2 above.
+
+To finish the planned 3×7×2, the OpenRouter key limit has to be raised
+(it has $0.34 left of $50). Only these nine trials should be rerun, at the
+same settings. That is likely about $4 to $8 more, most of it one more
+vpp-loss-divergence and one more intrastat-meldung on each arm. The 33
+scored trials should be kept.
 
 ## Rerun
 
@@ -109,9 +211,9 @@ The runs here also went through a small local proxy, which:
 Without the proxy, OpenRouter may route each request to a different
 provider.
 
-## Settings for the next round, and why
+## Settings used in round 2, and why
 
-| setting | round 1 | next | why |
+| setting | round 1 | round 2 | why |
 | :- | :- | :- | :- |
 | window | 64K | 128K | Both arms use the same window. The model's own window is 1M, so the window is artificial on purpose: with no compaction there is nothing to compare. At 64K, plain pi compacted 83 times on six tasks (43 on vpp-loss-divergence alone, a 157-minute run). The gnosh arm carried about 2.8K more fixed prefix (4.4–5.1K against 1.6–2.3K) and slid inside todos 19 times. 128K is still small enough that the long tasks compact (vpp-loss-divergence, intrastat-meldung, wal-recovery-ordering, dna-assembly), and it is the regime gnosh's frames are designed for (`frames.md` §8.8: "for the intended regime run 32K or more"). |
 | reserve | 16K | 32K | pi caps each answer at window − input − margin (pi-ai `clampMaxTokensToContext`). In round 1 that cap cut replies to one token: vanilla's 400 errors "max_tokens must be at least 2" and the length stops that ended both vpp runs. A 32K reserve leaves about 28K of answer at the point, above the largest reply seen (21K). |

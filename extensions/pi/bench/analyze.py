@@ -89,10 +89,28 @@ def main():
         print('| ' + ' | '.join(str(x) for x in v) + ' |')
     print()
     for arm in sorted(set(o['arm'] for o in rows)):
-        rs = [o for o in rows if o['arm'] == arm]
+        allr = [o for o in rows if o['arm'] == arm]
+        rs = [o for o in allr if o['reward'] is not None or o['exc']]
+        print(f"{arm}: {len(allr) - len(rs)} running/unfinished, {sum(1 for o in rs if o['reward'] is None)} errored")
         n = len(rs); passed = sum(1 for o in rs if o['reward'] == 1.0)
         print(f"{arm}: {passed}/{n} passed; cost ${sum(o['cost'] for o in rs):.2f}; in {sum(o['inp'] for o in rs)} cached {sum(o['cached'] for o in rs)} out {sum(o['out'] for o in rs)}; "
               f"compactions {sum(o['compactions'] for o in rs)} slides {sum(o['slides'] for o in rs)} uncovered {sum(o['uncovered'] for o in rs)} thinks {sum(o['thinks'] for o in rs)} pops {sum(o['pops'] for o in rs)} sent back {sum(o['sentback'] for o in rs)} side ${sum(o['sidecost'] for o in rs):.2f}; length stops {sum(o['length'] for o in rs)}; wall {sum((o['wall'] or 0) for o in rs)/60:.0f}m; timeouts {sum(1 for o in rs if o['exc']=='AgentTimeoutError')}")
+    # per task, aggregated over trials (finished = has a reward or an exception; running ones are skipped)
+    print()
+    print('| task | arm | pass | n | errored | mean time | mean cost | compactions | slides | refused slides | thoughts kept | send-backs | judge cost | VM calls | length stops |')
+    print('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+    fin = [o for o in rows if o['reward'] is not None or o['exc']]
+    for task in sorted(set(o['task'] for o in fin)):
+        for arm in sorted(set(o['arm'] for o in fin)):
+            rs = [o for o in fin if o['arm'] == arm and o['task'] == task]
+            if not rs: continue
+            ok = [o for o in rs if o['reward'] is not None]
+            err = [o for o in rs if o['reward'] is None]
+            w = [o['wall'] for o in ok if o['wall']]
+            S = lambda k: sum(o[k] for o in rs)
+            print(f"| {task} | {arm} | {sum(1 for o in ok if o['reward'] == 1.0)} | {len(ok)} | {len(err)} | "
+                  f"{(sum(w)/len(w)/60 if w else 0):.1f}m | ${(sum(o['cost'] for o in ok)/len(ok) if ok else 0):.3f} | "
+                  f"{S('compactions')} | {S('slides')} | {S('uncovered')} | {S('thinks')} | {S('sentback')} | ${S('sidecost'):.3f} | {S('scratch')} | {S('length')} |")
     if '--json' in os.environ.get('PIEXT_FLAGS', ''):
         print(json.dumps(rows))
 
