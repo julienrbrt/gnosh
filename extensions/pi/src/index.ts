@@ -13,7 +13,10 @@
 //   view, mem holding the plan, results and thoughts, with no summary and
 //   no model call (room). pi compacts only when nothing can slide, as a
 //   gnosh session does;
-// - between two rounds adds the notes a gnosh session adds (step).
+// - between two rounds adds the notes a gnosh session adds (step);
+// - as the run would end with a top todo closed and not yet checked, or
+//   one still open, sends the model back to check it against the task,
+//   as a gnosh session's turn-end check does (check.ts).
 //
 // mem and its frames are gnosh's, built on gnosh: https://gnosh.ai
 
@@ -24,7 +27,8 @@ import { appendFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Bridge, BridgeCallError } from "./bridge.ts";
-import { FRAMES, fromView, type PiMessage, toEntries } from "./map.ts";
+import { Check, Stack } from "./check.ts";
+import { FRAMES, framesOf, fromView, type PiMessage, toEntries } from "./map.ts";
 import type { Block, Entry, Reply } from "./protocol.ts";
 
 const CLIENT = "pi-gnosh 0.2.0";
@@ -73,7 +77,11 @@ export default async function (pi: ExtensionAPI) {
   // freedSinceReply is what slides took out since the model last answered:
   // pi's own count is from before them.
   let freedSinceReply = 0;
-  const stats = { slides: 0, freed: 0, compactions: 0, cancelled: 0, notes: 0, pushes: 0, pops: 0, calls: 0 };
+  const stats = { slides: 0, freed: 0, compactions: 0, cancelled: 0, notes: 0, pushes: 0, pops: 0, calls: 0, checks: 0 };
+  // The frames mem reported, for the check before the run ends.
+  let stack = new Stack();
+  const check = new Check();
+  const checking = process.env.PI_GNOSH_CHECK !== "0";
   const statsFile = process.env.PI_GNOSH_STATS;
   const log = (line: string) => {
     process.stderr.write(`pi-gnosh: ${line}\n`);
@@ -115,6 +123,10 @@ export default async function (pi: ExtensionAPI) {
       if (e.type === "custom" && e.customType === SLIDES && Array.isArray(e.data)) slides.push(...(e.data as Entry[]));
     }
     prompted = slides.length > 0 || ctx.sessionManager.getEntries().some((e) => (e as { type: string }).type === "message");
+    stack = new Stack();
+    for (const e of ctx.sessionManager.getEntries() as { type: string; message?: PiMessage }[]) {
+      if (e.type === "message" && e.message?.role === "toolResult") stack.add(framesOf(e.message), session);
+    }
   });
   pi.on("session_shutdown", async () => {
     log(`end ${JSON.stringify(stats)}`);
@@ -143,6 +155,7 @@ export default async function (pi: ExtensionAPI) {
         }
         stats.calls++;
         for (const f of r.frames ?? []) f.kind === "push" ? stats.pushes++ : stats.pops++;
+        stack.add(r.frames ?? [], sessionOf(ctx));
         return { content: piContent(r.content), details: { [FRAMES]: r.frames ?? [] }, isError: !!r.is_error };
       },
     });
@@ -158,6 +171,7 @@ export default async function (pi: ExtensionAPI) {
   // time; the mem line (and the frame line, in a frame) after the prompt.
   if (has("prompt")) {
     pi.on("before_agent_start", async (event, ctx) => {
+      check.reset();
       const r = await (await ensure()).call({ op: "prompt", session: sessionOf(ctx), first: !prompted, entries: entriesOf(last, ctx).entries });
       prompted = true;
       const parts = (r.parts ?? []).filter((p) => p.trim());
@@ -232,7 +246,16 @@ export default async function (pi: ExtensionAPI) {
   // Between two rounds: the slide when over pi's point (before pi's own
   // check), and the notes a gnosh session adds before the next reply.
   pi.on("turn_end", async (event, ctx) => {
-    if (!event.toolResults?.length) return undefined;
+    if (!event.toolResults?.length) {
+      // The model answered with no call: the run would end here.
+      if (!checking) return undefined;
+      const n = check.decide(stack, (event.message as { stopReason?: string }).stopReason);
+      if (!n) return undefined;
+      stats.checks++;
+      log(`sent back to check before stopping: ${n}`);
+      pi.sendMessage({ customType: NOTE, content: n, display: false }, { deliverAs: "followUp" });
+      return undefined;
+    }
     const p = point(ctx);
     if (!p) return undefined;
     const notes: string[] = [];
