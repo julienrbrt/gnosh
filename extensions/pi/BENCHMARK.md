@@ -36,13 +36,15 @@ peak context, Gno calls).
 
 What it shows, and what it does not:
 
-- **pi-gnosh replaced compaction completely.** It never let pi summarize, and
-  the context stayed under pi's point (peak 36–58K against 48–61K for plain
-  pi, whose summaries sometimes ran over).
-- **It lost on the answers, and not because of lost context.** On dna-insert
-  and intrastat-meldung nothing slid at all, and on most tasks very little.
-  The pi-gnosh runs ended much sooner, with about a fifth of plain pi's
-  output: the model popped its plan and stopped. A gnosh session checks every
+- **pi-gnosh replaced compaction completely in these runs.** It never let
+  pi summarize. Peak context was 36–58K against 48–61K for plain pi;
+  both sometimes exceeded the 49,152-token compaction point.
+- **It lost on the answers. Early stopping is a hypothesis, not a proven
+  cause of those failures.** On dna-insert and intrastat-meldung no rounds
+  slid, but frame pops still removed work from context. Thus zero slides
+  does not rule out information loss. The pi-gnosh runs ended much sooner,
+  with about a fifth of plain pi's output: the model popped its plan and
+  stopped. A gnosh session checks every
   top-level todo closed as done before a turn may end, and sends the model
   back when it does not hold (`internal/memjoin/goal.go`). `gnosh bridge` did
   not run that check, so pi stopped on the model's word. vpp-loss-divergence
@@ -61,9 +63,10 @@ What it shows, and what it does not:
 | :- | :- |
 | dna-insert | fail, 28.0m, 192K out, $0.35, 0 compactions, 7 slides, 8 / 8. The check fired once, after the top todo's pop. The model re-checked with its tools and kept the same wrong primer split (Tm difference 7.4 °C by the verifier's annealing region, against the 5 °C allowed). |
 
-The check works as intended: the run is sent back once, and the model
-verifies against the files instead of its mem results. It did not change
-this answer, and a single trial cannot say whether it closes the gap.
+The check fired as intended: the run was sent back once and the model
+attempted verification against the files, but kept a wrong answer. This
+is not an independent judge and does not establish correctness. A single
+trial cannot say whether it closes the gap.
 
 ### What a meaningful comparison needs
 
