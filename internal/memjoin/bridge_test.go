@@ -338,3 +338,106 @@ func TestBridgePromptRoomStep(t *testing.T) {
 		t.Fatalf("exit %d", code)
 	}
 }
+
+// With covered, a slide takes only work mem got a record of since, and
+// near the point the model is told so first (bridge.md §10.4).
+func TestBridgeCoveredSlide(t *testing.T) {
+	w := newWorld(t)
+	h := w.bridge()
+	h.ask(map[string]any{"op": "hello", "protocol": 1, "client": "test"})
+
+	c := &conv{session: "S1"}
+	c.prompt("fix the port")
+	for i := 0; i < 4; i++ {
+		id := "x" + itoa(i)
+		c.call(id, `"`+strings.Repeat("read ", 400)+`"`, "")
+		c.result(id, h.ask(runCall(id, `"`+strings.Repeat("read ", 400)+`"`, "")))
+	}
+	c.call("c1", `mem.Todo("fix the port").Push()`, "mem")
+	c.result("c1", h.ask(runCall("c1", `mem.Todo("fix the port").Push()`, "mem")))
+	for i := 0; i < 4; i++ {
+		id := "w" + itoa(i)
+		c.call(id, `"`+strings.Repeat("work ", 400)+`"`, "")
+		c.result(id, h.ask(runCall(id, `"`+strings.Repeat("work ", 400)+`"`, "")))
+	}
+
+	// Far from the point: nothing said.
+	st := h.ask(map[string]any{"op": "step", "session": "S1", "entries": c.entries, "used": 10000, "point": 20000, "covered": true})
+	if strings.Contains(strings.Join(st.Parts, "\n"), "near the point") {
+		t.Fatalf("slide-soon far from the point: %+v", st.Parts)
+	}
+	// Near it, with nothing kept since the push: said once.
+	st = h.ask(map[string]any{"op": "step", "session": "S1", "entries": c.entries, "used": 18000, "point": 20000, "covered": true})
+	if !strings.Contains(strings.Join(st.Parts, "\n"), "near the point") || !strings.Contains(strings.Join(st.Parts, "\n"), "`fix-port`") {
+		t.Fatalf("no slide-soon line: %+v", st.Parts)
+	}
+	st = h.ask(map[string]any{"op": "step", "session": "S1", "entries": c.entries, "used": 18500, "point": 20000, "covered": true})
+	if strings.Contains(strings.Join(st.Parts, "\n"), "near the point") {
+		t.Fatalf("slide-soon twice: %+v", st.Parts)
+	}
+	// Without covered, gnosh's own step says nothing of it.
+	st = h.ask(map[string]any{"op": "step", "session": "S2", "entries": c.entries, "used": 18000, "point": 20000})
+	if strings.Contains(strings.Join(st.Parts, "\n"), "near the point") {
+		t.Fatalf("slide-soon without covered: %+v", st.Parts)
+	}
+
+	// The rounds before the frame are covered by the plan made after them.
+	room := h.ask(map[string]any{"op": "room", "session": "S1", "entries": c.entries, "need": 500, "prompt": "e000", "covered": true})
+	if !room.OK || room.Freed <= 0 || len(room.NewSlides) == 0 {
+		t.Fatalf("covered rounds before the frame did not slide: %+v", room)
+	}
+	c.entries = append(c.entries, room.NewSlides...)
+	// The frame's own work: nothing kept in mem since the push.
+	room = h.ask(map[string]any{"op": "room", "session": "S1", "entries": c.entries, "need": 1500, "prompt": "e000", "covered": true})
+	if !room.OK || room.Freed != 0 || len(room.NewSlides) != 0 || !strings.Contains(room.Notice, "no record") {
+		t.Fatalf("uncovered work slid: %+v", room)
+	}
+	// Without covered it slides, as in a gnosh session.
+	plain := h.ask(map[string]any{"op": "room", "session": "S1", "entries": c.entries, "need": 1500, "prompt": "e000"})
+	if plain.Freed <= 0 {
+		t.Fatalf("room without covered: %+v", plain)
+	}
+	// A thought kept: now it slides.
+	c.call("c2", `mem.Think("the port is read from PORT in config.go:12")`, "mem")
+	c.result("c2", h.ask(runCall("c2", `mem.Think("the port is read from PORT in config.go:12")`, "mem")))
+	room = h.ask(map[string]any{"op": "room", "session": "S1", "entries": c.entries, "need": 1500, "prompt": "e000", "covered": true})
+	if !room.OK || room.Freed <= 0 || len(room.NewSlides) == 0 {
+		t.Fatalf("covered work did not slide: %+v", room)
+	}
+	c.entries = append(c.entries, room.NewSlides...)
+	// After the slide, the next one is warned of again once nothing new is kept.
+	for i := 0; i < 2; i++ {
+		id := "v" + itoa(i)
+		c.call(id, `"`+strings.Repeat("more ", 400)+`"`, "")
+		c.result(id, h.ask(runCall(id, `"`+strings.Repeat("more ", 400)+`"`, "")))
+	}
+	st = h.ask(map[string]any{"op": "step", "session": "S1", "entries": c.entries, "used": 19000, "point": 20000, "covered": true})
+	if !strings.Contains(strings.Join(st.Parts, "\n"), "near the point") {
+		t.Fatalf("no slide-soon after a slide: %+v", st.Parts)
+	}
+	if code := h.close(); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+}
+
+func TestRecordsMem(t *testing.T) {
+	call := func(code string) core.Message {
+		in, _ := json.Marshal(map[string]string{"name": "mem", "code": code})
+		return core.Message{Role: core.RoleAssistant, Blocks: []core.Block{{Type: core.BlockToolUse, ID: "c", Name: "gnovm_run", Input: in}}}
+	}
+	for code, want := range map[string]bool{
+		`mem.Show()`:                         false,
+		`mem.Find("port")`:                   false,
+		`mem.Next()`:                         false,
+		`mem.Think("x")`:                     true,
+		`mem.Frame("a/b").Think("x")`:        true,
+		`mem.Pop("done: x")`:                 true,
+		`mem.Fact("cmd/test", "go test")`:    true,
+		`mem.Todo("a", "b").Push()`:          true,
+		"mem.Show()\nmem.Done(\"a\", \"x\")": true,
+	} {
+		if got := recordsMem(call(code)); got != want {
+			t.Errorf("recordsMem(%q) = %v, want %v", code, got, want)
+		}
+	}
+}

@@ -59,13 +59,14 @@ func (p *process) bridgeCommand(ctx context.Context, c *app.CommandContext) int 
 				},
 			})).Tools()
 		},
-		Turns:    host,
-		Frames:   bridgeFrames,
-		Texts:    prompt.Builtin(),
-		Digest:   func() string { return gnovm.MemBlock(DataDir(c.Dirs.State), project) },
-		UsesMem:  usesMem,
-		Confirms: map[string]bool{gnovmtools.DropToolName: true},
-		Log:      func(line string) { fmt.Fprintln(c.Stderr, line) },
+		Turns:      host,
+		Frames:     bridgeFrames,
+		Texts:      prompt.Builtin(),
+		Digest:     func() string { return gnovm.MemBlock(DataDir(c.Dirs.State), project) },
+		UsesMem:    usesMem,
+		RecordsMem: recordsMem,
+		Confirms:   map[string]bool{gnovmtools.DropToolName: true},
+		Log:        func(line string) { fmt.Fprintln(c.Stderr, line) },
 	})
 	if err := srv.Serve(ctx, c.Stdin, c.Stdout); err != nil {
 		fmt.Fprintf(c.Stderr, "gnosh bridge: %v\n", err)

@@ -88,7 +88,7 @@ export default async function (pi: ExtensionAPI) {
   // ctxNow is the context of the event being handled, for the side
   // requests the bridge makes while it answers.
   let ctxNow: ExtensionContext | undefined;
-  const stats = { slides: 0, freed: 0, compactions: 0, cancelled: 0, notes: 0, pushes: 0, pops: 0, calls: 0, sentBack: 0, sides: 0, sideFailed: 0 };
+  const stats = { slides: 0, freed: 0, uncovered: 0, compactions: 0, cancelled: 0, notes: 0, pushes: 0, pops: 0, calls: 0, sentBack: 0, sides: 0, sideFailed: 0 };
   const statsFile = process.env.PI_GNOSH_STATS;
   const log = (line: string) => {
     process.stderr.write(`pi-gnosh: ${line}\n`);
@@ -105,8 +105,10 @@ export default async function (pi: ExtensionAPI) {
    * side answers a side request of gnosh's checks with pi's model, as a
    * gnosh session answers it with its small model (the benchmark ran gnosh
    * with the same model for both): the request's own system prompt and
-   * prompt alone, no reasoning asked for, its temperature, token limit and
-   * time.
+   * prompt alone, its temperature, token limit and time, and the least
+   * reasoning the model takes (gnosh asks its lowest thinking: a judge
+   * given 300 tokens that spends them reasoning answers nothing, and a
+   * check that answers nothing sends the model back).
    */
   async function side(req: SideRequest): Promise<SideAnswer> {
     const ctx = ctxNow;
@@ -115,11 +117,19 @@ export default async function (pi: ExtensionAPI) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), req.timeout_ms || 120_000);
     try {
-      const res = await ctx.modelRegistry.complete(
-        ctx.model,
-        { systemPrompt: req.system, messages: [{ role: "user", content: [{ type: "text", text: req.prompt }], timestamp: Date.now() }] },
-        { maxTokens: req.max_tokens || undefined, temperature: req.temperature, signal: ac.signal, cacheRetention: "none" } as never,
-      );
+      const res = await ctx.modelRegistry
+        .streamSimple(
+          ctx.model,
+          { systemPrompt: req.system, messages: [{ role: "user", content: [{ type: "text", text: req.prompt }], timestamp: Date.now() }] },
+          {
+            maxTokens: req.max_tokens || undefined,
+            temperature: req.temperature,
+            signal: ac.signal,
+            cacheRetention: "none",
+            ...(ctx.model.reasoning ? { reasoning: "minimal" } : {}),
+          } as never,
+        )
+        .result();
       if (res.stopReason === "error" || res.stopReason === "aborted") {
         stats.sideFailed++;
         return { failed: res.errorMessage || res.stopReason };
@@ -283,8 +293,16 @@ export default async function (pi: ExtensionAPI) {
     const need = Math.max(1, used - p.point + Math.floor(p.window / 10));
     const { entries } = entriesOf(last, ctx);
     const prompt = [...entries].reverse().find((e) => e.type === "user" && e.source === "prompt")?.uuid;
-    const r = await (await ensure()).call({ op: "room", session: sessionOf(ctx), entries, need, prompt });
-    if (!r.freed || !r.new_slides?.length) return undefined;
+    // covered: gnosh slides only work mem got a record of; what it holds no
+    // record of is left to pi's summary (bridge.md §10.4).
+    const r = await (await ensure()).call({ op: "room", session: sessionOf(ctx), entries, need, prompt, covered: true });
+    if (!r.freed || !r.new_slides?.length) {
+      if (r.notice) {
+        stats.uncovered++;
+        log(r.notice);
+      }
+      return undefined;
+    }
     slides.push(...r.new_slides);
     pi.appendEntry(SLIDES, r.new_slides);
     freedSinceReply += r.freed;
@@ -337,7 +355,7 @@ export default async function (pi: ExtensionAPI) {
     if (has("step")) {
       const msgs = [...last];
       if (!msgs.includes(event.message as unknown as PiMessage)) msgs.push(event.message as unknown as PiMessage, ...(event.toolResults as unknown as PiMessage[]));
-      const r = await (await ensure()).call({ op: "step", session: sessionOf(ctx), entries: entriesOf(msgs, ctx).entries, used: p.used, point: p.point });
+      const r = await (await ensure()).call({ op: "step", session: sessionOf(ctx), entries: entriesOf(msgs, ctx).entries, used: p.used, point: p.point, covered: true });
       notes.push(...(r.parts ?? []));
     }
     if (!notes.length) return undefined;

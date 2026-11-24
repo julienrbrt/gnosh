@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/gnosh-ai/gnosh/internal/core"
 	"github.com/gnosh-ai/gnosh/internal/prompt"
 	"github.com/gnosh-ai/gnosh/internal/transcript"
 )
@@ -101,6 +102,37 @@ func (s *Server) room(req Request) Reply {
 		rep.NewSlides = []transcript.Entry{}
 		return rep
 	}
+	if req.Covered {
+		for _, c := range cuts {
+			if !s.covered(req.Entries, c.Removed) {
+				what := "what came before `" + c.Before + "`"
+				if c.Frame != "" {
+					what = "the start of `" + c.Frame + "`"
+				}
+				rep.NewSlides = []transcript.Entry{}
+				rep.Notice = fmt.Sprintf("nothing slid: %s holds work mem has no record of, so it is left to a summary", what)
+				if s.opts.Log != nil {
+					s.opts.Log("gnosh bridge: " + rep.Notice)
+				}
+				return rep
+			}
+		}
+		ss := s.session(req.Session)
+		s.mu.Lock()
+		if ss.slidAt == nil {
+			ss.slidAt = map[string]string{}
+		}
+		last := lastMessage(req.Entries)
+		for _, c := range cuts {
+			f := c.Frame
+			if f == "" {
+				f = c.Before
+			}
+			ss.slidAt[f] = last
+			delete(ss.soon, f)
+		}
+		s.mu.Unlock()
+	}
 	names := req.EditTools
 	if len(names) == 0 {
 		names = editTools
@@ -172,6 +204,19 @@ func (s *Server) step(req Request) Reply {
 			rep.Parts = append(rep.Parts, t.LargeStep(top.ID, grown))
 		}
 	}
+	// Near the point, with nothing kept in mem since the top todo was
+	// entered or last slid: the slide-soon line, for a host that slides
+	// only what mem covers (§10.4).
+	if n := len(info.Stack); req.Covered && n > 0 && req.Point > 0 && req.Used >= req.Point-req.Point/8 {
+		top := info.Stack[n-1]
+		if !ss.soon[top.ID] && !s.recordedSince(req.Entries, s.since(req.Entries, ss, top)) {
+			if ss.soon == nil {
+				ss.soon = map[string]bool{}
+			}
+			ss.soon[top.ID] = true
+			rep.Parts = append(rep.Parts, t.SlideSoon(top.ID))
+		}
+	}
 	replies := 0
 	for i := len(req.Entries) - 1; i >= 0 && i >= ss.remindedAt; i-- {
 		e := &req.Entries[i]
@@ -188,6 +233,74 @@ func (s *Server) step(req Request) Reply {
 		rep.Parts = append(rep.Parts, t.MemReminder(frames, nil))
 	}
 	return rep
+}
+
+// covered reports whether mem got a record at or after the first of the
+// removed entries that the host sent: a reply that keeps something in mem
+// (Options.RecordsMem) came during or after the work the cut would take.
+func (s *Server) covered(entries []transcript.Entry, removed []string) bool {
+	in := make(map[string]bool, len(removed))
+	for _, u := range removed {
+		in[u] = true
+	}
+	for i, e := range entries {
+		if in[e.UUID] {
+			return s.recordedSince(entries, i)
+		}
+	}
+	return true // nothing of the host's is cut
+}
+
+// recordedSince reports whether a reply at or after entries[from] keeps
+// something in mem.
+func (s *Server) recordedSince(entries []transcript.Entry, from int) bool {
+	if s.opts.RecordsMem == nil {
+		return false
+	}
+	for i := max(from, 0); i < len(entries); i++ {
+		if entries[i].Type == transcript.TypeAssistant && s.opts.RecordsMem(entries[i].Message) {
+			return true
+		}
+	}
+	return false
+}
+
+// since is where the work of the frame top that a slide would take
+// begins in entries: after the reply that entered it, or after what the
+// host had sent when the frame last slid. The caller holds s.mu.
+func (s *Server) since(entries []transcript.Entry, ss *session, top transcript.Frame) int {
+	from := 0
+	for i, e := range entries {
+		switch {
+		case e.UUID != "" && e.UUID == top.UUID:
+			from = max(from, i+1)
+		case e.Type == transcript.TypeAssistant && top.ToolUseID != "" && callsID(e.Message, top.ToolUseID):
+			from = max(from, i+1)
+		case ss.slidAt[top.ID] != "" && e.UUID == ss.slidAt[top.ID]:
+			from = max(from, i+1)
+		}
+	}
+	return from
+}
+
+// callsID reports whether m holds the tool call id.
+func callsID(m core.Message, id string) bool {
+	for _, b := range m.Blocks {
+		if b.Type == core.BlockToolUse && b.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// lastMessage is the uuid of the last user or assistant entry.
+func lastMessage(entries []transcript.Entry) string {
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].IsMessage() {
+			return entries[i].UUID
+		}
+	}
+	return ""
 }
 
 func uniqueUUIDs(entries []transcript.Entry) string {

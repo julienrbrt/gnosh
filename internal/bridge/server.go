@@ -43,6 +43,10 @@ type Options struct {
 	// UsesMem reports whether a reply of the model calls mem, for the mem
 	// reminder's count.
 	UsesMem func(core.Message) bool
+	// RecordsMem reports whether a reply of the model keeps something in
+	// mem (a thought, a fact, a result, a todo), for room and step with
+	// Covered. Nil means no reply does.
+	RecordsMem func(core.Message) bool
 	// Log, when not nil, is told what the bridge has to say for a person:
 	// one line each, for standard error.
 	Log func(line string)
@@ -94,6 +98,12 @@ type session struct {
 	// was last given.
 	large      map[string]bool
 	remindedAt int
+	// slidAt holds, for each frame a covered room slid, the uuid of the
+	// last entry the host had sent then: work after it is what the next
+	// slide of the frame would take. soon holds the frames the slide-soon
+	// line was said of since their last slide.
+	slidAt map[string]string
+	soon   map[string]bool
 }
 
 // New makes a Server.

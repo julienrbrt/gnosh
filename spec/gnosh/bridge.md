@@ -316,6 +316,28 @@ are listed in `ops`; protocol 1 is unchanged.
   from `used` when the top frame was entered, and the mem reminder after
   ten replies with no call on mem.
 
+### 10.4 Covered slides: only what mem holds a record of
+
+A gnosh session slides "since mem holds the plan, the results and the
+thoughts" (`frames.md` §8.1), and tells its model so. A model that kept
+nothing in mem while it worked loses that work to a slide, with no summary:
+in the first pi benchmark one run slid twelve times inside one todo with no
+thought or result kept. A host may ask, with `covered: true` on `room` and
+`step`, that the bridge slide only what mem covers:
+
+- `room` makes the cut only when a reply that keeps something in mem (a
+  thought, fact, rule, todo, result, a reopened or dropped todo) came at or
+  after the first entry the cut would take. When one of the planned cuts is
+  not covered, nothing slides: `freed` is 0, `notice` says why, and the
+  host makes room its own way, by a summary.
+- `step` adds the slide-soon line once per todo, and again after each slide
+  of it, when `used` is past seven eighths of `point` and nothing has been
+  kept in mem since the todo was entered or last slid: the oldest rounds
+  are about to leave with no summary, so keep what later work needs as a
+  thought, or pop.
+
+Without `covered`, both answer as a gnosh session does.
+
 ## 11. A session's checks: the call, the turn's end, and side requests
 
 A gnosh session does not take its model's word that work is done

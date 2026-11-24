@@ -55,6 +55,7 @@ const (
 	textFrameLine        = "frame-line"
 	textSlide            = "slide"
 	textLargeStep        = "large-step"
+	textSlideSoon        = "slide-soon"
 	textMemReminder      = "mem-reminder"
 	textRepeat           = "repeat"
 	textRepeatClose      = "repeat-refused-close"
@@ -181,6 +182,8 @@ func specs() []spec {
 			when: "After the oldest rounds were taken out of the view to make room: inside the next frame line, or as a note of its own before the next reply."},
 		{name: textLargeStep, kind: KindLine, need: []string{"id", "tokens"},
 			when: "Once per todo, before the next reply, when much has come in since the todo was entered."},
+		{name: textSlideSoon, kind: KindLine, need: []string{"id"},
+			when: "Before the next reply, once per todo and again after each slide of it, when the context nears the point where the oldest rounds slide and nothing was kept in mem since the todo was entered or last slid."},
 		{name: textMemReminder, kind: KindLine, may: []string{"frame", "todos"},
 			when: "Before the next reply, after ten replies with no mem call."},
 

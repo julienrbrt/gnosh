@@ -2,6 +2,7 @@ package memjoin
 
 import (
 	"context"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -318,6 +319,25 @@ func usesMem(m core.Message) bool {
 	for _, b := range m.Blocks {
 		if b.Type == core.BlockToolUse && b.Name == gnovmtools.RunToolName {
 			if _, ok := memCode(b.Input); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// recordVerb finds the mem calls that keep something: a thought, a fact,
+// a rule, a todo, a result (a pop or a close), a reopened todo.
+var recordVerb = regexp.MustCompile(`(?:\bmem|\))\s*\.\s*(?:Think|Fact|Rule|Todo|Later|Pop|Done|Drop|Reopen|Ask)\s*\(`)
+
+// recordsMem reports whether a reply of the model keeps something in mem,
+// for the bridge's covered slides (bridge.md §10.4). It reads the code,
+// not the result, so a call mem refused counts too: it errs toward
+// sliding, as a gnosh session always does.
+func recordsMem(m core.Message) bool {
+	for _, b := range m.Blocks {
+		if b.Type == core.BlockToolUse && b.Name == gnovmtools.RunToolName {
+			if code, ok := memCode(b.Input); ok && recordVerb.MatchString(code) {
 				return true
 			}
 		}

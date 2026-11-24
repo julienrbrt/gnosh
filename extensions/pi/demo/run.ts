@@ -5,10 +5,11 @@
 //
 //   GNOSH_BIN=/path/to/gnosh node demo/run.ts
 //
-// With pi-gnosh the model plans in mem, works inside a frame, and works out
-// a sum on a Gno machine; when the window fills, the rounds before the frame
-// slide out of what is sent (no summary, no model call), and the frame's
-// work leaves when it is popped. Plain pi has to summarize instead.
+// With pi-gnosh the model plans in mem, works inside a frame, keeps what it
+// found as a thought, and works out a sum on a Gno machine; when the window
+// fills, rounds mem holds a record of slide out of what is sent (no
+// summary, no model call), and the frame's work leaves when it is popped.
+// Plain pi has to summarize instead.
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -44,7 +45,7 @@ function show(m: Msg): string {
 }
 
 
-export async function runDemo(opts: { gnosh: boolean; program?: string; window?: number; reserve?: number }): Promise<DemoResult> {
+export async function runDemo(opts: { gnosh: boolean; program?: string; window?: number; reserve?: number; think?: boolean }): Promise<DemoResult> {
   const home = mkdtempSync(join(tmpdir(), "pi-gnosh-demo-"));
   const oldEnv = { ...process.env };
   const oldCwd = process.cwd();
@@ -94,6 +95,7 @@ export async function runDemo(opts: { gnosh: boolean; program?: string; window?:
     run('mem.Todo("fix the port").Push()', "mem"),
     read("work", 1400), // work inside the frame
     read("work", 1400),
+    ...(opts.think === false ? [] : [run('mem.Think("setup binds a fixed port; picking a free one fixes it")', "mem")]), // what the work found, kept before it can slide
     read("work", 1400),
     run("17 * 23 + 4"), // the sum, worked out on a Gno machine
     run('mem.Pop("the port is picked free in setup; 17*23+4 = 395")', "mem"),
