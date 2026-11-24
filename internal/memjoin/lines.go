@@ -330,19 +330,19 @@ func usesMem(m core.Message) bool {
 // a rule, a todo, a result (a pop or a close), a reopened todo.
 var recordVerb = regexp.MustCompile(`(?:\bmem|\))\s*\.\s*(?:Think|Fact|Rule|Todo|Later|Pop|Done|Drop|Reopen|Ask)\s*\(`)
 
-// recordsMem reports whether a reply of the model keeps something in mem,
-// for the bridge's covered slides (bridge.md §10.4). It reads the code,
-// not the result, so a call mem refused counts too: it errs toward
-// sliding, as a gnosh session always does.
-func recordsMem(m core.Message) bool {
-	for _, b := range m.Blocks {
-		if b.Type == core.BlockToolUse && b.Name == gnovmtools.RunToolName {
-			if code, ok := memCode(b.Input); ok && recordVerb.MatchString(code) {
-				return true
-			}
-		}
+// recordsMem reports whether a call kept something in mem, for the
+// bridge's covered slides (bridge.md §10.4): a call on mem that keeps
+// (recordVerb) and whose result says it ran, not refused (an error, as a
+// refused close is) and not failed with nothing kept.
+func recordsMem(call, result core.Block) bool {
+	if call.Type != core.BlockToolUse || call.Name != gnovmtools.RunToolName {
+		return false
 	}
-	return false
+	code, ok := memCode(call.Input)
+	if !ok || !recordVerb.MatchString(code) {
+		return false
+	}
+	return !result.IsError && !failedLine(result.Content)
 }
 
 // count is the join's bookkeeping on what the loop stores: the calls on

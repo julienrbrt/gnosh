@@ -193,3 +193,25 @@ export function fromView(view: { messages: Message[]; sources: string[][] }, byU
   });
   return out;
 }
+
+/**
+ * staleUsage takes the usage off the replies the view sends after the
+ * first message it left out. pi sizes a request from the last reply's usage
+ * plus an estimate of what came after it (pi-ai's estimateContextTokens),
+ * and caps the answer by what it thinks is left of the window. A reply
+ * from before a pop or slide reports the context as it was then, so after
+ * a large cut pi would think the window nearly full and cap the answer at a
+ * token or two: in the first benchmark one run ended on a reply cut off at
+ * one token with 29K of a 64K window in use. The replies before the cut
+ * keep their usage, which still describes the prefix in front of them;
+ * after it pi estimates from the text. Only the copies sent are changed:
+ * pi's session keeps the replies as they were.
+ */
+export function staleUsage(sent: PiMessage[], had: readonly PiMessage[]): PiMessage[] {
+  const same = (a: PiMessage, b: PiMessage | undefined) =>
+    !!b && (a === b || (a.role === "toolResult" && b.role === "toolResult" && a.toolCallId === b.toolCallId));
+  let cut = 0;
+  while (cut < sent.length && same(sent[cut], had[cut])) cut++;
+  if (cut >= had.length) return sent;
+  return sent.map((m, i) => (i >= cut && m.role === "assistant" && m.usage ? { ...m, usage: { ...(m.usage as object), input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 } } : m));
+}

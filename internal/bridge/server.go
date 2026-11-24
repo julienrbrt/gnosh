@@ -43,10 +43,11 @@ type Options struct {
 	// UsesMem reports whether a reply of the model calls mem, for the mem
 	// reminder's count.
 	UsesMem func(core.Message) bool
-	// RecordsMem reports whether a reply of the model keeps something in
-	// mem (a thought, a fact, a result, a todo), for room and step with
-	// Covered. Nil means no reply does.
-	RecordsMem func(core.Message) bool
+	// RecordsMem reports whether a tool call kept something in mem (a
+	// thought, a fact, a result, a todo), read from the call and its
+	// result: a call mem refused or that failed kept nothing. It is for
+	// room and step with Covered. Nil means no call does.
+	RecordsMem func(call, result core.Block) bool
 	// Log, when not nil, is told what the bridge has to say for a person:
 	// one line each, for standard error.
 	Log func(line string)

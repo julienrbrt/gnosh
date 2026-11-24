@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { FRAMES, fromView, type PiMessage, toEntries } from "../src/map.ts";
+import { FRAMES, fromView, type PiMessage, staleUsage, toEntries } from "../src/map.ts";
 
 const prompt: PiMessage = { role: "user", content: "fix the port", timestamp: 1 };
 const call: PiMessage = { role: "assistant", stopReason: "toolUse", content: [{ type: "thinking", thinking: "t", thinkingSignature: "sig" }, { type: "toolCall", id: "c1", name: "gnovm_run", arguments: { name: "mem", code: "push" } }] };
@@ -69,4 +69,30 @@ test("the view comes back as pi's own messages, with notes added to results", ()
   assert.equal(out[2].toolCallId, "c1");
   assert.equal(out[3].role, "user");
   assert.equal(result.content?.length, 1, "the session's own message is not changed");
+});
+
+test("replies after a cut go without their usage, so pi does not think the window full", () => {
+  const usage = (n: number) => ({ input: n, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: n + 10 });
+  const u: PiMessage = { role: "user", content: "task" };
+  const a1: PiMessage = { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash", arguments: {} }], usage: usage(1000) };
+  const r1: PiMessage = { role: "toolResult", toolCallId: "c1", content: [{ type: "text", text: "big" }] };
+  const a2: PiMessage = { role: "assistant", content: [{ type: "toolCall", id: "c2", name: "gnovm_run", arguments: {} }], usage: usage(60000) };
+  const r2: PiMessage = { role: "toolResult", toolCallId: "c2", content: [{ type: "text", text: "popped" }] };
+  const a3: PiMessage = { role: "assistant", content: [{ type: "text", text: "next" }], usage: usage(61000) };
+  const had = [u, a1, r1, a2, r2, a3];
+
+  // Nothing left out (a note added to a result is not a cut): sent as it is.
+  const noted = { ...r1, content: [{ type: "text", text: "big" }, { type: "text", text: " [note]" }] };
+  const same = staleUsage([u, a1, noted, a2, r2, a3], had);
+  assert.equal(same[3], a2);
+  assert.equal(same[5], a3);
+
+  // r1 left: a1 keeps its usage, a2 and a3 go without theirs, and pi's own
+  // messages are not touched.
+  const sent = staleUsage([u, a1, a2, r2, a3], had);
+  assert.equal(sent[1], a1);
+  assert.equal((sent[2].usage as { totalTokens: number }).totalTokens, 0);
+  assert.equal((sent[4].usage as { input: number }).input, 0);
+  assert.deepEqual(sent[2].content, a2.content);
+  assert.equal((a2.usage as { totalTokens: number }).totalTokens, 60010);
 });

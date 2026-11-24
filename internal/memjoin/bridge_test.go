@@ -397,6 +397,14 @@ func TestBridgeCoveredSlide(t *testing.T) {
 	if plain.Freed <= 0 {
 		t.Fatalf("room without covered: %+v", plain)
 	}
+	// A thought that failed keeps nothing: still no slide.
+	c.call("c9", `mem.Think(noSuchName)`, "mem")
+	bad := h.ask(runCall("c9", `mem.Think(noSuchName)`, "mem"))
+	c.result("c9", bad)
+	room = h.ask(map[string]any{"op": "room", "session": "S1", "entries": c.entries, "need": 1500, "prompt": "e000", "covered": true})
+	if room.Freed != 0 {
+		t.Fatalf("a failed thought covered the work: %+v; the call said %+v", room, bad)
+	}
 	// A thought kept: now it slides.
 	c.call("c2", `mem.Think("the port is read from PORT in config.go:12")`, "mem")
 	c.result("c2", h.ask(runCall("c2", `mem.Think("the port is read from PORT in config.go:12")`, "mem")))
@@ -421,10 +429,11 @@ func TestBridgeCoveredSlide(t *testing.T) {
 }
 
 func TestRecordsMem(t *testing.T) {
-	call := func(code string) core.Message {
+	call := func(code string) core.Block {
 		in, _ := json.Marshal(map[string]string{"name": "mem", "code": code})
-		return core.Message{Role: core.RoleAssistant, Blocks: []core.Block{{Type: core.BlockToolUse, ID: "c", Name: "gnovm_run", Input: in}}}
+		return core.Block{Type: core.BlockToolUse, ID: "c", Name: "gnovm_run", Input: in}
 	}
+	ok := core.Block{Type: core.BlockToolResult, ToolUseID: "c", Content: []core.Block{core.Text("kept\nok · mem · ran 3ms · kept as entry 4")}}
 	for code, want := range map[string]bool{
 		`mem.Show()`:                         false,
 		`mem.Find("port")`:                   false,
@@ -436,8 +445,20 @@ func TestRecordsMem(t *testing.T) {
 		`mem.Todo("a", "b").Push()`:          true,
 		"mem.Show()\nmem.Done(\"a\", \"x\")": true,
 	} {
-		if got := recordsMem(call(code)); got != want {
+		if got := recordsMem(call(code), ok); got != want {
 			t.Errorf("recordsMem(%q) = %v, want %v", code, got, want)
 		}
+	}
+	// A call mem refused, or that failed, kept nothing.
+	refused := core.Block{Type: core.BlockToolResult, ToolUseID: "c", IsError: true, Content: []core.Block{core.Text("the close was refused")}}
+	failed := core.Block{Type: core.BlockToolResult, ToolUseID: "c", Content: []core.Block{core.Text("failed · mem · ran 2ms · kept nothing")}}
+	for _, r := range []core.Block{refused, failed} {
+		if recordsMem(call(`mem.Pop("done")`), r) {
+			t.Errorf("a call that kept nothing counts: %+v", r)
+		}
+	}
+	scratch, _ := json.Marshal(map[string]string{"code": `mem.Think("x")`})
+	if recordsMem(core.Block{Type: core.BlockToolUse, ID: "c", Name: "gnovm_run", Input: scratch}, ok) {
+		t.Error("a call on the scratch machine counts")
 	}
 }
