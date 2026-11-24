@@ -27,7 +27,7 @@ extension differs.
 | mteb-leaderboard | **pass**, 10.3m, 43K out, $0.12, 3 compactions | **pass**, 15.6m, 29K out, $0.12, 0 compactions, 4 slides, 4 / 4 |
 | vpp-loss-divergence | fail, 157.4m, 1,067K out, $2.11, 43 compactions | fail, 9.5m, 31K out, $0.22, 0 compactions, 12 slides, 2 / 0 |
 | wal-recovery-ordering | **pass**, 26.8m, 185K out, $0.36, 7 compactions | fail (2 of 97 hidden tests), 14.2m, 87K out, $0.13, 0 compactions, 1 slide, 6 / 6 |
-| **total** | **4/7**, 344m, 2.12M out, $4.26, 87 compactions | **1/7**, 83m, 0.40M out, $0.97, 0 compactions, 23 slides, 39 pops |
+| **total** | **4/7**, 347m, 2.12M out, $4.26, 87 compactions | **1/7**, 83m, 0.40M out, $0.97, 0 compactions, 23 slides, 37 pops |
 
 Costs are from each session's own usage at BaseTen list prices (input
 $0.30, cached $0.007, output $1.20 per M), pi's summary calls included.
