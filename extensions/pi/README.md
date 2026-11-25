@@ -26,12 +26,12 @@ end), and nothing else of gnosh.
 | tools | registers gnosh's `gnovm_run`, `gnovm_new`, `gnovm_list`, `gnovm_drop` (mem is `gnovm_run` with `name: "mem"`; the scratch machine does the maths). A call to mem carries the conversation through its reply, so gnosh checks it as it checks a session's: the fresh guard, the close check (the claim check and the model's review of the close), the pop's receipt of what left the context |
 | `before_agent_start` | adds gnosh's `<memory>` part after pi's system prompt (same bytes every time, so the provider's cache holds) and the mem line after the prompt |
 | `context` | sends gnosh's view of the conversation: popped work and slid rounds are gone; pi's own message objects are reused, so the cached prefix stays byte for byte |
-| `turn_end` | when over pi's compaction point, asks gnosh to slide, only what mem holds a record of (a thought, a result, a fact kept during or after that work; bridge.md §10.4), so that work the model kept nowhere is summarized by pi rather than dropped; near the point, gnosh tells the model to keep what it found before it slides; adds gnosh's notes (the slide line, "this todo is large", the mem reminder) as durable hidden messages |
+| `turn_end` | when over pi's compaction point, asks gnosh to slide, only what mem holds a record of (a thought, a result, a fact kept during or after that work; bridge.md §10.4), so that work the model kept nowhere is summarized by pi rather than dropped; near the point, gnosh tells the model to keep what it found before it slides; adds gnosh's notes (the slide line, and, unless lean, "this todo is large" and the mem reminder) as durable hidden messages |
 | `context`, after a cut | the replies sent after the first message the view left out go without their usage: pi sizes the answer it asks for from the last reply's usage, and a reply from before a pop or slide reports the larger context of then, so pi would cap the answer at a token or two (one round-1 run ended that way with 29K of a 64K window in use) |
 | the record | the session keeps, for the record only and never sent to the model, each side request with its usage (`gnosh-side`), each slide refused as uncovered (`gnosh-uncovered`) and each turn-end verdict (`gnosh-end`) |
 | `session_before_compact` | cancels pi's summary when slides brought the conversation under pi's point; otherwise lets pi summarize, as a gnosh session does with no frame to cut |
 | `turn_end`, no tool call | asks gnosh's turn-end checks (`end`): a turn that would end in a todo whose close was refused is sent back once, and every top-level todo closed as done in the turn, and not already approved by the close review, is judged; one found not met is opened again in mem and the model is sent back with gnosh's words. Every tenth send-back in a row asks the model first whether there is a genuine reason to stop |
-| side requests | the close review, the goal judge and the namer ask a model; the bridge asks pi's, through `modelRegistry.streamSimple`, with gnosh's own system prompt, prompt, temperature and token limit, at the least reasoning the model takes, `minimal` (gnosh's side requests think as little as the model allows) |
+| side requests | the close review, the goal judge and the namer ask a model; the bridge asks pi's, through `modelRegistry.streamSimple`, with gnosh's own system prompt, prompt, temperature and token limit, with reasoning off (gnosh asks its lowest thinking; a judge given 300 tokens or a namer given 24 answers nothing if it spends them reasoning) |
 
 ### The checks around a close and a turn's end
 
@@ -70,6 +70,20 @@ static binary, and costs about 0.2 ms per view on a short session (23 ms on a
 1.5 MB one, sent whole). An MCP server alone would give the tools without the
 cut, and mem's receipts would then tell the model something false ("removed
 from your context when you pop it").
+
+## Lean mode
+
+By default the extension runs **lean**: it keeps the system memory text, the
+tools, the slide and gnosh's turn-end checks, but leaves out the per-prompt and
+per-step nudges (the mem line, the frame line, the "this todo is large" line and
+the mem reminder). Those nudges bias the model toward mem and early pops on work
+a plain pi session would simply keep in context, which costs tokens and closes
+frames too soon on tasks that never reach the compaction point. Lean makes the
+extension behave like plain pi until the window actually fills, where the slide
+and the judge still apply.
+
+Set `PI_GNOSH_LEAN=0` to restore gnosh's full set of nudges. Native gnosh is not
+affected either way: its own agent loop does not go through the bridge.
 
 ## Use
 

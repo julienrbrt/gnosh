@@ -340,6 +340,23 @@ thought or result kept. A host may ask, with `covered: true` on `room` and
 
 Without `covered`, both answer as a gnosh session does.
 
+### 10.5 Lean: only the lines that matter under context pressure
+
+A host may ask, with `lean: true` on `prompt` and `step`, that the bridge give
+only the lines that bear on making room, leaving out the nudges that bias the
+model toward mem and early pops on work a host that is not gnosh would keep in
+context:
+
+- `prompt` with `lean` returns `system` (the memory text) and no `parts`: no
+  mem line, no frame line, no mem digest.
+- `step` with `lean` returns neither the large-step line nor the mem reminder.
+  The slide-soon line (§10.4) is unaffected, since it fires only under real
+  context pressure.
+
+`room` is unaffected: a slide only ever happens at the point. Without `lean`,
+both answer as a gnosh session does. `lean` is a host option; gnosh's own agent
+loop does not use the bridge, so its behaviour is the same either way.
+
 ## 11. A session's checks: the call, the turn's end, and side requests
 
 A gnosh session does not take its model's word that work is done

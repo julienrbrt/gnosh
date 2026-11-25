@@ -47,6 +47,12 @@ func (s *Server) prompt(ctx context.Context, req Request) Reply {
 		return rep
 	}
 	rep.System = t.Memory(prompt.MemoryLean)
+	if req.Lean {
+		// Under lean the system text alone introduces mem; the per-prompt
+		// nudges are left out (they bias the model toward mem and frames on
+		// work a plain host would keep in context).
+		return rep
+	}
 	if req.First && s.opts.Digest != nil {
 		if block := strings.TrimSpace(s.opts.Digest()); block != "" {
 			rep.Parts = append(rep.Parts, block)
@@ -167,7 +173,9 @@ func (s *Server) room(req Request) Reply {
 // within a turn. used is the host's token count of the request just
 // answered and point the count at which it would summarize. The lines are
 // the large-step line, once per frame (frames.md §8.7), and the mem
-// reminder after ten replies with no call on mem.
+// reminder after ten replies with no call on mem. Under req.Lean
+// only the slide-soon line is kept: the large-step line and the mem
+// reminder are left out.
 func (s *Server) step(req Request) Reply {
 	if req.Session == "" {
 		return fail(req.ID, CodeBadRequest, "step needs session")
@@ -196,7 +204,7 @@ func (s *Server) step(req Request) Reply {
 		at, ok := ss.pushedAt[top.ID]
 		grown, room := req.Used-at, req.Point-at
 		key := top.ID + "\x00" + top.ToolUseID
-		if ok && at > 0 && room > 0 && grown > room/2 && grown > req.Point/10 && !ss.large[key] {
+		if !req.Lean && ok && at > 0 && room > 0 && grown > room/2 && grown > req.Point/10 && !ss.large[key] {
 			if ss.large == nil {
 				ss.large = map[string]bool{}
 			}
@@ -228,7 +236,7 @@ func (s *Server) step(req Request) Reply {
 		}
 		replies++
 	}
-	if replies >= remindAfter {
+	if !req.Lean && replies >= remindAfter {
 		ss.remindedAt = len(req.Entries)
 		rep.Parts = append(rep.Parts, t.MemReminder(frames, nil))
 	}
