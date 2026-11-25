@@ -125,8 +125,31 @@ func (s *Server) room(req Request) Reply {
 		}
 		ss := s.session(req.Session)
 		s.mu.Lock()
+		// A frame that has already slid maxFrameSlides times is stuck: it is
+		// not popping, so sliding it again only loses more without progress
+		// (one round-2 run slid a single frame 44 times). Leave room-making
+		// to the host's own compaction, so a run can never slide worse than
+		// it would compact.
+		for _, c := range cuts {
+			f := c.Frame
+			if f == "" {
+				f = c.Before
+			}
+			if ss.slides[f] >= maxFrameSlides {
+				s.mu.Unlock()
+				rep.NewSlides = []transcript.Entry{}
+				rep.Notice = fmt.Sprintf("nothing slid: `%s` has slid %d times without being popped, so it is left to a summary; split it into smaller todos or pop it", f, ss.slides[f])
+				if s.opts.Log != nil {
+					s.opts.Log("gnosh bridge: " + rep.Notice)
+				}
+				return rep
+			}
+		}
 		if ss.slidAt == nil {
 			ss.slidAt = map[string]string{}
+		}
+		if ss.slides == nil {
+			ss.slides = map[string]int{}
 		}
 		last := lastMessage(req.Entries)
 		for _, c := range cuts {
@@ -135,6 +158,7 @@ func (s *Server) room(req Request) Reply {
 				f = c.Before
 			}
 			ss.slidAt[f] = last
+			ss.slides[f]++
 			delete(ss.soon, f)
 		}
 		s.mu.Unlock()
@@ -239,6 +263,32 @@ func (s *Server) step(req Request) Reply {
 	if !req.Lean && replies >= remindAfter {
 		ss.remindedAt = len(req.Entries)
 		rep.Parts = append(rep.Parts, t.MemReminder(frames, nil))
+	}
+	// A frame close to its slide limit is stuck: tell the model, once, to
+	// split it into smaller todos or pop it with what it has, before the
+	// bridge stops sliding it and leaves room-making to the host's
+	// compaction (§10.4). This is a correctness guard, so it runs under lean
+	// too; one round-2 run slid a single frame 44 times without popping.
+	if n := len(info.Stack); req.Covered && n > 0 {
+		top := info.Stack[n-1]
+		if c := ss.slides[top.ID]; c >= maxFrameSlides-1 && !ss.toldStuck[top.ID] {
+			if ss.toldStuck == nil {
+				ss.toldStuck = map[string]bool{}
+			}
+			ss.toldStuck[top.ID] = true
+			rep.Parts = append(rep.Parts, fmt.Sprintf("`%s` has slid %d times and is not closing. Split it into smaller todos you can pop one by one, or pop it now with what you have; otherwise its oldest rounds will be summarized, not slid.", top.ID, c))
+		}
+	}
+	// Back at the root after closing todos: their work is out of context, so
+	// a popped summary is all that is left of it. Point the model at mem and
+	// the files to re-check a result before it relies on it in the final
+	// artifact (a round-2 run popped a design frame with a wrong primer
+	// baked into its summary and wrote the file from that). Once per return
+	// to the root, so it is not a per-turn nudge; a correctness guard, so it
+	// runs under lean too.
+	if len(info.Stack) == 0 && ss.popped && !ss.verifyTold {
+		ss.verifyTold = true
+		rep.Parts = append(rep.Parts, "Your todos are closed and their work is out of your context; mem.Show lists them and mem.Show(name) holds each result. Before you write or finalize the answer, re-check it against the task and re-read the files you changed, rather than trusting a closed todo's summary.")
 	}
 	return rep
 }

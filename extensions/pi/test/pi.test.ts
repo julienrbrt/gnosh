@@ -2,6 +2,10 @@
 // test provider and a real `gnosh bridge`: what the provider is sent after
 // a pop. GNOSH_BIN names the gnosh program; without it the test is skipped.
 
+// These tests assert gnosh's full set of prompt nudges (the mem line and the
+// rest), so they run with lean off; the lean default is covered by the Go
+// bridge tests (internal/bridge/lean_test.go).
+process.env.PI_GNOSH_LEAN = "0";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

@@ -337,6 +337,16 @@ thought or result kept. A host may ask, with `covered: true` on `room` and
   kept in mem since the todo was entered or last slid: the oldest rounds
   are about to leave with no summary, so keep what later work needs as a
   thought, or pop.
+- `room` stops sliding a frame that keeps sliding without being popped. After
+  it has slid a frame `maxFrameSlides` times, `room` makes no cut of it:
+  `freed` is 0 and `notice` says why, so the host compacts instead and a run
+  can never slide worse than it would compact. `step` warns the model once, as
+  the frame nears that limit, to split it into smaller todos or pop it.
+- `step` points the model to verify after it closes its todos. When the stack
+  is empty again after a pop, `step` tells it once that its closed todos' work
+  is out of context and to re-check the result against the task and the files
+  before relying on a closed todo's summary in the final answer. These two
+  lines are correctness guards: they are given under `lean` too.
 
 Without `covered`, both answer as a gnosh session does.
 
