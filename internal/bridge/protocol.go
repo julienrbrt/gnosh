@@ -85,6 +85,15 @@ type Request struct {
 	Point int `json:"point,omitempty"`
 	Used  int `json:"used,omitempty"`
 
+	// Lean says the host wants only the lines that matter under context
+	// pressure: prompt and step then leave out the mem line, the frame
+	// line, the large-step line and the mem reminder, the nudges that bias
+	// the model toward mem and early pops on work a plain host would keep
+	// in context. The system memory text, the tools, the slide (room), the
+	// slide-soon line and the turn-end checks are unaffected. It is a host
+	// option; gnosh's own agent loop does not go through the bridge.
+	Lean bool `json:"lean,omitempty"`
+
 	// room and step: Covered says the host slides only what mem covers
 	// (§10.4): room makes no cut that holds work mem got no record of
 	// since, and step warns the model before such a cut would be due.

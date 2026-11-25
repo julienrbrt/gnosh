@@ -36,7 +36,7 @@ import { Bridge, BridgeCallError } from "./bridge.ts";
 import { FRAMES, fromView, type PiMessage, staleUsage, toEntries } from "./map.ts";
 import type { Block, Entry, Message, Reply, SideAnswer, SideRequest } from "./protocol.ts";
 
-const CLIENT = "pi-gnosh 0.3.0";
+const CLIENT = "pi-gnosh 0.4.0";
 /** The custom type of the notes this extension adds to the conversation, and of its kept slides. */
 const NOTE = "gnosh";
 const SLIDES = "gnosh-slides";
@@ -72,6 +72,13 @@ export default async function (pi: ExtensionAPI) {
   pi.registerFlag("gnosh", { description: "The gnosh program that serves mem (default: gnosh on PATH)", type: "string" });
 
   const program = () => (pi.getFlag("gnosh") as string | undefined) || process.env.PI_GNOSH_PROGRAM || "gnosh";
+  // Lean keeps the system memory text, the tools, the slide and the
+  // turn-end checks, but drops the per-prompt and per-step nudges that bias
+  // the model toward mem and early pops on work a plain host would keep in
+  // context. It is on by default; PI_GNOSH_LEAN=0 restores gnosh's full set
+  // of nudges. gnosh's own agent loop is unaffected: it does not use the
+  // bridge, so native gnosh behaviour is unchanged either way.
+  const leanMode = process.env.PI_GNOSH_LEAN !== "0";
   const cwd = process.cwd();
   let bridge: Bridge | undefined;
   let starting: Promise<Bridge> | undefined;
@@ -130,7 +137,10 @@ export default async function (pi: ExtensionAPI) {
             temperature: req.temperature,
             signal: ac.signal,
             cacheRetention: "none",
-            ...(ctx.model.reasoning ? { reasoning: "minimal" } : {}),
+            // The checks want an answer in a very small budget (a name in
+            // ~24 tokens, a verdict in 300); any reasoning starves it, so ask
+            // for none, as gnosh asks its lowest thinking.
+            ...(ctx.model.reasoning ? { reasoning: "off" } : {}),
           } as never,
         )
         .result();
@@ -231,7 +241,7 @@ export default async function (pi: ExtensionAPI) {
       ctxNow = ctx;
       // A prompt starts a turn: gnosh's turn-end checks count from it.
       const text = event.messageType === "user" ? event.prompt : "";
-      const r = await (await ensure()).call({ op: "prompt", session: sessionOf(ctx), first: !prompted, text, entries: entriesOf(last, ctx).entries });
+      const r = await (await ensure()).call({ op: "prompt", session: sessionOf(ctx), first: !prompted, text, entries: entriesOf(last, ctx).entries, lean: leanMode });
       prompted = true;
       const parts = (r.parts ?? []).filter((p) => p.trim());
       return {
@@ -365,7 +375,7 @@ export default async function (pi: ExtensionAPI) {
     if (has("step")) {
       const msgs = [...last];
       if (!msgs.includes(event.message as unknown as PiMessage)) msgs.push(event.message as unknown as PiMessage, ...(event.toolResults as unknown as PiMessage[]));
-      const r = await (await ensure()).call({ op: "step", session: sessionOf(ctx), entries: entriesOf(msgs, ctx).entries, used: p.used, point: p.point, covered: true });
+      const r = await (await ensure()).call({ op: "step", session: sessionOf(ctx), entries: entriesOf(msgs, ctx).entries, used: p.used, point: p.point, covered: true, lean: leanMode });
       notes.push(...(r.parts ?? []));
     }
     if (!notes.length) return undefined;

@@ -105,7 +105,26 @@ type session struct {
 	// line was said of since their last slide.
 	slidAt map[string]string
 	soon   map[string]bool
+	// slides counts, per frame, how many times a covered room has slid it
+	// without the frame being popped: a frame that keeps sliding is stuck,
+	// and after maxFrameSlides the bridge falls back to the host's own
+	// compaction so a run can never slide worse than it would compact
+	// (§10.4). popped says a frame the session stood in has been popped
+	// since the last push, and verifyTold that the back-at-root verify note
+	// has been given since.
+	slides     map[string]int
+	popped     bool
+	verifyTold bool
+	// toldStuck holds the frames the stuck-frame "split or pop" note was
+	// said of, said once before the frame hits its slide limit.
+	toldStuck map[string]bool
 }
+
+// maxFrameSlides is how many times one frame may slide before the bridge
+// stops sliding it and leaves room-making to the host's compaction. A frame
+// that has slid this many times without being popped is not making progress
+// a slide can help (one round-2 run slid a single frame 44 times).
+const maxFrameSlides = 6
 
 // New makes a Server.
 func New(o Options) *Server {
@@ -320,7 +339,10 @@ func (s *Server) apply(ss *session, f Frame) {
 			ss.pushedAt = map[string]int{}
 		}
 		ss.pushedAt[f.ID] = ss.used
+		ss.verifyTold = false
 	case "pop":
+		ss.popped = true
+		delete(ss.slides, f.ID)
 		for i := len(ss.stack) - 1; i >= 0; i-- {
 			if ss.stack[i] == f.ID {
 				ss.stack = ss.stack[:i]

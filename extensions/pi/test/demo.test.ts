@@ -3,6 +3,9 @@
 // frame's work out of what is sent; the sum is worked out on a Gno machine.
 // GNOSH_BIN names the gnosh program; without it the test is skipped.
 
+// The demo asserts gnosh's mem line in the prompt, so it runs with lean off
+// (the slide and pop behaviour it shows is the same either way).
+process.env.PI_GNOSH_LEAN = "0";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { runDemo } from "../demo/run.ts";
