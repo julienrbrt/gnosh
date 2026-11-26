@@ -85,6 +85,18 @@ and the judge still apply.
 Set `PI_GNOSH_LEAN=0` to restore gnosh's full set of nudges. Native gnosh is not
 affected either way: its own agent loop does not go through the bridge.
 
+## Kept facts
+
+A closed todo leaves only its result, so a pop can lock in a conclusion that was
+never checked. By default the extension asks the bridge to keep the task's own
+requirements, word for word (file paths, numbers, identifiers, and lines that
+ask for a check), and to show them again as a short list once the model is back
+at the root after a pop, together with anything a closed todo said it left
+unchecked. The first push also tells the model that its pop result must carry
+those details. The list is capped at about 1.6 KB and shown once per pop.
+
+Set `PI_GNOSH_KEEP=0` to turn it off. See `spec/gnosh/bridge.md` §10.6.
+
 ## Use
 
 Needs a gnosh with `gnosh bridge` (ops `prompt`, `room`, `step` and `end`) on `PATH`,

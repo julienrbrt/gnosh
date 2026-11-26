@@ -348,6 +348,12 @@ thought or result kept. A host may ask, with `covered: true` on `room` and
   before relying on a closed todo's summary in the final answer. These two
   lines are correctness guards: they are given under `lean` too.
 
+`maxFrameSlides` is 6. In the round-2 transcripts (r2-gnosh, 16 trials), nine
+frames slid: the five that were popped afterwards slid at most twice, the
+frames of the trials that passed once, and the four that never popped slid
+1, 3, 5 and 41 times. 6 lies above every frame that went on to succeed and far
+below the runaway; the sample is small, so the number is a guard, not a fit.
+
 Without `covered`, both answer as a gnosh session does.
 
 ### 10.5 Lean: only the lines that matter under context pressure
@@ -366,6 +372,38 @@ context:
 `room` is unaffected: a slide only ever happens at the point. Without `lean`,
 both answer as a gnosh session does. `lean` is a host option; gnosh's own agent
 loop does not use the bridge, so its behaviour is the same either way.
+
+### 10.6 Kept facts: what a pop must not lock away
+
+A pop leaves its result and nothing else, so a wrong or unchecked conclusion
+in it is never looked at again. In the round-2 `dna-assembly` trial, the model
+could not fetch NEB's page for BsaI-HF v2, the pops that followed called the
+design validated, and the task's own line asking it to check NEB's
+requirements was gone with the frame. A host may ask, with `keep: true` and the
+task as `text` on `prompt`, for the bridge to hold it:
+
+- The session's first push gets one more line with its result: a pop's result
+  must carry, word for word, the task's exact requirements and constraints it
+  touches, file paths, numbers and identifiers, and anything not checked or
+  that could not be checked. It stays in context, since it is a tool result of
+  the push.
+- The bridge keeps the task's requirement lines word for word: bullets and
+  numbered lines, and lines with a path, a number, a backtick or a constraint
+  word. Lines that ask for a check (make sure, check, verify, ensure, confirm,
+  validate, satisfy) come first and are marked still to confirm. A long line of
+  story is left out unless it asks for a check or sets a limit. The list is
+  capped at 14 lines and about 1600 bytes, 300 per line.
+- The bridge also reads each pop's `result` for what it says it left unchecked
+  (not verified, could not, unable to, assumed) and adds up to six of those
+  sentences, marked as left unchecked by a closed todo.
+- `step` shows the list once the model has popped, when the stack is empty
+  again, joined to the verify note of §10.4, and again after each later pop. It
+  shows it after the session's first pop even when a frame is still open. It
+  is a correctness guard: given under `lean` too. It costs the length of the
+  list once per pop, not per step.
+
+Without `keep`, `prompt`, `call` and `step` are as before. `keep` is a host
+option; gnosh's own agent loop does not use the bridge.
 
 ## 11. A session's checks: the call, the turn's end, and side requests
 

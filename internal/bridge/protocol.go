@@ -94,6 +94,12 @@ type Request struct {
 	// option; gnosh's own agent loop does not go through the bridge.
 	Lean bool `json:"lean,omitempty"`
 
+	// Keep, on prompt, says the host wants the kept facts (§10.6): the
+	// task's requirements, word for word, shown again once the model is back
+	// at the root after a pop, and what a pop's result must carry told with
+	// the session's first push. Text is the task.
+	Keep bool `json:"keep,omitempty"`
+
 	// room and step: Covered says the host slides only what mem covers
 	// (§10.4): room makes no cut that holds work mem got no record of
 	// since, and step warns the model before such a cut would be due.

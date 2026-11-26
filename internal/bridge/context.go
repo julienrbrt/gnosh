@@ -35,6 +35,15 @@ func (s *Server) prompt(ctx context.Context, req Request) Reply {
 		return fail(req.ID, CodeBadRequest, "prompt needs session")
 	}
 	rep := Reply{OK: true, ID: req.ID, Parts: []string{}}
+	if req.Keep {
+		ss := s.session(req.Session)
+		s.mu.Lock()
+		ss.keep = true
+		if strings.TrimSpace(req.Text) != "" {
+			ss.task = req.Text
+		}
+		s.mu.Unlock()
+	}
 	if tu := s.opts.Turns; tu != nil {
 		// A prompt the person typed starts a turn (§11).
 		if len(req.Entries) > 0 && uniqueUUIDs(req.Entries) == "" {
@@ -286,9 +295,23 @@ func (s *Server) step(req Request) Reply {
 	// baked into its summary and wrote the file from that). Once per return
 	// to the root, so it is not a per-turn nudge; a correctness guard, so it
 	// runs under lean too.
+	kept := ""
+	if ss.keep && ss.poppedSince {
+		kept = keptList(ss.task, ss.unsure)
+	}
 	if len(info.Stack) == 0 && ss.popped && !ss.verifyTold {
 		ss.verifyTold = true
-		rep.Parts = append(rep.Parts, "Your todos are closed and their work is out of your context; mem.Show lists them and mem.Show(name) holds each result. Before you write or finalize the answer, re-check it against the task and re-read the files you changed, rather than trusting a closed todo's summary.")
+		note := "Your todos are closed and their work is out of your context; mem.Show lists them and mem.Show(name) holds each result. Before you write or finalize the answer, re-check it against the task and re-read the files you changed, rather than trusting a closed todo's summary."
+		if kept != "" {
+			note += "\n" + kept
+			ss.poppedSince, ss.keptTold = false, true
+		}
+		rep.Parts = append(rep.Parts, note)
+	} else if kept != "" && (len(info.Stack) == 0 || !ss.keptTold) {
+		// The list is also shown after the first pop of a session, wherever
+		// it came, and again at the root once a pop came since (§10.6).
+		rep.Parts = append(rep.Parts, kept)
+		ss.poppedSince, ss.keptTold = false, true
 	}
 	return rep
 }

@@ -118,6 +118,17 @@ type session struct {
 	// toldStuck holds the frames the stuck-frame "split or pop" note was
 	// said of, said once before the frame hits its slide limit.
 	toldStuck map[string]bool
+	// keep, task and unsure are the kept facts (§10.6): whether the host
+	// asked for them, the task as the person last typed it, and what closed
+	// todos said they left unchecked. poppedSince says a pop came since the
+	// list was last shown, keptTold that it was shown at all, and
+	// instructed that the first push was told what a pop's result must carry.
+	keep        bool
+	task        string
+	unsure      []string
+	poppedSince bool
+	keptTold    bool
+	instructed  bool
 }
 
 // maxFrameSlides is how many times one frame may slide before the bridge
@@ -325,6 +336,20 @@ func (s *Server) call(ctx context.Context, req Request) Reply {
 	if rep.Content == nil {
 		rep.Content = []core.Block{}
 	}
+	// The session's first push is told what a pop's result must carry: only
+	// the result stays, so the task's requirements and what is unchecked
+	// must be in it (§10.6).
+	s.mu.Lock()
+	if ss.keep && !ss.instructed {
+		for _, f := range rep.Frames {
+			if f.Kind == "push" {
+				ss.instructed = true
+				rep.Content = append(rep.Content, core.Text(keepInstruction))
+				break
+			}
+		}
+	}
+	s.mu.Unlock()
 	return rep
 }
 
@@ -342,6 +367,13 @@ func (s *Server) apply(ss *session, f Frame) {
 		ss.verifyTold = false
 	case "pop":
 		ss.popped = true
+		ss.poppedSince = true
+		if ss.keep {
+			ss.unsure = append(ss.unsure, unsureOf(f.Result)...)
+			if len(ss.unsure) > 6 {
+				ss.unsure = ss.unsure[len(ss.unsure)-6:]
+			}
+		}
 		delete(ss.slides, f.ID)
 		for i := len(ss.stack) - 1; i >= 0; i-- {
 			if ss.stack[i] == f.ID {
