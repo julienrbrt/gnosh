@@ -16,6 +16,8 @@ extension differs.
 | compaction | `reserveTokens` 16,384 (point 49,152), `keepRecentTokens` 20,000 |
 | pi-gnosh | slides at the same point; pi's summary only when slides cannot bring the context under it |
 
+Round 3 (provisional, 36 of 42 trials) is reported below the round-2 settings.
+
 ## Results (round 1, 2026-11-23/24, one trial per task and arm)
 
 | task | pi | pi + pi-gnosh |
@@ -223,3 +225,78 @@ provider.
 | trials | 1 | 3 per task and arm, 7 tasks | |
 
 The gnosh arm's own fix for the one-token cap is in the extension (`staleUsage`). After a pop or slide, pi sized requests from a reply's usage that still counted the removed work.
+
+## Results (round 3, provisional, 2026-11-26, 128K window, three trials)
+
+Same seven tasks and the same settings as round 2 (128K window, 32K reserve,
+20K keep recent, 32K max output). The gnosh arm is the lean build of
+`e789bc9` (PR #12): lean mode on by default, check requests with reasoning
+off, a verify-after-pop note, a per-frame slide cap of 6, and kept facts
+shown at the root after a pop. A 5-cent smoke test first confirmed that, with
+reasoning off, the judge returns a complete JSON verdict (`finish_reason`
+stop, 53 tokens, no reasoning) and the namer returns usable names (reasoning
+tokens 0). In the run itself every goal-judge (15/15) and close-review
+(75/75) finished with `stop`; the namer still hit the 24-token length cap on
+44 of 68 calls, but 24 finished cleanly, and `readNames` takes the first line.
+
+The run started at 09:32 UTC+1. A box replacement at about 11:50 UTC+1
+stopped the in-flight trials; 18 plain-pi and 12 gnosh results were already
+on disk and were kept. The job was resumed at 12:36 UTC+1 on a new OpenRouter
+key (limit $50, starting from $0) with `harbor jobs resume`, so only the
+unfinished trials continued. At 14:16 UTC+1, 36 of 42 trials had a result.
+The six still running are the remaining long ones (not errors, and Harbor
+does not consider the jobs done):
+
+| arm | still running |
+| :- | :- |
+| pi | `intrastat-meldung__cHAhLeY`, `vpp-loss-divergence__iZcifoC`, `vpp-loss-divergence__sSKN3Sx` |
+| pi + pi-gnosh | `intrastat-meldung__zVEXhkU`, `vpp-loss-divergence__3D9ojQ2`, `vpp-loss-divergence__CzSuHwf` |
+
+Each still has a live `pi` process and is under the 28,800-second agent
+timeout. This table will be updated when they finish. Counts below exclude
+those six.
+
+| task | pi | pi + pi-gnosh |
+| :- | :- | :- |
+| dna-assembly | 0/3, mean 5.8m, $0.08, 0 compactions | 0/3, mean 9.5m, $0.16, 0 compactions, 1 slide |
+| dna-insert | 1/3, mean 4.8m, $0.06, 0 compactions | **2/3**, mean 8.5m, $0.16, 3 compactions, 0 slides |
+| gcode-to-text | **2/3**, mean 7.8m, $0.11, 3 compactions; one 15m timeout | **2/3**, mean 12.7m, $0.19, 0 compactions, 3 slides; one 15m timeout that still passed |
+| intrastat-meldung | 0/2, mean 32.0m, $0.76, 15 compactions (1 running) | 0/2, mean 17.5m, $0.52, 7 slides, 4 refused (1 running) |
+| mteb-leaderboard | **3/3**, mean 23.8m, $0.16, 4 compactions | **2/3**, mean 29.8m, $0.14, 2 compactions, 1 slide; one 60m timeout |
+| vpp-loss-divergence | **1/1**, 20.8m, $0.26, 3 compactions (2 running) | **1/1**, 54.1m, $1.00, 9 compactions, 5 slides (2 running) |
+| wal-recovery-ordering | **2/3**, mean 10.2m, $0.17, 3 compactions | **2/3**, mean 8.1m, $0.14, 0 compactions, 0 slides |
+| **total (finished)** | **9/18**, 242m, 1.60M out, $3.52, 28 compactions | **9/18**, 295m, 1.82M out, $4.40, 17 compactions, 17 slides, 75 pops |
+
+Costs are from each session's own usage at the same BaseTen list prices, side
+requests included. The gnosh arm's close reviews, judges and namers cost
+$0.28 of its $4.40. Proxy spend for the whole of round 3, including the six
+trials still running, is about $19.56.
+
+What it shows so far, and what it does not:
+
+- **On the 36 finished trials the arms are tied, 9/18 each.** That is a
+  clear step up from round 2, where the gnosh arm was 3/16 against plain
+  pi's 9/17 on the trials that actually got a model reply. It is not yet a
+  win: six long trials are still out, and those are the tasks that decided
+  earlier rounds.
+- **The gnosh arm is no longer losing the short tasks outright.** It matches
+  or beats plain pi on dna-insert (2/3 vs 1/3), gcode-to-text (2/3 each,
+  against 0/2 in round 2) and wal-recovery-ordering (2/3 each, against 0/2
+  in round 2). mteb-leaderboard is 2/3 against plain pi's 3/3.
+- **dna-assembly is still 0/3 on the gnosh arm**, and this time also 0/3 on
+  plain pi (it was 2/3 in round 2). Kept facts did fire: the push addendum
+  was given on 16 of 18 finished gnosh trials, the kept-facts list 22 times
+  across 11 trials, and the verify-after-pop note 22 times across 14 trials.
+  That did not, on these three trials, produce a passing primer set. A
+  replay of a round-2 failure could only show the NEB requirement would have
+  been listed, not that the model would act on it.
+- **The runaway slide loop has not come back.** The finished vpp trial on
+  the gnosh arm slid 5 times (under the cap of 6), also compacted 9 times,
+  ran 54 minutes, and passed. Round 2 had a 44-slide, never-popped vpp
+  failure. 17 slides and 17 compactions on the gnosh arm overall, against
+  28 compactions on plain pi.
+- **The turn-end judge still never sent the model back** (0 send-backs),
+  even though all 15 goal-judge calls finished with a complete answer.
+  Close reviews all completed (75/75).
+- **These numbers will move** when the last two vpp-loss-divergence and the
+  last intrastat-meldung on each arm land.
