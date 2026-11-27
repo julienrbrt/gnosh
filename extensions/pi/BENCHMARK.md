@@ -16,7 +16,7 @@ extension differs.
 | compaction | `reserveTokens` 16,384 (point 49,152), `keepRecentTokens` 20,000 |
 | pi-gnosh | slides at the same point; pi's summary only when slides cannot bring the context under it |
 
-Round 3 is reported below the round-2 settings. The extension arm is complete (21/21); one plain-pi trial is still running.
+Round 3 is reported below the round-2 settings. Both arms are complete (42 trials).
 
 ## Results (round 1, 2026-11-23/24, one trial per task and arm)
 
@@ -241,31 +241,33 @@ The run started at 09:32 UTC+1. A box replacement at about 11:50 UTC+1
 stopped the in-flight trials; finished results were kept. The job was resumed
 at 12:36 UTC+1 on a new OpenRouter key (limit $50, starting from $0) with
 `harbor jobs resume`. The gnosh arm finished all 21 trials. One plain-pi
-trial, `intrastat-meldung__cHAhLeY`, is still running as of 15:59 UTC+1 and is
-excluded from the pi totals below. This section will be updated when it lands.
+trial, `intrastat-meldung__cHAhLeY`, ran until it hit the 8-hour agent limit
+(`AgentTimeoutError`, reward 0) on Nov 27 at 14:40 UTC+1; the last 5.5 hours of
+it were one `grep -R` over the container's whole filesystem. The box was idle
+for much of the time, so its wall clock (27 h) is much longer than its 8 h
+of container time. All 42 trials are in the totals below.
 
 | task | pi | pi + pi-gnosh |
 | :- | :- | :- |
 | dna-assembly | 0/3, mean 5.8m, $0.08, 0 compactions | 0/3, mean 9.5m, $0.16, 0 compactions, 1 slide |
 | dna-insert | 1/3, mean 4.8m, $0.06, 0 compactions | **2/3**, mean 8.5m, $0.16, 3 compactions, 0 slides |
 | gcode-to-text | **2/3**, mean 7.8m, $0.11, 3 compactions; one 15m timeout | **2/3**, mean 12.7m, $0.19, 0 compactions, 3 slides; one 15m timeout that still passed |
-| intrastat-meldung | 0/2, mean 32.0m, $0.76, 15 compactions (1 running) | 0/3, mean 34.2m, $0.82, 10 compactions, 16 slides, 8 refused, 2 send-backs |
+| intrastat-meldung | 0/3, mean 562.7m (one 8h timeout), $0.63, 19 compactions | 0/3, mean 34.2m, $0.82, 10 compactions, 16 slides, 8 refused, 2 send-backs |
 | mteb-leaderboard | **3/3**, mean 23.8m, $0.16, 4 compactions | **2/3**, mean 29.8m, $0.14, 2 compactions, 1 slide; one 60m timeout |
 | vpp-loss-divergence | **1/3**, mean 112.8m, $1.63, 57 compactions | **3/3**, mean 96.5m, $1.45, 42 compactions, 12 slides |
 | wal-recovery-ordering | **2/3**, mean 10.2m, $0.17, 3 compactions | **2/3**, mean 8.1m, $0.14, 0 compactions, 0 slides |
-| **total** | **9/20**, 559m, 3.41M out, $8.16, 82 compactions (1 running) | **11/21**, 598m, 3.68M out, $9.16, 57 compactions, 33 slides, 89 pops |
+| **total** | **9/21**, 2183m, 3.58M out, $8.55, 86 compactions | **11/21**, 598m, 3.68M out, $9.16, 57 compactions, 33 slides, 89 pops |
 
 Costs are from each session's own usage at the same BaseTen list prices, side
 requests included. The gnosh arm's close reviews, judges and namers cost
-$0.33 of its $9.16. Proxy spend for the whole of round 3, including the one
-trial still running, is about $23.58.
+$0.33 of its $9.16. Proxy spend for the whole of round 3 is about $23.8.
 
 What it shows, and what it does not:
 
-- **The extension is ahead on the finished trials, 11/21 against 9/20.** In
-  round 2 the scored trials were 3/16 against plain pi's 9/17. The remaining
-  plain-pi `intrastat-meldung` cannot overtake that lead on its own (plain pi
-  would finish 9/21 or 10/21).
+- **The extension is ahead, 11/21 against 9/21.** In round 2 the scored
+  trials were 3/16 against plain pi's 9/17. The last plain-pi
+  `intrastat-meldung` trial timed out at 8 h with reward 0, so the final
+  score on both arms of that task is 0/3.
 - **The gain is on the long task that used to be a loss.** All three
   `vpp-loss-divergence` trials passed on the gnosh arm (3/3, mean 96.5m,
   12 slides, 42 compactions), against 1/3 on plain pi (mean 112.8m, 57
@@ -304,5 +306,4 @@ What it shows, and what it does not:
   sufficient evidence is the follow-up, not another connection fix. The
   two send-backs on intrastat did not turn that trial into a pass.
 
-This table will be updated when `intrastat-meldung__cHAhLeY` on the pi arm
-finishes.
+The table is final: `intrastat-meldung__cHAhLeY` finished (timeout, reward 0).
