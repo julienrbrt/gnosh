@@ -105,6 +105,17 @@ type Request struct {
 	// since, and step warns the model before such a cut would be due.
 	Covered bool `json:"covered,omitempty"`
 
+	// room: Autokeep says the host lets the bridge keep, in mem, a digest of
+	// the work a cut would take that mem has no record of, instead of leaving
+	// that cut to the host's summary (§10.7). It needs Covered, and a bridge
+	// whose mem can be written to.
+	Autokeep bool `json:"autokeep,omitempty"`
+
+	// step: Nudge says the host wants the todo line (§10.7): once the context
+	// is filling and the session stands in no todo, so that nothing can slide
+	// out of it, the model is told to put the work in todos.
+	Nudge bool `json:"nudge,omitempty"`
+
 	// end (Session and Entries too): the reply the turn would end on, and
 	// whether the model finished it itself (not cut off at its length).
 	Reply    *core.Message `json:"reply,omitempty"`

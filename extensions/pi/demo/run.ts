@@ -45,7 +45,7 @@ function show(m: Msg): string {
 }
 
 
-export async function runDemo(opts: { gnosh: boolean; program?: string; window?: number; reserve?: number; think?: boolean }): Promise<DemoResult> {
+export async function runDemo(opts: { gnosh: boolean; program?: string; window?: number; reserve?: number; think?: boolean; logs?: boolean }): Promise<DemoResult> {
   const home = mkdtempSync(join(tmpdir(), "pi-gnosh-demo-"));
   const oldEnv = { ...process.env };
   const oldCwd = process.cwd();
@@ -89,14 +89,20 @@ export async function runDemo(opts: { gnosh: boolean; program?: string; window?:
   // A large read: pi's own bash tool prints n words.
   const read = (word: string, n: number) =>
     fauxAssistantMessage(fauxToolCall("bash", { command: `for i in $(seq 1 ${n}); do printf '${word} '; done` }), { stopReason: "toolUse" });
+  // The same size of read as lines of a build log, for a demo whose work
+  // must not look like a secret to mem (the bridge's automatic keep).
+  const work = (n: number) =>
+    opts.logs
+      ? fauxAssistantMessage(fauxToolCall("bash", { command: `for i in $(seq 1 ${n / 7}); do echo "step $i of the build passed in 41 ms"; done` }), { stopReason: "toolUse" })
+      : read("work", n);
   const script = [
     read("explored", 1400), // large reads before any plan
     read("explored", 1400),
     run('mem.Todo("fix the port").Push()', "mem"),
-    read("work", 1400), // work inside the frame
-    read("work", 1400),
+    work(1400), // work inside the frame
+    work(1400),
     ...(opts.think === false ? [] : [run('mem.Think("setup binds a fixed port; picking a free one fixes it")', "mem")]), // what the work found, kept before it can slide
-    read("work", 1400),
+    work(1400),
     run("17 * 23 + 4"), // the sum, worked out on a Gno machine
     run('mem.Pop("the port is picked free in setup; 17*23+4 = 395")', "mem"),
     fauxAssistantMessage(fauxText("done: the port is fixed")),

@@ -99,7 +99,7 @@ func (s *Server) framesOf(session string, entries []transcript.Entry) []prompt.F
 // conversation and sends in every later view. Freed 0 means nothing could
 // slide (the session stands in no frame, or too little is left), and the
 // host makes room its own way, by a summary.
-func (s *Server) room(req Request) Reply {
+func (s *Server) room(ctx context.Context, req Request) Reply {
 	switch {
 	case req.Session == "":
 		return fail(req.ID, CodeBadRequest, "room needs session")
@@ -117,20 +117,33 @@ func (s *Server) room(req Request) Reply {
 		rep.NewSlides = []transcript.Entry{}
 		return rep
 	}
+	var digests []string
 	if req.Covered {
+		// The cuts that take work mem has no record of. With Autokeep the
+		// bridge keeps a digest of it itself (§10.7); without, or when it
+		// cannot, nothing slides and the host summarizes.
+		var gaps []transcript.Cut
 		for _, c := range cuts {
 			if !s.covered(req.Entries, c.Removed) {
-				what := "what came before `" + c.Before + "`"
-				if c.Frame != "" {
-					what = "the start of `" + c.Frame + "`"
-				}
-				rep.NewSlides = []transcript.Entry{}
-				rep.Notice = fmt.Sprintf("nothing slid: %s holds work mem has no record of, so it is left to a summary", what)
-				if s.opts.Log != nil {
-					s.opts.Log("gnosh bridge: " + rep.Notice)
-				}
-				return rep
+				gaps = append(gaps, c)
 			}
+		}
+		refuse := func(c transcript.Cut) Reply {
+			what := "what came before `" + c.Before + "`"
+			if c.Frame != "" {
+				what = "the start of `" + c.Frame + "`"
+			}
+			rep.NewSlides = []transcript.Entry{}
+			rep.Freed, rep.Parts = 0, nil
+			rep.Notice = fmt.Sprintf("nothing slid: %s holds work mem has no record of, so it is left to a summary", what)
+			if s.opts.Log != nil {
+				s.opts.Log("gnosh bridge: " + rep.Notice)
+			}
+			return rep
+		}
+		auto := req.Autokeep && s.opts.KeepCall != nil
+		if len(gaps) > 0 && !auto {
+			return refuse(gaps[0])
 		}
 		ss := s.session(req.Session)
 		s.mu.Lock()
@@ -154,6 +167,32 @@ func (s *Server) room(req Request) Reply {
 				return rep
 			}
 		}
+		s.mu.Unlock()
+		if len(gaps) > 0 {
+			// The thought goes on the todo the session stands in, as the
+			// model's own would: the stack of these entries, not of the last
+			// view the bridge was asked for.
+			_, info := transcript.View(req.Entries, transcript.ViewOptions{Session: req.Session})
+			stack := make([]string, len(info.Stack))
+			for i, f := range info.Stack {
+				stack[i] = f.ID
+			}
+			s.mu.Lock()
+			ss.stack = stack
+			s.mu.Unlock()
+		}
+		for _, c := range gaps {
+			d := digestOf(req.Entries, c.Removed)
+			if d != "" {
+				d = s.keepWork(ctx, req.Session, d)
+			}
+			if d == "" {
+				return refuse(c)
+			}
+			digests = append(digests, d)
+		}
+		s.mu.Lock()
+		ss.autoKept += len(digests)
 		if ss.slidAt == nil {
 			ss.slidAt = map[string]string{}
 		}
@@ -195,6 +234,10 @@ func (s *Server) room(req Request) Reply {
 		if line := s.opts.Texts.SlideLine(told); line != "" {
 			rep.Parts = []string{line}
 		}
+	}
+	if len(digests) > 0 {
+		rep.Parts = append(rep.Parts, autoKeepNote(strings.Join(digests, "\n")))
+		rep.Notice += fmt.Sprintf(" (kept a digest of %d cut(s) in mem, as the model had kept none)", len(digests))
 	}
 	if s.opts.Log != nil && rep.Notice != "" {
 		s.opts.Log("gnosh bridge: " + rep.Notice)
@@ -243,6 +286,23 @@ func (s *Server) step(req Request) Reply {
 			}
 			ss.large[key] = true
 			rep.Parts = append(rep.Parts, t.LargeStep(top.ID, grown))
+		}
+	}
+	// With the context filling and the session in no todo, nothing can slide
+	// out of it: the host's summary is all that is left to make room. The
+	// todo line (§10.7) is said at two and at three quarters of the way to
+	// the point, and again after the context stood low (a summary or a pop).
+	if req.Nudge && len(info.Stack) == 0 && req.Point > 0 && req.Used > 0 {
+		switch pct := req.Used * 100 / req.Point; {
+		case pct < 25:
+			ss.rootLevel = 0
+		case pct >= 40 && ss.rootLevel < 1, pct >= 75 && ss.rootLevel < 2:
+			if pct >= 75 {
+				ss.rootLevel = 2
+			} else {
+				ss.rootLevel = 1
+			}
+			rep.Parts = append(rep.Parts, rootNudge(pct))
 		}
 	}
 	// Near the point, with nothing kept in mem since the top todo was
@@ -432,4 +492,10 @@ func named(slides []transcript.Entry, session string) []transcript.Entry {
 		}
 	}
 	return slides
+}
+
+// rootNudge is the todo line: the context is pct percent of the way to the
+// point where the host summarizes, and the session stands in no todo.
+func rootNudge(pct int) string {
+	return fmt.Sprintf("Your context is about %d%% of the way to the point where it is summarized, and you are working in no todo, so a summary written over all of it is the only way to make room. Put the work in todos: enter one for what you are doing now with `mem.Todo(\"title\").Push()` (or split what is left into pieces with `mem.Todo(...)` and take them in turn with `mem.Next()`), keep what you find with `mem.Think(\"…\")`, and pop each with its result when done. The work of a todo you pop leaves your context with no summary, and its result stays.", pct)
 }
