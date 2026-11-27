@@ -306,3 +306,60 @@ What it shows, and what it does not:
 
 This table will be updated when `intrastat-meldung__cHAhLeY` on the pi arm
 finishes.
+
+## Why pi-gnosh still compacts, and what changed (round 3 follow-up)
+
+Round 3's gnosh arm made 57 pi summaries beside 33 slides. `bench/r3-compactions/causes.py`
+classifies each one from the session logs (the compaction entries, the extension's
+`pi compacts … the slides freed N` and `nothing slid` lines, and the frame stack rebuilt from
+each tool result's frames):
+
+| cause | summaries | where |
+|---|---|---|
+| the session stood in no todo, so nothing could slide | **44** | `vpp-loss-divergence` 33 (23 in one trial that never pushed a todo, 9 in one that pushed its first at round 219, 1 after its last pop), `dna-insert` 3 and `mteb-leaderboard` 2 (trials that never pushed), `intrastat-meldung` 6 (after its root todo was popped) |
+| `room` refused: work mem had no record of | 2 | `intrastat-meldung` |
+| `room` refused: the todo had slid 6 times | 3 | `intrastat-meldung` 2, `vpp-loss-divergence` 1 |
+| after such a summary the todo's own push is behind it, so nothing of it can slide until it pops | 8 | `vpp-loss-divergence`, one trial, one todo |
+| a slide freed less than it was asked | **0** | |
+
+Every slide that happened freed enough (the 33). The summaries are not a failure of the slide; they
+are the places no slide could start. Three trials (28 summaries) never entered a todo at all, though
+each used mem (`mem.Show`, `mem.Fact`): lean mode no longer tells the model to push.
+
+Two changes, both in the bridge and the extension, none in gnosh's own loop
+(`spec/gnosh/bridge.md` §10.7, README "Fewer summaries"):
+
+1. **The todo line** (`step`, `nudge`): with no todo open, at 40% and 75% of the point, the model is told
+   that a summary is the only way left to make room and to put the work in todos. In round 3 the
+   model kept something in mem within three replies of a slide-soon line in 38 of 49 cases.
+2. **The automatic keep** (`room`, `autokeep`): where a slide would take work mem has no record of, the
+   bridge writes a digest of it to mem as a thought, with no model call, and slides instead of refusing.
+   The model is shown what was kept. If mem refuses it as a secret, it is written again with long values
+   cut short; if it refuses that, nothing slides. The slide limit stays.
+
+**Offline replay** (no model calls, no spend; `bench/r3-compactions/replay_fix.py` through the real
+bridge with a fresh mem per compaction): each of the 57 contexts is rebuilt as the extension had it and
+`room` is asked with `covered` and `autokeep`. The two uncovered refusals slid (38K and 44K tokens against
+13K and 15K asked). For the 44 top-level summaries the replay assumes the model opened one todo a round after the
+todo line (the first context at 40% of the point); that is a hypothesis, not a measurement. Before the
+limit of 6 slides per todo, 41 of the 44 slid. mem refused the digest of 8 of them as a secret
+(a hash, a path read as a key); the shortened digest was accepted every time. Only the first summary of a
+stretch is a clean replay; later ones assume the earlier slides happened.
+
+| task | summaries | top-level, replay slides | …with the limit of 6 per todo | top-level, still summary | uncovered → slide | capped | in-frame after a summary |
+|---|---|---|---|---|---|---|---|
+| dna-insert | 3 | 3 | 3 | 0 | 0 | 0 | 0 |
+| intrastat-meldung | 10 | 4 | 4 | 2 | 2 | 2 | 0 |
+| mteb-leaderboard | 2 | 2 | 2 | 0 | 0 | 0 | 0 |
+| vpp-loss-divergence | 42 | 32 | 12 | 1 | 0 | 1 | 8 |
+| **all** | **57** | **41** | **21** | **3** | **2** | **3** | **8** |
+
+summaries that become slides: 43 of 57 without the limit, 23 of 57 with it; at the measured 78% follow-through of a nudge: about 18 to 34
+
+So the fix, if the model follows the line, turns up to 43 of 57 summaries into slides (23 with the limit of
+6 slides per todo, which bites on the two vpp trials that would stay in one todo; about 18 to 34 at the
+78% follow-through measured above). It cannot touch the 8 that follow a summary inside one todo, the 3
+refused by the limit, and the 3 top-level cases where nothing could be cut. Whether it raises the score is
+unmeasured: a new benchmark run is needed. Round 3's 21 gnosh trials cost $9.16 by the results' own count
+(about $12 on the proxy, which also saw the side calls and the first attempts); a gnosh-only round on this build
+would cost about the same, and both arms about $20 to $24. The proxy's key had about $38 left when this was written.

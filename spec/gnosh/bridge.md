@@ -405,6 +405,58 @@ task as `text` on `prompt`, for the bridge to hold it:
 Without `keep`, `prompt`, `call` and `step` are as before. `keep` is a host
 option; gnosh's own agent loop does not use the bridge.
 
+### 10.7 Fewer summaries: the todo line and the automatic keep
+
+A host that slides only what mem covers (§10.4) still summarizes where a slide
+cannot go. In the third pi benchmark (r3-gnosh, 21 trials, 57 summaries) the
+causes, counted from the session logs, were:
+
+| cause | summaries |
+|---|---|
+| the session stood in no todo (never pushed one, before its first, or after its last was closed), so there was nothing to slide | 44 (77%) |
+| `room` refused: the start of a todo held work mem had no record of | 2 |
+| `room` refused: the todo had slid `maxFrameSlides` times | 3 |
+| after such a refusal, the todo's own push was behind the summary, so nothing of it could slide | 8 |
+| a slide freed less than it was asked | 0 |
+
+Where a slide happened it always freed enough. Two things are added for a host
+that asks; neither changes what a slide is or what gnosh's own loop does.
+
+- `step` with `nudge: true` adds the todo line when the session stands in no
+  todo and `used` reaches 40% of `point`, and again at 75%. It tells the model
+  that a summary written over all of its context is the only way left to make
+  room, and to put the work in todos (`mem.Todo(…).Push()`, `mem.Next()`),
+  keep what it finds, and pop each with its result: the work of a popped todo
+  leaves the context with no summary. The line is said once per level, and
+  again after `used` fell below 25% of `point` (a summary or a pop). It is
+  pressure-gated, so it is given under `lean` too, and not inside a todo. In
+  r3-gnosh the model kept something in mem within three replies of a
+  slide-soon line 38 times in 49, so a line of this kind is followed most of
+  the time.
+- `room` with `covered: true` and `autokeep: true` keeps a digest itself, in
+  place of refusing, when a cut would take work mem has no record of. The
+  digest is made with no model call from the entries the cut removes: what the
+  model said and each call it made, with the head and last line of its result,
+  at most about 6000 bytes (rounds from the middle are left out first, and it
+  says so). It is written to mem as a thought, by the same call the model would
+  make (`mem.Think`), on the todo the entries stand in, and the slide goes on.
+  `parts` then carries a second note: what was kept, up to about 2800 bytes,
+  and that it is the head of each result, not the whole. `notice` says a digest
+  was kept. mem keeps no secrets: when it refuses the digest (a hash, a key, a
+  long path read as one), it is written again with the value after a word that
+  names a secret and the end of any run of 20 or more characters cut short, and
+  says so. If mem refuses that too, or has no todo to put it on, nothing slides
+  and the host summarizes as before. Work is never dropped that is kept nowhere.
+
+The slide limit (§10.4) is unchanged and holds with `autokeep`: a todo that
+has slid `maxFrameSlides` times is left to the host's summary. A todo is also
+beyond slides once a summary has put its push behind it: gnosh's cut starts
+from the push, so nothing more of it slides until it is popped.
+
+The bridge needs `Options.KeepCall`, the call that keeps a thought, to keep
+anything itself: `gnosh bridge` sets it; without it `autokeep` is ignored and
+`room` answers as §10.4 says.
+
 ## 11. A session's checks: the call, the turn's end, and side requests
 
 A gnosh session does not take its model's word that work is done

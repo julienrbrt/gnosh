@@ -40,8 +40,29 @@ test("pi-gnosh slides where plain pi summarizes", { skip: !program && "GNOSH_BIN
 });
 
 test("work mem holds no record of is summarized, not slid", { skip: !program && "GNOSH_BIN is not set" }, async () => {
-  const g = await runDemo({ gnosh: true, program, think: false });
-  assert.ok(g.compactions >= 1, `pi-gnosh made ${g.compactions} summaries of work mem had no record of`);
+  // Without the automatic keep (PI_GNOSH_AUTOKEEP=0), as in rounds 1 to 3.
+  process.env.PI_GNOSH_AUTOKEEP = "0";
+  try {
+    const g = await runDemo({ gnosh: true, program, think: false });
+    assert.ok(g.compactions >= 1, `pi-gnosh made ${g.compactions} summaries of work mem had no record of`);
+    const all = g.requests.flatMap((r) => r.messages);
+    assert.ok(!all.some((m) => m.includes("The start of `port-fix` left your context")), "the frame's unrecorded work slid");
+  } finally {
+    delete process.env.PI_GNOSH_AUTOKEEP;
+  }
+});
+
+// spec §10.7: with the automatic keep, the bridge keeps a digest of the work
+// in mem, the frame slides, and the model is told what mem now holds.
+test("work the model kept none of slides with a digest kept in mem", { skip: !program && "GNOSH_BIN is not set" }, async () => {
+  const g = await runDemo({ gnosh: true, program, think: false, logs: true });
   const all = g.requests.flatMap((r) => r.messages);
-  assert.ok(!all.some((m) => m.includes("The start of `port-fix` left your context")), "the frame's unrecorded work slid");
+  assert.ok(g.slides >= 1, `pi-gnosh made no slide (${g.compactions} summaries)`);
+  assert.ok(all.some((m) => m.includes("The start of `port-fix` left your context")), "the frame's work did not slide");
+  const note = all.find((m) => m.includes("gnosh kept this much of the work that just left your context"));
+  assert.ok(note, "the model was not told what was kept");
+  assert.ok(note.includes("step 1 of the build passed"), note);
+  // The two large reads before any plan came with no todo open: the model
+  // was told to put the work in one, once the context was filling.
+  assert.ok(all.some((m) => m.includes("you are working in no todo")), "the model was not told to open a todo");
 });

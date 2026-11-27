@@ -2,7 +2,9 @@ package memjoin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/gnosh-ai/gnosh/internal/app"
@@ -65,6 +67,7 @@ func (p *process) bridgeCommand(ctx context.Context, c *app.CommandContext) int 
 		Digest:     func() string { return gnovm.MemBlock(DataDir(c.Dirs.State), project) },
 		UsesMem:    usesMem,
 		RecordsMem: recordsMem,
+		KeepCall:   keepCall,
 		Confirms:   map[string]bool{gnovmtools.DropToolName: true},
 		Log:        func(line string) { fmt.Fprintln(c.Stderr, line) },
 	})
@@ -97,4 +100,12 @@ func bridgeVersion() string {
 		parts = append(parts, buildinfo.BuildTime)
 	}
 	return strings.Join(parts, " ")
+}
+
+// keepCall is the call that keeps text in mem as a thought, for the
+// bridge's automatic keep (bridge.md §10.7): the same call a model makes
+// with mem.Think.
+func keepCall(text string) (string, json.RawMessage) {
+	in, _ := json.Marshal(gnovmtools.RunParams{Name: gnovm.MemVM, Code: "mem.Think(" + strconv.Quote(text) + ")"})
+	return gnovmtools.RunToolName, in
 }

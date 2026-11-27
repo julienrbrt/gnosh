@@ -48,6 +48,10 @@ type Options struct {
 	// result: a call mem refused or that failed kept nothing. It is for
 	// room and step with Covered. Nil means no call does.
 	RecordsMem func(call, result core.Block) bool
+	// KeepCall makes the call that keeps text in mem as a thought: the
+	// tool's name and its input. It is for room with Autokeep (§10.7). Nil
+	// means the bridge cannot keep anything itself.
+	KeepCall func(text string) (tool string, input json.RawMessage)
 	// Log, when not nil, is told what the bridge has to say for a person:
 	// one line each, for standard error.
 	Log func(line string)
@@ -129,6 +133,11 @@ type session struct {
 	poppedSince bool
 	keptTold    bool
 	instructed  bool
+	// rootLevel is how many todo lines (§10.7) were said since the context
+	// last stood low: the session stands in no todo and its context fills.
+	rootLevel int
+	// autoKept counts the digests the bridge kept in mem for the session.
+	autoKept int
 }
 
 // maxFrameSlides is how many times one frame may slide before the bridge
@@ -240,7 +249,7 @@ func (s *Server) Handle(ctx context.Context, line []byte) (Reply, error) {
 	case OpPrompt:
 		return s.prompt(ctx, req), nil
 	case OpRoom:
-		return s.room(req), nil
+		return s.room(ctx, req), nil
 	case OpStep:
 		return s.step(req), nil
 	case OpEnd:

@@ -97,6 +97,28 @@ those details. The list is capped at about 1.6 KB and shown once per pop.
 
 Set `PI_GNOSH_KEEP=0` to turn it off. See `spec/gnosh/bridge.md` §10.6.
 
+## Fewer summaries
+
+pi still summarizes where gnosh cannot slide. In round 3, 44 of 57 summaries came
+while the model stood in no todo (nothing to slide), and 5 more when a slide was
+refused (work mem had no record of, or a todo that kept sliding). Two options,
+both on by default, address these:
+
+- **Todo line (`PI_GNOSH_NUDGE=0` turns it off).** With no todo open and the
+  context at 40% of pi's point, and again at 75%, the model is told that a summary
+  is the only way left to make room, and to put the work in todos. A popped todo's
+  work leaves the context with no summary.
+- **Automatic keep (`PI_GNOSH_AUTOKEEP=0` turns it off).** Where the model kept
+  nothing in mem, the bridge writes a digest of the work that would slide (what
+  the model said, each call, the head of each result) to mem as a thought, with no
+  model call, and slides instead of refusing. The model is shown what was kept.
+  If mem refuses the digest (it keeps no secrets), it is written again with long
+  values shortened; if it refuses that, pi summarizes as before, so nothing is
+  dropped that is kept nowhere. The slide limit (six slides of one todo without a
+  pop) still applies.
+
+See `spec/gnosh/bridge.md` §10.7.
+
 ## Use
 
 Needs a gnosh with `gnosh bridge` (ops `prompt`, `room`, `step` and `end`) on `PATH`,

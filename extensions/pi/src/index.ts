@@ -36,7 +36,7 @@ import { Bridge, BridgeCallError } from "./bridge.ts";
 import { FRAMES, fromView, type PiMessage, staleUsage, toEntries } from "./map.ts";
 import type { Block, Entry, Message, Reply, SideAnswer, SideRequest } from "./protocol.ts";
 
-const CLIENT = "pi-gnosh 0.5.0";
+const CLIENT = "pi-gnosh 0.6.0";
 /** The custom type of the notes this extension adds to the conversation, and of its kept slides. */
 const NOTE = "gnosh";
 const SLIDES = "gnosh-slides";
@@ -81,6 +81,13 @@ export default async function (pi: ExtensionAPI) {
   const leanMode = process.env.PI_GNOSH_LEAN !== "0";
   // Kept facts: the task's requirements stay visible after a pop (spec §10.6).
   const keepMode = process.env.PI_GNOSH_KEEP !== "0";
+  // Fewer summaries (spec §10.7): the todo line, once the context fills with
+  // no todo open, since only a todo's work can slide; and the bridge's own
+  // digest in mem of work the model kept none of, so that the slide goes on
+  // instead of pi's summary. PI_GNOSH_NUDGE=0 and PI_GNOSH_AUTOKEEP=0 turn
+  // them off.
+  const nudgeMode = process.env.PI_GNOSH_NUDGE !== "0";
+  const autokeepMode = process.env.PI_GNOSH_AUTOKEEP !== "0";
   const cwd = process.cwd();
   let bridge: Bridge | undefined;
   let starting: Promise<Bridge> | undefined;
@@ -316,7 +323,7 @@ export default async function (pi: ExtensionAPI) {
     const prompt = [...entries].reverse().find((e) => e.type === "user" && e.source === "prompt")?.uuid;
     // covered: gnosh slides only work mem got a record of; what it holds no
     // record of is left to pi's summary (bridge.md §10.4).
-    const r = await (await ensure()).call({ op: "room", session: sessionOf(ctx), entries, need, prompt, covered: true });
+    const r = await (await ensure()).call({ op: "room", session: sessionOf(ctx), entries, need, prompt, covered: true, autokeep: autokeepMode });
     if (!r.freed || !r.new_slides?.length) {
       if (r.notice) {
         stats.uncovered++;
@@ -377,7 +384,7 @@ export default async function (pi: ExtensionAPI) {
     if (has("step")) {
       const msgs = [...last];
       if (!msgs.includes(event.message as unknown as PiMessage)) msgs.push(event.message as unknown as PiMessage, ...(event.toolResults as unknown as PiMessage[]));
-      const r = await (await ensure()).call({ op: "step", session: sessionOf(ctx), entries: entriesOf(msgs, ctx).entries, used: p.used, point: p.point, covered: true, lean: leanMode });
+      const r = await (await ensure()).call({ op: "step", session: sessionOf(ctx), entries: entriesOf(msgs, ctx).entries, used: p.used, point: p.point, covered: true, lean: leanMode, nudge: nudgeMode });
       notes.push(...(r.parts ?? []));
     }
     if (!notes.length) return undefined;
