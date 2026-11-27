@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/gnosh-ai/gnosh/internal/core"
@@ -133,6 +134,10 @@ type session struct {
 	poppedSince bool
 	keptTold    bool
 	instructed  bool
+	// framed says the session has stood in a todo: from then on the todo
+	// line (§10.7) is not said, since the model knows todos and a root
+	// stretch after a pop is the work it chose to do there.
+	framed bool
 	// rootLevel is how many todo lines (§10.7) were said since the context
 	// last stood low: the session stands in no todo and its context fills.
 	rootLevel int
@@ -305,6 +310,9 @@ func (s *Server) call(ctx context.Context, req Request) Reply {
 		input = json.RawMessage("{}")
 	}
 	ss := s.session(req.Session)
+	if msg := s.tooDeep(ss, req.MaxDepth, input); msg != "" {
+		return Reply{OK: true, ID: req.ID, IsError: true, Content: []core.Block{core.Text(msg)}}
+	}
 	call := core.ToolCall{ID: req.CallID, Name: req.Name, Input: input}
 	env := &core.ToolEnv{Cwd: s.opts.Project, Roots: []string{s.opts.Project}, SessionID: req.Session, Store: ss.store}
 	if d, ok := t.(core.Describer); ok && !req.Confirmed {
@@ -368,6 +376,7 @@ func (s *Server) apply(ss *session, f Frame) {
 	defer s.mu.Unlock()
 	switch f.Kind {
 	case "push":
+		ss.framed = true
 		ss.stack = append(ss.stack, f.ID)
 		if ss.pushedAt == nil {
 			ss.pushedAt = map[string]int{}
@@ -437,4 +446,27 @@ func (s *Server) view(req Request) Reply {
 
 func fail(id json.RawMessage, code, msg string) Reply {
 	return Reply{OK: false, ID: id, Error: &Error{Code: code, Message: msg}}
+}
+
+// tooDeep is the depth limit (§10.8). A call whose code enters todos with
+// Push or Next, and pops none, is refused when the session would stand more
+// than max todos deep after it: a long run that keeps opening todos inside
+// todos ends with a path no slide can cut and no summary can read (a
+// round-4 run stood 18 deep). It returns the line for the model, or "".
+func (s *Server) tooDeep(ss *session, max int, input json.RawMessage) string {
+	if max <= 0 {
+		return ""
+	}
+	code := string(input)
+	if strings.Contains(code, "Pop(") {
+		return ""
+	}
+	enter := strings.Count(code, ".Push(") + strings.Count(code, "Next(")
+	s.mu.Lock()
+	depth := len(ss.stack)
+	s.mu.Unlock()
+	if enter == 0 || depth+enter <= max {
+		return ""
+	}
+	return fmt.Sprintf("Not run: you are %d todos deep and this would enter %d more, past the limit of %d. A path that deep cannot be slid or summarized well. Pop the todo you have finished with `mem.Pop(\"its result\")`, then continue in the todo above it or in a new one at that level; do the work of the todo you are in rather than splitting it again.", depth, enter, max)
 }

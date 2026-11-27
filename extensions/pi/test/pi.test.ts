@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxText, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -175,4 +175,44 @@ test("gnosh's judge sends the model back when a top todo it closed does not hold
     // The request after "Released." ends with gnosh's words for the judge's verdict.
     assert.match(sent[7].at(-1) ?? "", /The check of `[a-z/-]+` found it not met: nothing shows the release was published/);
   });
+});
+
+// spec §10.8: a reply of reasoning alone would end pi's run; the model is
+// asked, once, to go on.
+test("a reply of reasoning alone is asked to go on, once", { skip: !program && "GNOSH_BIN is not set" }, async () => {
+  const script = [
+    fauxAssistantMessage(fauxThinking("I should open a todo")),
+    fauxAssistantMessage(fauxText("done")),
+  ];
+  await withSession(script, () => ok, async ({ prompt, sent }) => {
+    await prompt("do the thing");
+    assert.equal(sent.length, 2, sent.map((s) => s.join("\n")).join("\n---\n"));
+    assert.ok(sent[1].some((m) => m.includes("held no call and no answer")), sent[1].join("\n"));
+  });
+  const twice = [fauxAssistantMessage(fauxThinking("hm")), fauxAssistantMessage(fauxThinking("hm again")), fauxAssistantMessage(fauxText("never asked"))];
+  await withSession(twice, () => ok, async ({ prompt, sent }) => {
+    await prompt("do the thing");
+    assert.equal(sent.length, 2, "the model is asked to go on once, not again");
+  });
+});
+
+// spec §10.8: past the depth limit, the call is not run and says to pop.
+test("a call that goes past the todo depth limit is not run", { skip: !program && "GNOSH_BIN is not set" }, async () => {
+  process.env.PI_GNOSH_MAXDEPTH = "2";
+  try {
+    const script = [
+      run('mem.Todo("one").Push()', "mem"),
+      run('mem.Todo("two").Push()', "mem"),
+      run('mem.Todo("three").Push()', "mem"),
+      fauxAssistantMessage(fauxText("done")),
+    ];
+    let n = 0;
+    await withSession(script, (p) => (p === "name" ? `todo-${++n}` : ok), async ({ prompt, sent }) => {
+      await prompt("go");
+      assert.equal(sent.length, 4);
+      assert.ok(sent[3].some((m) => m.includes("Not run: you are 2 todos deep")), sent[3].join("\n"));
+    });
+  } finally {
+    delete process.env.PI_GNOSH_MAXDEPTH;
+  }
 });

@@ -291,8 +291,11 @@ func (s *Server) step(req Request) Reply {
 	// With the context filling and the session in no todo, nothing can slide
 	// out of it: the host's summary is all that is left to make room. The
 	// todo line (§10.7) is said at two and at three quarters of the way to
-	// the point, and again after the context stood low (a summary or a pop).
-	if req.Nudge && len(info.Stack) == 0 && req.Point > 0 && req.Used > 0 {
+	// the point, and again after the context stood low (a summary). It is
+	// said only to a session that never stood in a todo (§10.8): after a pop
+	// the model knows todos, and a stretch at the root is the work it chose
+	// to do there.
+	if req.Nudge && len(info.Stack) == 0 && !ss.framed && !ss.popped && req.Point > 0 && req.Used > 0 {
 		switch pct := req.Used * 100 / req.Point; {
 		case pct < 25:
 			ss.rootLevel = 0
@@ -334,7 +337,7 @@ func (s *Server) step(req Request) Reply {
 		rep.Parts = append(rep.Parts, t.MemReminder(frames, nil))
 	}
 	// A frame close to its slide limit is stuck: tell the model, once, to
-	// split it into smaller todos or pop it with what it has, before the
+	// pop it with what it has and go on at the same level, before the
 	// bridge stops sliding it and leaves room-making to the host's
 	// compaction (§10.4). This is a correctness guard, so it runs under lean
 	// too; one round-2 run slid a single frame 44 times without popping.
@@ -345,7 +348,7 @@ func (s *Server) step(req Request) Reply {
 				ss.toldStuck = map[string]bool{}
 			}
 			ss.toldStuck[top.ID] = true
-			rep.Parts = append(rep.Parts, fmt.Sprintf("`%s` has slid %d times and is not closing. Split it into smaller todos you can pop one by one, or pop it now with what you have; otherwise its oldest rounds will be summarized, not slid.", top.ID, c))
+			rep.Parts = append(rep.Parts, fmt.Sprintf("`%s` has slid %d times and is not closing. Pop it now with what you have and carry on in a new todo at the same level, not inside this one; otherwise its oldest rounds will be summarized, not slid.", top.ID, c))
 		}
 	}
 	// Back at the root after closing todos: their work is out of context, so
@@ -497,5 +500,5 @@ func named(slides []transcript.Entry, session string) []transcript.Entry {
 // rootNudge is the todo line: the context is pct percent of the way to the
 // point where the host summarizes, and the session stands in no todo.
 func rootNudge(pct int) string {
-	return fmt.Sprintf("Your context is about %d%% of the way to the point where it is summarized, and you are working in no todo, so a summary written over all of it is the only way to make room. Put the work in todos: enter one for what you are doing now with `mem.Todo(\"title\").Push()` (or split what is left into pieces with `mem.Todo(...)` and take them in turn with `mem.Next()`), keep what you find with `mem.Think(\"…\")`, and pop each with its result when done. The work of a todo you pop leaves your context with no summary, and its result stays.", pct)
+	return fmt.Sprintf("Your context is about %d%% of the way to the point where it is summarized, and you are working in no todo, so a summary written over all of it is the only way to make room. Put the work in a todo: enter one for what you are doing now with `mem.Todo(\"title\").Push()`, keep what you find with `mem.Think(\"…\")`, and pop it with its result when done. Keep todos shallow: pop one before you open the next. The work of a todo you pop leaves your context with no summary, and its result stays.", pct)
 }
