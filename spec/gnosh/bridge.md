@@ -457,6 +457,47 @@ The bridge needs `Options.KeepCall`, the call that keeps a thought, to keep
 anything itself: `gnosh bridge` sets it; without it `autokeep` is ignored and
 `room` answers as §10.4 says.
 
+### 10.8 The todo line, kept in bounds: depth, once, and a reply of reasoning alone
+
+The fourth pi benchmark (r4-gnosh, 21 trials) ran the todo line of §10.7 and
+showed three faults, all on the long tasks.
+
+- One run stood in a path of about 18 todos (the earlier rounds' deepest was
+  2). The line said to "split what is left into pieces" and take them with
+  `mem.Next()`; the model kept entering todos inside todos, the start of the
+  deep path could not be slid or summarized, 18 of the host's summaries failed
+  and the context overflowed.
+- In another run the line came after two minutes of large reads, the model
+  answered it with reasoning alone (no call, no text), and the host ended the run.
+- The line also came late in short tasks, after the model had used and popped
+  a todo, asking for another when the work was nearly done.
+
+So:
+
+- The todo line asks for one todo, kept shallow ("pop one before you open the
+  next"); it no longer mentions splitting the work or `mem.Next()`. The
+  stuck-frame line (§10.4) says to pop and go on in a new todo at the same
+  level, not inside the one that is stuck.
+- `step` says the todo line only to a session that never stood in a todo: not
+  after any todo was pushed or popped. (After a pop the model knows todos;
+  what it does at the root then is what it chose.) It is still said once per
+  level and again after the context stood low.
+- `call` takes `max_depth`. A call whose input enters todos (`.Push(`, `Next(`)
+  and pops none is not run when the session would stand more than `max_depth`
+  todos deep after it: the reply is `is_error` with a line that says the depth
+  and the limit and to pop first. 0 or absent sets no limit. The depth is the
+  stack the bridge keeps from the frames its calls made.
+- A host re-asks once when the model's reply is reasoning alone (no call, no
+  text, a normal stop): it sends a note that the run would have ended and asks
+  the model to go on, and does not ask again until the model has answered with
+  a call or text. This is the host's; the bridge is not involved.
+- A host whose own summary can be written with no reasoning writes it so: with
+  reasoning on, the summary was cut off at the output limit and failed (18
+  times in one run, and 7 in one plain-pi run), which leaves the run with no
+  room.
+
+`max_depth` is a host option; gnosh's own agent loop does not use the bridge.
+
 ## 11. A session's checks: the call, the turn's end, and side requests
 
 A gnosh session does not take its model's word that work is done

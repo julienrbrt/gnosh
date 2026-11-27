@@ -117,7 +117,22 @@ both on by default, address these:
   dropped that is kept nowhere. The slide limit (six slides of one todo without a
   pop) still applies.
 
-See `spec/gnosh/bridge.md` §10.7.
+Round 4 showed three faults of the todo line on the long tasks (a path of 18
+nested todos, a run ended by a reply of reasoning alone, a line that came late
+in short tasks). Four more options, on by default, bound it:
+
+- **One shallow todo, said once, to a session that never used one.** The line no
+  longer says to split the work or to use `mem.Next()`, and it is not said after a
+  todo was pushed or popped.
+- **Depth limit (`PI_GNOSH_MAXDEPTH=4`; `0` sets none).** A call that would put the
+  session more todos deep than that is not run; the model is told to pop first.
+- **Re-ask (`PI_GNOSH_REASK=0` turns it off).** A reply of reasoning alone, with
+  no call and no text, is asked once to go on instead of ending pi's run.
+- **Summary without reasoning (`PI_GNOSH_SUMMARY=0` turns it off).** When pi must
+  summarize, the extension writes pi's own summary with reasoning off, so it is not
+  cut off at the output limit; if that fails, pi writes it as it would have.
+
+See `spec/gnosh/bridge.md` §10.7 and §10.8.
 
 ## Use
 

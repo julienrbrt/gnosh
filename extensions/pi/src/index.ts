@@ -30,13 +30,17 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { appendFileSync } from "node:fs";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { compact, type ExtensionAPI, type ExtensionContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Bridge, BridgeCallError } from "./bridge.ts";
 import { FRAMES, fromView, type PiMessage, staleUsage, toEntries } from "./map.ts";
 import type { Block, Entry, Message, Reply, SideAnswer, SideRequest } from "./protocol.ts";
 
-const CLIENT = "pi-gnosh 0.6.0";
+const CLIENT = "pi-gnosh 0.7.0";
+const REASK = "Your last reply held no call and no answer, so the run would have ended. Go on: make the next call, or give your final answer.";
+/** A reply of reasoning alone: no text and no call. */
+const bareReply = (m: PiMessage) =>
+  Array.isArray(m.content) && !m.content.some((c) => c.type === "toolCall" || (c.type === "text" && (c.text ?? "").trim() !== ""));
 /** The custom type of the notes this extension adds to the conversation, and of its kept slides. */
 const NOTE = "gnosh";
 const SLIDES = "gnosh-slides";
@@ -88,6 +92,18 @@ export default async function (pi: ExtensionAPI) {
   // them off.
   const nudgeMode = process.env.PI_GNOSH_NUDGE !== "0";
   const autokeepMode = process.env.PI_GNOSH_AUTOKEEP !== "0";
+  // Todo depth (spec §10.8): a call that would put the session more todos
+  // deep than this is not run. PI_GNOSH_MAXDEPTH=0 sets no limit.
+  const maxDepth = Number.isFinite(Number(process.env.PI_GNOSH_MAXDEPTH ?? "")) && process.env.PI_GNOSH_MAXDEPTH !== "" ? Math.max(0, Math.floor(Number(process.env.PI_GNOSH_MAXDEPTH))) : 4;
+  // Re-ask once (spec §10.8): a reply of reasoning alone, with no call and no
+  // answer, would end pi's run; the model is asked to go on instead.
+  // PI_GNOSH_REASK=0 turns it off.
+  const reaskMode = process.env.PI_GNOSH_REASK !== "0";
+  // pi's own summary, when it must be written, without reasoning (spec
+  // §10.8): with reasoning on, a model can spend the whole output on it and
+  // the summary comes back cut off, and fails. PI_GNOSH_SUMMARY=0 leaves
+  // pi's summary as pi makes it.
+  const summaryMode = process.env.PI_GNOSH_SUMMARY !== "0";
   const cwd = process.cwd();
   let bridge: Bridge | undefined;
   let starting: Promise<Bridge> | undefined;
@@ -108,7 +124,8 @@ export default async function (pi: ExtensionAPI) {
   // ctxNow is the context of the event being handled, for the side
   // requests the bridge makes while it answers.
   let ctxNow: ExtensionContext | undefined;
-  const stats = { slides: 0, freed: 0, uncovered: 0, compactions: 0, cancelled: 0, notes: 0, pushes: 0, pops: 0, calls: 0, sentBack: 0, sides: 0, sideFailed: 0 };
+  let reasked = false;
+  const stats = { reasks: 0, summaries: 0, summaryFailed: 0, slides: 0, freed: 0, uncovered: 0, compactions: 0, cancelled: 0, notes: 0, pushes: 0, pops: 0, calls: 0, sentBack: 0, sides: 0, sideFailed: 0 };
   const statsFile = process.env.PI_GNOSH_STATS;
   const log = (line: string) => {
     process.stderr.write(`pi-gnosh: ${line}\n`);
@@ -215,6 +232,7 @@ export default async function (pi: ExtensionAPI) {
       async execute(callId, params, _signal, _onUpdate, ctx) {
         ctxNow = ctx;
         const req: Record<string, unknown> = { op: "call", session: sessionOf(ctx), call_id: callId, name: t.name, input: params };
+        if (maxDepth > 0) req.max_depth = maxDepth;
         // A call to mem is checked against the conversation through the
         // reply that makes it (bridge.md §11).
         if ((params as { name?: string } | undefined)?.name === "mem") req.entries = entriesOf([...last, ...since], ctx).entries;
@@ -276,6 +294,7 @@ export default async function (pi: ExtensionAPI) {
   pi.on("message_end", async (event) => {
     const m = event.message as unknown as PiMessage;
     if (m.role === "assistant") freedSinceReply = 0;
+    if (m.role === "assistant" && !bareReply(m)) reasked = false;
     if (m.role === "assistant" || m.role === "toolResult") since.push(m);
   });
 
@@ -286,6 +305,14 @@ export default async function (pi: ExtensionAPI) {
    * failed ends the run, as a stopped or failed turn ends in gnosh.
    */
   async function end(reply: PiMessage, ctx: ExtensionContext) {
+    if (reaskMode && reply.stopReason === "stop" && bareReply(reply) && !reasked) {
+      // Reasoning with no call and no answer is not a finished turn.
+      reasked = true;
+      stats.reasks++;
+      log("the reply was reasoning alone, with no call and no answer: the model is asked to go on");
+      pi.sendMessage({ customType: NOTE, content: REASK, display: false }, { deliverAs: "followUp" });
+      return;
+    }
     if (!has("end") || reply.stopReason === "aborted" || reply.stopReason === "error") return;
     const msgs = [...last];
     for (const m of [...since, reply]) if (!msgs.includes(m)) msgs.push(m);
@@ -341,6 +368,29 @@ export default async function (pi: ExtensionAPI) {
     return r.parts ?? [];
   }
 
+  /**
+   * summarize writes pi's summary with pi's own routine, with no reasoning.
+   * When it cannot (no model, no credentials, the request fails), pi writes
+   * it as it would have.
+   */
+  async function summarize(event: SessionBeforeCompactEvent, ctx: ExtensionContext) {
+    const model = ctx.model;
+    if (!model || event.reason === "manual") return undefined;
+    try {
+      // The registry streams the request with the model's own credentials and
+      // provider, as pi does for its own summary.
+      const stream = ((m: typeof model, c: unknown, o: unknown) => ctx.modelRegistry.streamSimple(m, c as never, o as never)) as never;
+      const compaction = await compact(event.preparation, model, undefined, undefined, event.customInstructions, event.signal, "off", stream);
+      stats.summaries++;
+      log(`pi's summary written without reasoning (${compaction.summary.length} characters)`);
+      return { compaction };
+    } catch (e) {
+      stats.summaryFailed++;
+      log(`pi's summary without reasoning failed, pi writes its own: ${(e as Error).message}`);
+      return undefined;
+    }
+  }
+
   // Where pi would compact, gnosh slides; pi compacts only when the slides
   // cannot bring the conversation under its point, as in a gnosh session.
   pi.on("session_before_compact", async (event, ctx) => {
@@ -360,7 +410,7 @@ export default async function (pi: ExtensionAPI) {
     }
     stats.compactions++;
     log(`pi compacts (${event.reason}) at ~${before} tokens: the slides freed ${freedSinceReply}, not enough`);
-    return undefined;
+    return summaryMode ? await summarize(event, ctx) : undefined;
   });
 
   // Between two rounds: the slide when over pi's point (before pi's own

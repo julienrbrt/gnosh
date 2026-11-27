@@ -64,6 +64,10 @@ type Request struct {
 	Name      string          `json:"name,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
 	Confirmed bool            `json:"confirmed,omitempty"`
+	// MaxDepth, on call, is how many todos deep the host lets a session
+	// stand (§10.8): a call that would push or step past it is refused with
+	// a line that says to pop first. 0 sets no limit.
+	MaxDepth int `json:"max_depth,omitempty"`
 
 	// view (Session too)
 	Entries    []transcript.Entry `json:"entries,omitempty"`
